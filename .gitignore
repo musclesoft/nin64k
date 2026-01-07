@@ -1,0 +1,27 @@
+# Build outputs
+build/
+
+# Compression test files
+*.gz
+*.bz2
+*.xz
+*.zst
+*.lz4
+*.br
+*.rans
+
+# Node
+node_modules/
+package*.json
+
+# OS
+.DS_Store
+
+# Editor
+*.swp
+*~
+
+# Temporary
+/tmp/
+*.bin
+*.o

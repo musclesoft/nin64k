@@ -1,5 +1,6 @@
 # Build outputs
 build/
+/compress
 
 # Compression test files
 *.gz
@@ -23,5 +24,4 @@ package*.json
 
 # Temporary
 /tmp/
-*.bin
 *.o

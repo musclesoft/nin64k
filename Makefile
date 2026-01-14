@@ -1,47 +1,64 @@
 ASM = ca65
 LD = ld65
-C1541 = ~/Desktop/vice-arm64-sdl2-3.10/bin/c1541
-VICE = ~/Desktop/vice-arm64-sdl2-3.10/bin/x64sc
 
-SRC = src/soundemon_loop.asm
+SRC = src/nin64k.asm
 CFG = src/c64.cfg
-OBJ = build/soundemon_loop.o
-PRG = build/soundemon_loop.prg
-D64 = build/ninjas.d64
+OBJ = build/nin64k.o
+PRG = build/nin64k.prg
 
-PATCH_DATA = build/patch_data.inc build/player_odd_base.bin build/player_even_base.bin
+SELFTEST_SRC = src/nin64selftest.asm
+SELFTEST_OBJ = build/nin64selftest.o
+SELFTEST_PRG = build/nin64selftest.prg
 
-.PHONY: all clean run generate-patches
+SID_SRC = src/nin64sid.asm
+SID_CFG = src/sid.cfg
+SID_OBJ = build/nin64sid.o
+SID_FILE = build/Nine_Inch_Ninjas.sid
 
-all: $(D64)
+INCLUDES = $(wildcard src/*.inc)
 
-# Generate patch data and base players from original songs
-$(PATCH_DATA): $(wildcard uncompressed/d*p.raw)
-	@mkdir -p build
-	node generate_patches.js
+.PHONY: all clean run selftest run-selftest sid
 
-generate-patches: $(PATCH_DATA)
+all: $(PRG) $(SID_FILE)
 
-$(OBJ): $(SRC) $(PATCH_DATA)
+$(OBJ): $(SRC) $(INCLUDES) generated/decompress.asm generated/stream_main.bin generated/stream_tail.bin
 	@mkdir -p build
 	$(ASM) -o $@ $<
 
 $(PRG): $(OBJ) $(CFG)
 	$(LD) -C $(CFG) -o $@ $<
 
-$(D64): $(PRG) $(PATCH_DATA)
-	$(C1541) -format "ninjas,00" d64 $@ \
-		-write $(PRG) "nin-soundemon" \
-		-write uncompressed/d1p.raw "d1" \
-		-write uncompressed/d2p.raw "d2" \
-		-write uncompressed/d3p.raw "d3" \
-		-write uncompressed/d4p.raw "d4" \
-		-write uncompressed/d5p.raw "d5" \
-		-write uncompressed/d6p.raw "d6" \
-		-write uncompressed/d7p.raw "d7"
+run: $(PRG)
+ifdef VICE_BIN
+	$(VICE_BIN)/x64sc -autostartprgmode 1 +confirmonexit $(PRG) &
+else
+	@echo "Set VICE_BIN to run in emulator, e.g.: export VICE_BIN=~/path/to/vice/bin"
+endif
 
-run: $(D64)
-	$(VICE) -warp $(D64) &
+selftest: $(SELFTEST_PRG)
+
+$(SELFTEST_OBJ): $(SELFTEST_SRC) $(INCLUDES) generated/decompress.asm generated/stream_main.bin generated/stream_tail.bin
+	@mkdir -p build
+	$(ASM) -o $@ $<
+
+$(SELFTEST_PRG): $(SELFTEST_OBJ) $(CFG)
+	$(LD) -C $(CFG) -o $@ $<
+
+run-selftest: $(SELFTEST_PRG)
+ifdef VICE_BIN
+	$(VICE_BIN)/x64sc -autostartprgmode 1 -warp +confirmonexit $(SELFTEST_PRG) &
+else
+	@echo "Set VICE_BIN to run in emulator, e.g.: export VICE_BIN=~/path/to/vice/bin"
+endif
+
+sid: $(SID_FILE)
+
+$(SID_OBJ): $(SID_SRC) $(INCLUDES) generated/decompress.asm generated/stream_main.bin generated/stream_tail.bin
+	@mkdir -p build
+	$(ASM) -o $@ $<
+
+$(SID_FILE): $(SID_OBJ) $(SID_CFG)
+	$(LD) -C $(SID_CFG) -o $@ $<
 
 clean:
-	rm -rf build/*.o build/*.prg build/*.d64 build/*.d71 build/*.bin build/*.inc
+	rm -rf build/*.o build/*.prg build/*.sid build/*.bin build/*.inc

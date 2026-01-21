@@ -110,5 +110,8 @@ copy_bytes_bwd:
 stream_tail:
         .incbin "../generated/stream_tail.bin"
 stream_main:
-        .incbin "../generated/stream_main.bin"
+.ifndef STREAM_OFFSET
+    STREAM_OFFSET = 0
+.endif
+        .incbin "../generated/stream_main.bin", STREAM_OFFSET
 stream_end:

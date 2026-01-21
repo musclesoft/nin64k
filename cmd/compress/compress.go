@@ -1095,6 +1095,11 @@ func main() {
 	fmt.Printf("  S9 split at command boundary: bit %d of %d (%d bytes into S9)\n",
 		bestBoundary, s9Bits, bestBoundary/8)
 
+	// Also generate part 1 raw for SID export (pre-decompressed at $1000)
+	part1Path := filepath.Join("generated", "part1.bin")
+	os.WriteFile(part1Path, songs[1], 0644)
+	fmt.Printf("\nPart 1 raw: %d bytes -> %s\n", len(songs[1]), part1Path)
+
 	if allVerified {
 		fmt.Println("\nVerification: ALL PASSED")
 	} else {

@@ -53,7 +53,7 @@ endif
 
 sid: $(SID_FILE)
 
-$(SID_OBJ): $(SID_SRC) $(INCLUDES) generated/decompress.asm generated/stream_main.bin generated/stream_tail.bin
+$(SID_OBJ): $(SID_SRC) $(INCLUDES) generated/decompress.asm generated/part1.bin generated/stream_main.bin generated/stream_tail.bin
 	@mkdir -p build
 	$(ASM) -o $@ $<
 

@@ -60,22 +60,17 @@ TUNE2_PLAY      = $7003
 ; ----------------------------------------------------------------------------
 sid_init:
         sei
-        lda     #0
-        ldx     #$18
-@clear_sid:
-        sta     $D400,x
-        dex
-        bpl     @clear_sid
         jsr     setup_irq           ; Set up IRQ before stream copy overwrites $DC0D
         lda     #$30                ; All RAM for stream access
         sta     $01
+        lda     #1
+        sta     zp_part_num
+        sta     zp_preloaded
+        lda     #0
+        jsr     TUNE1_INIT
+        cli
         jsr     copy_streams
         jsr     init_stream
-        lda     #0
-        sta     zp_part_num
-        jsr     do_preload          ; Decompress and init song 1
-        inc     zp_part_num         ; Now playing song 1
-        cli
 @loop:
         lda     zp_part_num
         cmp     zp_preloaded
@@ -237,27 +232,40 @@ decompress_one:
         tax                         ; Restore X
         rts
 
-; ----------------------------------------------------------------------------
-; init_stream - Initialize stream pointer
-; ----------------------------------------------------------------------------
-init_stream:
-        lda     #<STREAM_MAIN_DEST
-        sta     zp_src_lo
-        lda     #>STREAM_MAIN_DEST
-        sta     zp_src_hi
-        lda     #$80
-        sta     zp_bitbuf
-        rts
-
 ; ----------------------------------------------------------------------
 ; Part timing data (decremented in place during playback)
 ; ----------------------------------------------------------------------
 part_times:
 .include "part_times.inc"
 
+; ----------------------------------------------------------------------------
+; init_stream - Initialize stream pointer to song 2 (song 1 is preloaded)
+; Song 1 = 39981 bits = 4997 bytes + 5 bits, so song 2 starts mid-byte
+; ----------------------------------------------------------------------------
+STREAM_OFFSET = 4997                    ; Byte offset where song 2 starts
+
+init_stream:
+        lda     #<(STREAM_MAIN_DEST + 1)
+        sta     zp_src_lo
+        lda     #>(STREAM_MAIN_DEST + 1)
+        sta     zp_src_hi
+        lda     STREAM_MAIN_DEST        ; Load partial byte
+        asl     a                       ; Shift out 5 bits consumed by song 1
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        ora     #$10                    ; Add sentinel (3 bits remain at 7,6,5)
+        sta     zp_bitbuf
+        rts
+
 ; ============================================================================
 ; Decompressor
 ; ============================================================================
 .include "../generated/decompress.asm"
 
+.segment "PART1"
+.incbin "../generated/part1.bin"
+
+.segment "DATA"
 .include "stream.inc"

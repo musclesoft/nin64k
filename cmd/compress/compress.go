@@ -1102,7 +1102,17 @@ func main() {
 	asmPath := filepath.Join("generated", "decompress.asm")
 	os.WriteFile(mainPath, mainWriter.data, 0644)
 	os.WriteFile(tailPath, tailWriter.data, 0644)
-	WriteDecompressorAsm(asmPath)
+
+	// Run VM to get cycle stats for ASM generation
+	cycleStats, err := RunDecompressorForCycleStats(songs, mainWriter.data, tailWriter.data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not get cycle stats: %v\n", err)
+		WriteDecompressorAsm(asmPath)
+	} else {
+		WriteDecompressorAsmWithCycleStats(asmPath, cycleStats.LowestMaxGapOffset, cycleStats.MaxCycleGap)
+		fmt.Printf("\nCycle stats: lowest max cycle gap at offset $%02X (%d cycles)\n",
+			cycleStats.LowestMaxGapOffset, cycleStats.MaxCycleGap)
+	}
 
 	fmt.Printf("\nSplit stream: main %d bytes + tail %d bytes (target tail: %d)\n",
 		len(mainWriter.data), len(tailWriter.data), tailTargetBytes)

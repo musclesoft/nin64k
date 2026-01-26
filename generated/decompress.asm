@@ -1,10 +1,14 @@
-; Size: 252 bytes
+; Size: 259 bytes
 ; External zero page variables (must be defined by caller)
 ; zp_src_lo       = $02   ; Source pointer (compressed data)
 ; zp_src_hi       = $03
 ; zp_bitbuf       = $04   ; Bit buffer (set to $80 for first call)
 ; zp_out_lo       = $05   ; Output pointer ($1000 or $7000)
 ; zp_out_hi       = $06
+;
+; IMPORTANT: Define 'checkpoint' globally before including this file.
+; Called frequently (every bit, every byte). Can trash A and P.
+; Minimal: checkpoint: rts
 
 ; Internal zero page variables
 zp_val_lo       = $07
@@ -104,6 +108,7 @@ backref_no_adjust:
 copy_loop:
         lda     (zp_ref_lo),y
         sta     (zp_out_lo),y
+        jsr     checkpoint
         inc     zp_out_lo
         bne     skip_out_hi_inc
         inc     zp_out_hi
@@ -160,20 +165,22 @@ dec_gamma:
         ldx     zp_val_hi
         rts
 read_bit:
+        pha
+        jsr     checkpoint
         asl     zp_bitbuf
         bne     read_bit_done
-        pha
         lda     (zp_src_lo),y
         rol a
         sta     zp_bitbuf
         inc     zp_src_lo
-        bne     skip_src_hi_inc
+        bne     read_bit_done
         inc     zp_src_hi
-skip_src_hi_inc:
-        pha
+read_bit_done:
+        pla
+        rts
 terminator:
         pla
         pla
-read_bit_done:
         rts
+; checkpoint: max 53 cycles between calls
 .endproc

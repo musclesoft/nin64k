@@ -443,3 +443,105 @@ func vmTestMain() {
 		os.Exit(1)
 	}
 }
+
+// CycleStats holds cycle analysis results from the VM
+type CycleStats struct {
+	LowestMaxGapOffset int    // Offset from $0D00 of instruction with lowest max cycle gap
+	MaxCycleGap        uint64 // Max cycles between revisits for that instruction
+}
+
+// RunDecompressorForCycleStats runs the decompressor and returns cycle statistics
+func RunDecompressorForCycleStats(songs map[int][]byte, streamMain, streamTail []byte) (*CycleStats, error) {
+	decompCode := GetDecompressorCode()
+
+	const tailAddr = 0x663B
+	mainStart := 0x10000 - len(streamMain)
+
+	cpu := NewCPU6502()
+	cpu.LoadAt(0x0D00, decompCode)
+	cpu.LoadAt(uint16(mainStart), streamMain)
+	cpu.LoadAt(tailAddr, streamTail)
+
+	cpu.Mem[zpSrcLo] = byte(mainStart)
+	cpu.Mem[zpSrcHi] = byte(mainStart >> 8)
+	cpu.Mem[zpBitBuf] = 0x80
+	cpu.Mem[0x0CFF] = 0x00
+
+	// Decompress songs 1-8 from main stream
+	var totalCycles uint64
+	for song := 1; song <= 8; song++ {
+		target := songs[song]
+
+		var dstAddr uint16
+		if song%2 == 1 {
+			dstAddr = 0x1000
+		} else {
+			dstAddr = 0x7000
+		}
+		cpu.Mem[zpOutLo] = byte(dstAddr)
+		cpu.Mem[zpOutHi] = byte(dstAddr >> 8)
+
+		cpu.Mem[0x01FF] = 0x0C
+		cpu.Mem[0x01FE] = 0xFE
+		cpu.SP = 0xFD
+		cpu.PC = 0x0D00
+		cpu.Halted = false
+		startCycles := cpu.Cycles
+
+		if err := cpu.Run(startCycles + 2000000); err != nil {
+			return nil, fmt.Errorf("song %d: %w", song, err)
+		}
+		if !cpu.Halted {
+			return nil, fmt.Errorf("song %d: timeout", song)
+		}
+		totalCycles += cpu.Cycles - startCycles
+
+		output := cpu.Mem[dstAddr : dstAddr+uint16(len(target))]
+		if !bytes.Equal(output, target) {
+			return nil, fmt.Errorf("song %d: output mismatch", song)
+		}
+	}
+
+	// Song 9: partial from main, then continue from tail
+	cpu.Mem[zpOutLo] = 0x00
+	cpu.Mem[zpOutHi] = 0x10
+
+	cpu.Mem[0x01FF] = 0x0C
+	cpu.Mem[0x01FE] = 0xFE
+	cpu.SP = 0xFD
+	cpu.PC = 0x0D00
+	cpu.Halted = false
+	startCycles := cpu.Cycles
+
+	if err := cpu.Run(startCycles + 2000000); err != nil {
+		return nil, fmt.Errorf("song 9 (main): %w", err)
+	}
+
+	// Continue from tail
+	cpu.Mem[zpSrcLo] = byte(tailAddr & 0xFF)
+	cpu.Mem[zpSrcHi] = byte(tailAddr >> 8)
+	cpu.Mem[zpBitBuf] = 0x80
+
+	cpu.Mem[0x01FF] = 0x0C
+	cpu.Mem[0x01FE] = 0xFE
+	cpu.SP = 0xFD
+	cpu.PC = 0x0D00
+	cpu.Halted = false
+	startCycles = cpu.Cycles
+
+	if err := cpu.Run(startCycles + 2000000); err != nil {
+		return nil, fmt.Errorf("song 9 (tail): %w", err)
+	}
+
+	target9 := songs[9]
+	output9 := cpu.Mem[0x1000 : 0x1000+uint16(len(target9))]
+	if !bytes.Equal(output9, target9) {
+		return nil, fmt.Errorf("song 9: output mismatch")
+	}
+
+	offset, maxGap := cpu.LowestMaxCycleGapPC(0x0D00)
+	return &CycleStats{
+		LowestMaxGapOffset: offset,
+		MaxCycleGap:        maxGap,
+	}, nil
+}

@@ -31,6 +31,11 @@ type CPU6502 struct {
 	// Memory access callbacks for validation
 	OnRead  func(addr uint16) // Called on memory reads from copy operations
 	OnWrite func(addr uint16) // Called on memory writes to buffers
+
+	// Visit tracking for cycle analysis
+	VisitCount     map[uint16]uint64 // PC -> number of times visited
+	LastVisitCycle map[uint16]uint64 // PC -> cycle count at last visit
+	MaxCycleGap    map[uint16]uint64 // PC -> max cycles between consecutive visits
 }
 
 // Status flag bits
@@ -47,12 +52,15 @@ const (
 
 func NewCPU6502() *CPU6502 {
 	cpu := &CPU6502{
-		SP:           0xFF,
-		P:            FlagU | FlagI,
-		CLCTotal:     make(map[uint16]int),
-		CLCRedundant: make(map[uint16]int),
-		SECTotal:     make(map[uint16]int),
-		SECRedundant: make(map[uint16]int),
+		SP:             0xFF,
+		P:              FlagU | FlagI,
+		CLCTotal:       make(map[uint16]int),
+		CLCRedundant:   make(map[uint16]int),
+		SECTotal:       make(map[uint16]int),
+		SECRedundant:   make(map[uint16]int),
+		VisitCount:     make(map[uint16]uint64),
+		LastVisitCycle: make(map[uint16]uint64),
+		MaxCycleGap:    make(map[uint16]uint64),
 	}
 	return cpu
 }
@@ -205,6 +213,19 @@ func (c *CPU6502) Step() error {
 	if c.PC == c.Breakpoint {
 		c.Halted = true
 		return nil
+	}
+
+	// Track visit frequency and cycle gaps (only for decompressor code)
+	// Decompressor can be up to 512 bytes, ending at $0F00
+	if c.PC >= 0x0D00 && c.PC < 0x0F00 {
+		if lastCycle, visited := c.LastVisitCycle[c.PC]; visited {
+			gap := c.Cycles - lastCycle
+			if gap > c.MaxCycleGap[c.PC] {
+				c.MaxCycleGap[c.PC] = gap
+			}
+		}
+		c.VisitCount[c.PC]++
+		c.LastVisitCycle[c.PC] = c.Cycles
 	}
 
 	opcode := c.Mem[c.PC]
@@ -928,4 +949,25 @@ func (c *CPU6502) Has100PctRedundantFlagOps() bool {
 		}
 	}
 	return false
+}
+
+// LowestMaxCycleGapPC returns the PC with lowest max cycle gap between revisits
+// (i.e., the instruction that gets revisited most frequently in terms of cycles).
+// Returns the PC offset from base and the max gap.
+func (c *CPU6502) LowestMaxCycleGapPC(base uint16) (offset int, minMaxGap uint64) {
+	var lowestPC uint16
+	minMaxGap = ^uint64(0) // Start with max value
+	for pc, gap := range c.MaxCycleGap {
+		if gap > 0 && gap < minMaxGap {
+			minMaxGap = gap
+			lowestPC = pc
+		}
+	}
+	if minMaxGap == ^uint64(0) {
+		minMaxGap = 0
+	}
+	if lowestPC >= base {
+		offset = int(lowestPC - base)
+	}
+	return offset, minMaxGap
 }

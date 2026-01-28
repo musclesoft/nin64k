@@ -17,7 +17,7 @@ SID_FILE = build/Nine_Inch_Ninjas.sid
 
 INCLUDES = $(wildcard src/*.inc)
 
-.PHONY: all clean run selftest run-selftest sid
+.PHONY: all clean run selftest run-selftest sid test
 
 all: $(PRG) $(SID_FILE)
 
@@ -59,6 +59,10 @@ $(SID_OBJ): $(SID_SRC) $(INCLUDES) generated/decompress.asm generated/part1.bin 
 
 $(SID_FILE): $(SID_OBJ) $(SID_CFG)
 	$(LD) -C $(SID_CFG) -o $@ $<
+
+test:
+	$(MAKE) -C tools/odin_convert
+	cd tools/odin_convert && ./odin_convert
 
 clean:
 	rm -rf build/*.o build/*.prg build/*.sid build/*.bin build/*.inc

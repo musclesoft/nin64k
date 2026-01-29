@@ -27,7 +27,7 @@ zp_out_hi       = $06
 
 ; Buffer addresses (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
 TUNE1_BASE      = $2000            ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $7000            ; Even songs (2,4,6,8)
+TUNE2_BASE      = $4000            ; Even songs (2,4,6,8)
 
 .segment "RSIDHEADER"
         .byte   "RSID"                  ; $00: Magic
@@ -59,7 +59,10 @@ TUNE2_BASE      = $7000            ; Even songs (2,4,6,8)
 ; ----------------------------------------------------------------------------
 sid_init:
         sei
-        jsr     setup_irq           ; Set up IRQ before stream copy
+        lda     #$35                ; I/O visible, BASIC banked out
+        sta     $01
+        jsr     setup_irq
+        jsr     init_stream
         ; Init player for song 1
         lda     #1
         sta     zp_part_num
@@ -68,10 +71,6 @@ sid_init:
         ldx     #>TUNE1_BASE
         jsr     player_init
         cli                         ; Enable IRQ - music starts playing
-        lda     #$30                ; All RAM for stream access
-        sta     $01
-        jsr     copy_streams
-        jsr     init_stream
 
 ; ----------------------------------------------------------------------------
 ; Main loop - just preloading, playback happens in IRQ
@@ -87,8 +86,6 @@ main_loop:
 ; Set up raster IRQ
 ; ----------------------------------------------------------------------------
 setup_irq:
-        lda     #$35                ; I/O visible for VIC/CIA setup
-        sta     $01
         lda     #$7F
         sta     $DC0D
         lda     $DC0D
@@ -105,14 +102,10 @@ setup_irq:
 ; ----------------------------------------------------------------------------
 irq_handler:
         pha
-        lda     $01
-        pha
         txa
         pha
         tya
         pha
-        lda     #$35                ; I/O visible for SID
-        sta     $01
         lda     $D019
         sta     $D019
         jsr     player_play
@@ -121,8 +114,6 @@ irq_handler:
         tay
         pla
         tax
-        pla
-        sta     $01                 ; Restore RAM config
         pla
         rti
 
@@ -219,9 +210,9 @@ part_times:
 init_stream:
         lda     #$80                    ; Empty buffer, will load on first read
         sta     zp_bitbuf
-        lda     #<STREAM_DEST
+        lda     #<STREAM_START
         sta     zp_src_lo
-        lda     #>STREAM_DEST
+        lda     #>STREAM_START
         sta     zp_src_hi
         rts
 
@@ -238,6 +229,6 @@ init_stream:
 .segment "PART1"
 .incbin "../generated/parts/part1.bin"
 
-.segment "DATA"
+.segment "STREAM"
 USE_STREAM2 = 1                 ; Use stream2.bin (songs 2-9 only, byte-aligned)
 .include "stream.inc"

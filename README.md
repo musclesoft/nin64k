@@ -6,8 +6,8 @@ Disassembly and rebuild of SounDemoN's "[Nine Inch Ninjas](https://csdb.dk/relea
 
 Dual-buffer system with sequential decompression:
 
-- **$1800-$67FF** - Buffer A: odd songs (1, 3, 5, 7, 9)
-- **$6800-$B7FF** - Buffer B: even songs (2, 4, 6, 8)
+- **$2000-$3FFF** - Buffer A: odd songs (1, 3, 5, 7, 9)
+- **$4000-$5FFF** - Buffer B: even songs (2, 4, 6, 8)
 - **High memory** - Single compressed stream
 
 Songs are stored as data-only (no embedded player). A standalone player handles all songs.
@@ -55,10 +55,10 @@ Key optimizations:
 After init (stream copied to high memory):
 
 ```
-$0801-$167D   Code, player, decompressor
-$1800-$67FF   Buffer A (20KB) - odd songs, gap $6259-$67FF (1447 bytes)
-$6800-$B7FF   Buffer B (20KB) - even songs, gap $B619-$B7FF (487 bytes)
-$AC7E-$FFFD   Compressed stream (21KB)
+$0801-$1FFF   Code, player, decompressor
+$2000-$3FFF   Buffer A (8KB) - odd songs (1,3,5,7,9)
+$4000-$5FFF   Buffer B (8KB) - even songs (2,4,6,8)
+$6000-$D000   Compressed stream (~26KB)
 ```
 
 Sequential decompression: S1 to buffer A, S2 to buffer B (referencing S1), S3 to buffer A (referencing S2), etc. The stream is consumed faster than output is written, allowing in-place decompression.

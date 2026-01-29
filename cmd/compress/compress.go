@@ -15,9 +15,12 @@ const (
 	kOffset = 2
 
 	// Memory regions on C64 - derived from decompress6502.go constants
-	addrLow    = DecompBuf1Hi << 8  // Odd songs (S1, S3, S5, S7, S9)
-	addrHigh   = DecompBuf2Hi << 8  // Even songs (S2, S4, S6, S8)
-	bufferSize = DecompBufGap << 8  // Gap between buffers
+	addrLow    = DecompBuf1Hi << 8 // Odd songs (S1, S3, S5, S7, S9)
+	addrHigh   = DecompBuf2Hi << 8 // Even songs (S2, S4, S6, S8)
+
+	// Buffer size for compression (max song length rounded to 4KB)
+	// This is independent of the C64's physical buffer gap
+	bufferSize = 8192
 )
 
 var (
@@ -616,8 +619,8 @@ func decompress(compressed, selfDict, otherDict []byte, expectedLen int) []byte 
 	output := make([]byte, 0, expectedLen)
 	otherLen := len(otherDict)
 
-	// Memory layout: selfDict at $1800, otherDict at $6800 (gap = $5000)
-	const otherBase = 0x5000
+	// Memory layout: selfDict at buffer 1, otherDict at buffer 2 (gap = bufferSize)
+	otherBase := bufferSize
 
 	// Backref byte access: at position pos with distance d
 	getBackrefByte := func(pos, d int) byte {

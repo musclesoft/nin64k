@@ -24,7 +24,7 @@
 ;
 ; Tune buffers:
 ;   $2000 - Buffer 1 (odd parts: 1,3,5,7,9)
-;   $7000 - Buffer 2 (even parts: 2,4,6,8)
+;   $4000 - Buffer 2 (even parts: 2,4,6,8)
 ;
 ; ============================================================================
 
@@ -77,7 +77,7 @@ IRQ_RETURN      = $EA31
 ; Buffer destinations (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
 ; Note: selftest code extends to ~$1A00, so buffers must start after that
 TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $7000         ; Even songs (2,4,6,8)
+TUNE2_BASE      = $4000         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801
@@ -113,7 +113,7 @@ start:
         jsr     setup_irq
         cli
 
-        lda     #$30
+        lda     #$35
         sta     $01
 
         jsr     init
@@ -162,14 +162,10 @@ kernal_irq:
 ; ----------------------------------------------------------------------------
 irq_handler:
         pha
-        lda     $01
-        pha
         txa
         pha
         tya
         pha
-        lda     #$35                ; Ensure I/O visible
-        sta     $01
 
         lda     $DC0D               ; Acknowledge CIA1 interrupt
         lda     $D019
@@ -191,8 +187,6 @@ skip_play:
         tay
         pla
         tax
-        pla
-        sta     $01
         pla
         rts
 
@@ -344,9 +338,9 @@ selftest_verify_stream:
         sta     (zp_screen_lo),y
         iny
         sty     zp_copy_rem
-        lda     #<STREAM_DEST
+        lda     #<STREAM_START
         sta     zp_ptr_lo
-        lda     #>STREAM_DEST
+        lda     #>STREAM_START
         sta     zp_ptr_hi
         lda     #<STREAM_SIZE
         sta     zp_size_lo
@@ -589,9 +583,9 @@ load_tune:
 ; Initialize stream pointer for in-memory decompression
 ; ----------------------------------------------------------------------------
 init_stream:
-        lda     #<STREAM_DEST
+        lda     #<STREAM_START
         sta     zp_src_lo
-        lda     #>STREAM_DEST
+        lda     #>STREAM_START
         sta     zp_src_hi
         lda     #$80
         sta     zp_bitbuf
@@ -637,8 +631,6 @@ checkpoint:
 ; ----------------------------------------------------------------------------
 ; ----------------------------------------------------------------------------
 init:
-        jsr     copy_streams        ; Copy compressed data to safe location
-
         lda     #$00
         sta     zp_selected                 ; Auto-select part 1 (skip menu)
         ldx     #$00

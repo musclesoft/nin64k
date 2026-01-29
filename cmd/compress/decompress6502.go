@@ -27,8 +27,8 @@ const (
 
 // Buffer layout constants for dual-buffer decompression
 // Buffer 1 (odd songs): $2000-$3FFF
-// Buffer 2 (even songs): $7000-$8FFF
-// Gap between buffers: $5000
+// Buffer 2 (even songs): $4000-$5FFF
+// Gap between buffers: $2000
 //
 // To change buffer addresses:
 //   1. Update these constants
@@ -37,10 +37,10 @@ const (
 //   4. Run: go run ./cmd/compress && make clean && make
 const (
 	DecompBuf1Hi  = 0x20 // Buffer 1 high byte ($2000)
-	DecompBuf2Hi  = 0x70 // Buffer 2 high byte ($7000)
-	DecompBufGap  = 0x50 // Gap between buffers ($5000 >> 8)
-	DecompWrapHi  = 0xC0 // Buffer 2 + gap ($7000 + $5000 = $C000)
-	DecompWrapAdj = DecompWrapHi - DecompBuf1Hi // $A0 = wrap adjustment
+	DecompBuf2Hi  = 0x40 // Buffer 2 high byte ($4000)
+	DecompBufGap  = 0x20 // Gap between buffers ($2000 >> 8)
+	DecompWrapHi  = 0x60 // Buffer 2 + gap ($4000 + $2000 = $6000)
+	DecompWrapAdj = DecompWrapHi - DecompBuf1Hi // $40 = wrap adjustment
 )
 
 // Terminator detection: must be > max gamma zeros in compressed data
@@ -397,7 +397,7 @@ func WriteDecompressorAsmWithCycleStats(path string, lowestMaxGapOffset int, max
 ; To change: update constants in cmd/compress/decompress6502.go, then rebuild
 DECOMP_BUF1_HI   = $%02X           ; Buffer 1 high byte
 DECOMP_BUF2_HI   = $%02X           ; Buffer 2 high byte
-DECOMP_BUF_GAP   = $%02X           ; Gap between buffers ($5000 >> 8)
+DECOMP_BUF_GAP   = $%02X           ; Gap between buffers ($2000 >> 8)
 DECOMP_WRAP_HI   = $%02X           ; Buffer 2 + gap (wrap threshold)
 
 ; Internal zero page variables
@@ -410,7 +410,7 @@ zp_caller_x     = $0C
 
 `, DecompBuf1Hi, DecompBuf2Hi, DecompBuf1Hi, DecompBuf2Hi, DecompBufGap, DecompWrapHi)
 	// Size excludes checkpoint RTS (1 byte) which is defined externally
-	content := fmt.Sprintf("; Size: %d bytes\n%s%s", GetDecompressorCodeSize()-1, zpDefs, GetDecompressorAsmIncludeWithCycleStats(lowestMaxGapOffset, maxCycleGap))
+	content := fmt.Sprintf("; Generated file - do not edit. Modify cmd/compress/decompress6502.go instead.\n; Size: %d bytes\n%s%s", GetDecompressorCodeSize()-1, zpDefs, GetDecompressorAsmIncludeWithCycleStats(lowestMaxGapOffset, maxCycleGap))
 	return os.WriteFile(path, []byte(content), 0644)
 }
 

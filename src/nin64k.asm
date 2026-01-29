@@ -18,7 +18,7 @@ zp_out_hi       = $06
 
 ; Buffer addresses (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
 TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $7000         ; Even songs (2,4,6,8)
+TUNE2_BASE      = $4000         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801
@@ -39,20 +39,14 @@ basic_stub:
 ; ----------------------------------------------------------------------------
 start:
         sei
-        ; Set up safe IRQ vector for all-RAM mode
-        lda     #<safe_rti
-        sta     $FFFE
-        lda     #>safe_rti
-        sta     $FFFF
         ; Disable CIA interrupts
         lda     #$7F
         sta     $DC0D
         lda     $DC0D
 
-        ; Switch to all-RAM for stream copy
-        lda     #$30
+        ; Bank out BASIC ROM, keep I/O visible
+        lda     #$35
         sta     $01
-        jsr     copy_streams
         jsr     init_stream
 
         ; Init player for song 1
@@ -70,8 +64,6 @@ start:
 ; ----------------------------------------------------------------------------
 main_loop:
         jsr     checkpoint
-        lda     #$35
-        sta     $01
         ; Check space bar for skip
         lda     #$7F                ; Select keyboard row 7
         sta     $DC00
@@ -81,8 +73,6 @@ main_loop:
         ; Space pressed - debounce
 @debounce:
         jsr     checkpoint
-        lda     #$35
-        sta     $01
         lda     $DC01
         and     #$10
         beq     @debounce           ; Wait for release
@@ -103,19 +93,17 @@ main_loop:
         lda     zp_part_num
         and     #$01
         bne     @init_odd
-        ; Even part num (2,4,6,8) -> buffer at $6800
+        ; Even part num (2,4,6,8) -> TUNE2_BASE
         lda     #$00
         ldx     #>TUNE2_BASE
         jsr     player_init
         jmp     @check_preload
 @init_odd:
-        ; Odd part num (3,5,7,9) -> buffer at $1800
+        ; Odd part num (3,5,7,9) -> TUNE1_BASE
         lda     #$00
         ldx     #>TUNE1_BASE
         jsr     player_init
 @check_preload:
-        lda     #$30
-        sta     $01
         ; Check if preload needed
         lda     zp_part_num
         cmp     zp_preloaded
@@ -123,15 +111,10 @@ main_loop:
         jsr     do_preload
         jmp     main_loop
 
-safe_rti:
-        rti
-
 ; ----------------------------------------------------------------------------
 ; Checkpoint - called during decompression for vblank detection and indicator
 ; ----------------------------------------------------------------------------
 checkpoint:
-        lda     #$35
-        sta     $01
         rol     $D020               ; Loading indicator
         lda     $D012
         bmi     @no_vblank
@@ -141,8 +124,6 @@ checkpoint:
         lda     #0
 @no_vblank:
         sta     zp_last_line
-        lda     #$30
-        sta     $01
         rts
 
 ; ----------------------------------------------------------------------------
@@ -196,13 +177,13 @@ check_countdown:
         lda     zp_part_num
         and     #$01
         bne     @switch_odd
-        ; Even part num (2,4,6,8) -> buffer at $6800
+        ; Even part num (2,4,6,8) -> TUNE2_BASE
         lda     #$00
         ldx     #>TUNE2_BASE
         jsr     player_init
         jmp     @done
 @switch_odd:
-        ; Odd part num (3,5,7,9) -> buffer at $1800
+        ; Odd part num (3,5,7,9) -> TUNE1_BASE
         lda     #$00
         ldx     #>TUNE1_BASE
         jsr     player_init
@@ -256,9 +237,9 @@ part_times:
 init_stream:
         lda     #$80                    ; Empty buffer, will load on first read
         sta     zp_bitbuf
-        lda     #<STREAM_DEST
+        lda     #<STREAM_START
         sta     zp_src_lo
-        lda     #>STREAM_DEST
+        lda     #>STREAM_START
         sta     zp_src_hi
         rts
 
@@ -275,6 +256,6 @@ init_stream:
 .segment "PART1"
 .incbin "../generated/parts/part1.bin"
 
-.segment "DATA"
+.segment "STREAM"
 USE_STREAM2 = 1                 ; Use stream2.bin (songs 2-9 only, byte-aligned)
 .include "stream.inc"

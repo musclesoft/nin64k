@@ -1,3 +1,4 @@
+; Generated file - do not edit. Modify cmd/compress/decompress6502.go instead.
 ; Size: 259 bytes
 ; External zero page variables (must be defined by caller)
 ; zp_src_lo       = $02   ; Source pointer (compressed data)
@@ -12,12 +13,12 @@
 
 ; Buffer layout constants (dual-buffer decompression)
 ; Buffer 1 (odd songs):  $2000
-; Buffer 2 (even songs): $7000
+; Buffer 2 (even songs): $4000
 ; To change: update constants in cmd/compress/decompress6502.go, then rebuild
 DECOMP_BUF1_HI   = $20           ; Buffer 1 high byte
-DECOMP_BUF2_HI   = $70           ; Buffer 2 high byte
-DECOMP_BUF_GAP   = $50           ; Gap between buffers ($5000 >> 8)
-DECOMP_WRAP_HI   = $C0           ; Buffer 2 + gap (wrap threshold)
+DECOMP_BUF2_HI   = $40           ; Buffer 2 high byte
+DECOMP_BUF_GAP   = $20           ; Gap between buffers ($2000 >> 8)
+DECOMP_WRAP_HI   = $60           ; Buffer 2 + gap (wrap threshold)
 
 ; Internal zero page variables
 zp_val_lo       = $07
@@ -30,10 +31,10 @@ zp_caller_x     = $0C
 .proc decompress
         ldy     #$00
         lda     zp_out_hi
-        cmp     #$70
-        lda     #$B0
+        cmp     #$40
+        lda     #$E0
         bcc     store_delta
-        lda     #$50
+        lda     #$20
 store_delta:
         sta     zp_other_delta
 main_loop:
@@ -70,9 +71,9 @@ fwdref:
         bcc     store_and_check
         sbc     zp_other_delta
 store_and_check:
-        cmp     #$C0
+        cmp     #$60
         bcc     no_high_wrap
-        sbc     #$A0
+        sbc     #$40
 no_high_wrap:
         bne     backref_no_adjust
 set_x3:
@@ -106,7 +107,7 @@ backref_common:
         cmp     #$20
         bcs     backref_no_adjust
 backref_adjust:
-        adc     #$A0
+        adc     #$40
 backref_no_adjust:
         sta     zp_ref_hi
         jsr     read_expgol

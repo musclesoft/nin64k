@@ -177,14 +177,14 @@ read_bit:
         pha
         jsr     checkpoint
         asl     zp_bitbuf
-        bne     skip_src_hi_inc
+        bne     read_bit_done
         lda     (zp_src_lo),y
         rol a
         sta     zp_bitbuf
         inc     zp_src_lo
-        bne     skip_src_hi_inc
+        bne     read_bit_done
         inc     zp_src_hi
-skip_src_hi_inc:
+read_bit_done:
         pla
         rts
 terminator:

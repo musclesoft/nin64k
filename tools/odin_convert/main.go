@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -468,9 +469,11 @@ type ConversionStats struct {
 	NewFilterSize     int
 	PatternDictSize   int
 	PatternPackedSize int
+	PrimaryIndices    int
+	ExtendedIndices   int
 }
 
-func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
+func convertToNewFormat(raw []byte, songNum int) ([]byte, ConversionStats) {
 	var stats ConversionStats
 	// Detect base address from entry point JMP (offset 0: 4c xx yy -> base is $yy00)
 	baseAddr := int(raw[2]) << 8
@@ -909,8 +912,17 @@ func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
 		patternData[i] = pat
 	}
 
+	// Build dictionary first to find NOP entry for dead entry mapping
+	dict, _ := buildPatternDict(patternData)
+
+	// Load equivalence map for this song (needs dict to find NOP)
+	equivMap := loadSongEquivMap(songNum, dict)
+
 	// Pack patterns with per-song dictionary + RLE
-	dict, packed, patOffsets := packPatterns(patternData)
+	dict, packed, patOffsets, primaryCount, extendedCount := packPatternsWithEquiv(patternData, equivMap)
+
+	stats.PrimaryIndices = primaryCount
+	stats.ExtendedIndices = extendedCount
 
 	// Fixed layout:
 	// $9D9: row dictionary (1236 bytes = 412 entries × 3)
@@ -1028,7 +1040,6 @@ func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
 	stats.PatternDictSize = len(dict) / 3
 	stats.PatternPackedSize = len(packed)
 
-
 	return out, stats
 }
 
@@ -1049,11 +1060,58 @@ func remapPatternEffects(pattern []byte, remap [16]byte) {
 	}
 }
 
-// packPatterns packs pattern data using per-song row dictionary + RLE
-// Encoding: 0x00-0xDF (224) = primary dict, 0xE0-0xFE (31) = RLE 1-31, 0xFF+byte = extended dict
-// Returns: dictionary (N×3 bytes), packed patterns, pattern offsets (relative to packed data start)
-func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint16) {
-	// Build frequency map of non-repeat rows
+// Global caches loaded once
+var globalEquivCache []EquivResult
+var equivCacheLoaded bool
+
+// loadEquivCache loads the equivalence cache from disk
+func loadEquivCache() []EquivResult {
+	if equivCacheLoaded {
+		return globalEquivCache
+	}
+	equivCacheLoaded = true
+
+	data, err := os.ReadFile("equiv_cache.json")
+	if err != nil {
+		return nil
+	}
+	var results []EquivResult
+	if json.Unmarshal(data, &results) != nil {
+		return nil
+	}
+	globalEquivCache = results
+	return results
+}
+
+// loadSongEquivMap returns equivalence map for a specific song
+// Uses verified equivalences from equiv_cache (extended -> primary with identical output)
+func loadSongEquivMap(songNum int, dict []byte) map[int]int {
+	if songNum < 1 || songNum > 9 {
+		return nil
+	}
+
+	equivCache := loadEquivCache()
+	if equivCache == nil {
+		return nil
+	}
+
+	songEquiv := equivCache[songNum-1].Equiv
+	if len(songEquiv) == 0 {
+		return nil
+	}
+
+	equivMap := make(map[int]int)
+	for extIdxStr, priIdx := range songEquiv {
+		var extIdx int
+		fmt.Sscanf(extIdxStr, "%d", &extIdx)
+		equivMap[extIdx] = priIdx
+	}
+
+	return equivMap
+}
+
+// buildPatternDict builds the dictionary from patterns (sorted by frequency)
+func buildPatternDict(patterns [][]byte) (dict []byte, rowToIdx map[string]int) {
 	rowFreq := make(map[string]int)
 	for _, pat := range patterns {
 		var prevRow [3]byte
@@ -1067,7 +1125,6 @@ func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint
 		}
 	}
 
-	// Sort rows by frequency (descending)
 	type rowEntry struct {
 		row  string
 		freq int
@@ -1078,7 +1135,6 @@ func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint
 	}
 	for i := 0; i < len(sortedRows)-1; i++ {
 		for j := i + 1; j < len(sortedRows); j++ {
-			// Sort by frequency desc, then by content for determinism
 			if sortedRows[j].freq > sortedRows[i].freq ||
 				(sortedRows[j].freq == sortedRows[i].freq && sortedRows[j].row < sortedRows[i].row) {
 				sortedRows[i], sortedRows[j] = sortedRows[j], sortedRows[i]
@@ -1086,22 +1142,27 @@ func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint
 		}
 	}
 
-	// Build dictionary: all unique rows indexed by frequency rank
-	rowToIdx := make(map[string]int)
+	rowToIdx = make(map[string]int)
 	for i, entry := range sortedRows {
 		rowToIdx[entry.row] = i
 		dict = append(dict, entry.row[0], entry.row[1], entry.row[2])
 	}
+	return dict, rowToIdx
+}
 
-	// Pack each pattern
-	const primaryMax = 224  // 0x00-0xDF
-	const rleMax = 31       // 0xE0-0xFE = RLE 1-31
+// packPatternsWithEquiv packs pattern data, using equivalences to reduce extended indices
+func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int) {
+	dict, rowToIdx := buildPatternDict(patterns)
+
+	// Pack each pattern individually first
+	const primaryMax = 224
+	const rleMax = 31
 	const rleBase = 0xE0
 	const extMarker = 0xFF
 
-	for _, pat := range patterns {
-		offsets = append(offsets, uint16(len(packed)))
-
+	patternPacked := make([][]byte, len(patterns))
+	for i, pat := range patterns {
+		var patPacked []byte
 		var prevRow [3]byte
 		repeatCount := 0
 
@@ -1112,41 +1173,197 @@ func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint
 			if curRow == prevRow {
 				repeatCount++
 				if repeatCount == rleMax || row == 63 {
-					// Emit RLE
-					packed = append(packed, byte(rleBase+repeatCount-1))
+					patPacked = append(patPacked, byte(rleBase+repeatCount-1))
 					repeatCount = 0
 				}
 			} else {
-				// Emit pending RLE if any
 				if repeatCount > 0 {
-					packed = append(packed, byte(rleBase+repeatCount-1))
+					patPacked = append(patPacked, byte(rleBase+repeatCount-1))
 					repeatCount = 0
 				}
-				// Emit row
 				idx := rowToIdx[string(curRow[:])]
+
+				// Apply equivalence: if this is an extended index with a primary equivalent, use it
+				if idx >= primaryMax && equivMap != nil {
+					if priIdx, ok := equivMap[idx]; ok {
+						idx = priIdx
+					}
+				}
+
 				if idx < primaryMax {
-					packed = append(packed, byte(idx))
+					patPacked = append(patPacked, byte(idx))
+					primaryCount++
 				} else {
-					packed = append(packed, extMarker, byte(idx-primaryMax))
+					patPacked = append(patPacked, extMarker, byte(idx-primaryMax))
+					extendedCount++
 				}
 			}
 			prevRow = curRow
 		}
-		// Emit final RLE if any
 		if repeatCount > 0 {
-			packed = append(packed, byte(rleBase+repeatCount-1))
+			patPacked = append(patPacked, byte(rleBase+repeatCount-1))
+		}
+		patternPacked[i] = patPacked
+	}
+
+	// Optimize packing using suffix/prefix overlap (greedy superstring)
+	packed, offsets = optimizePackedOverlap(patternPacked)
+
+	return dict, packed, offsets, primaryCount, extendedCount
+}
+
+// optimizePackedOverlap uses greedy superstring algorithm to find optimal overlapping
+func optimizePackedOverlap(patterns [][]byte) (packed []byte, offsets []uint16) {
+	n := len(patterns)
+	if n == 0 {
+		return nil, nil
+	}
+
+	// Find identical patterns first - they can share the same offset
+	canonical := make([]int, n)
+	for i := range canonical {
+		canonical[i] = i
+	}
+	for i := 0; i < n; i++ {
+		if canonical[i] != i {
+			continue
+		}
+		for j := i + 1; j < n; j++ {
+			if canonical[j] != j {
+				continue
+			}
+			if string(patterns[i]) == string(patterns[j]) {
+				canonical[j] = i
+			}
 		}
 	}
 
-	// Verify decoding produces original patterns
-	for i, origPat := range patterns {
-		decoded := decodePattern(dict, packed, offsets[i])
-		if !bytes.Equal(origPat, decoded) {
-			panic(fmt.Sprintf("Pattern %d decode mismatch! First diff at byte %d", i, findFirstDiff(origPat, decoded)))
+	// Get unique patterns
+	var uniquePatterns [][]byte
+	uniqueToOrig := make([]int, 0)
+	origToUnique := make([]int, n)
+	for i := 0; i < n; i++ {
+		if canonical[i] == i {
+			origToUnique[i] = len(uniquePatterns)
+			uniqueToOrig = append(uniqueToOrig, i)
+			uniquePatterns = append(uniquePatterns, patterns[i])
+		} else {
+			origToUnique[i] = -1 // will be set from canonical
+		}
+	}
+	for i := 0; i < n; i++ {
+		if canonical[i] != i {
+			origToUnique[i] = origToUnique[canonical[i]]
 		}
 	}
 
-	return dict, packed, offsets
+	numUnique := len(uniquePatterns)
+	if numUnique == 0 {
+		return nil, make([]uint16, n)
+	}
+
+	// Greedy superstring: work with indices into uniquePatterns
+	// We'll build a superstring by greedily merging patterns with maximum overlap
+
+	// strings[i] is the current merged string at position i (nil if merged into another)
+	strings := make([][]byte, numUnique)
+	for i := range strings {
+		strings[i] = make([]byte, len(uniquePatterns[i]))
+		copy(strings[i], uniquePatterns[i])
+	}
+
+	// patternOffset[i] = offset of original pattern i within strings[root[i]]
+	patternOffset := make([]int, numUnique)
+	// root[i] = which string index pattern i currently belongs to
+	root := make([]int, numUnique)
+	for i := range root {
+		root[i] = i
+	}
+
+	// Repeatedly find and apply best merge
+	for {
+		bestOverlap := 0
+		bestI, bestJ := -1, -1
+
+		// Find best overlap between any two active strings
+		for i := 0; i < numUnique; i++ {
+			if strings[i] == nil {
+				continue
+			}
+			for j := 0; j < numUnique; j++ {
+				if i == j || strings[j] == nil {
+					continue
+				}
+				// Check suffix of strings[i] vs prefix of strings[j]
+				si, sj := strings[i], strings[j]
+				maxLen := len(si)
+				if len(sj) < maxLen {
+					maxLen = len(sj)
+				}
+				for l := maxLen; l >= 1; l-- {
+					if string(si[len(si)-l:]) == string(sj[:l]) {
+						if l > bestOverlap {
+							bestOverlap = l
+							bestI, bestJ = i, j
+						}
+						break
+					}
+				}
+			}
+		}
+
+		if bestOverlap == 0 {
+			break
+		}
+
+		// Merge strings[bestJ] into strings[bestI]
+		si := strings[bestI]
+		sj := strings[bestJ]
+		merged := make([]byte, len(si)+len(sj)-bestOverlap)
+		copy(merged, si)
+		copy(merged[len(si):], sj[bestOverlap:])
+		strings[bestI] = merged
+
+		// Update all patterns that were in bestJ to now be in bestI
+		offsetShift := len(si) - bestOverlap
+		for p := 0; p < numUnique; p++ {
+			if root[p] == bestJ {
+				root[p] = bestI
+				patternOffset[p] += offsetShift
+			}
+		}
+
+		strings[bestJ] = nil
+	}
+
+	// Concatenate all remaining strings and compute final offsets
+	uniqueOffset := make([]int, numUnique)
+	for i := 0; i < numUnique; i++ {
+		if strings[i] != nil {
+			// This is a root string, record its position
+			baseOffset := len(packed)
+			packed = append(packed, strings[i]...)
+			// Update all patterns rooted here
+			for p := 0; p < numUnique; p++ {
+				if root[p] == i {
+					uniqueOffset[p] = baseOffset + patternOffset[p]
+				}
+			}
+		}
+	}
+
+	// Build final offsets for all original patterns
+	offsets = make([]uint16, n)
+	for i := 0; i < n; i++ {
+		offsets[i] = uint16(uniqueOffset[origToUnique[i]])
+	}
+
+	return packed, offsets
+}
+
+// packPatterns packs pattern data using per-song row dictionary + RLE (no equivalence)
+func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int) {
+	return packPatternsWithEquiv(patterns, nil)
 }
 
 // decodePattern simulates the 6502 decode routine for verification
@@ -1249,6 +1466,36 @@ func (c *CPU6502) Reset() {
 	c.P = FlagU | FlagI
 	c.SIDWrites = nil
 	c.Cycles = 0
+}
+
+// CPUSnapshot holds CPU state for fast restore
+type CPUSnapshot struct {
+	A, X, Y      byte
+	SP           byte
+	PC           uint16
+	P            byte
+	Memory       [65536]byte
+	Cycles       uint64
+	CurrentFrame int
+}
+
+func (c *CPU6502) Snapshot() CPUSnapshot {
+	return CPUSnapshot{
+		A: c.A, X: c.X, Y: c.Y,
+		SP: c.SP, PC: c.PC, P: c.P,
+		Memory:       c.Memory,
+		Cycles:       c.Cycles,
+		CurrentFrame: c.CurrentFrame,
+	}
+}
+
+func (c *CPU6502) Restore(snap CPUSnapshot) {
+	c.A, c.X, c.Y = snap.A, snap.X, snap.Y
+	c.SP, c.PC, c.P = snap.SP, snap.PC, snap.P
+	c.Memory = snap.Memory
+	c.Cycles = snap.Cycles
+	c.CurrentFrame = snap.CurrentFrame
+	c.SIDWrites = nil
 }
 
 func (c *CPU6502) Read(addr uint16) byte {
@@ -2106,7 +2353,7 @@ func testSong(songNum int, rawData, playerData []byte) result {
 	builtinCycles := cpuBuiltin.Cycles
 
 	// Convert to new format
-	convertedData, convStats := convertToNewFormat(rawData)
+	convertedData, convStats := convertToNewFormat(rawData, songNum)
 
 	// Run new player with converted data
 	cpuNew := NewCPU()
@@ -2267,7 +2514,7 @@ func main() {
 		if songData[songNum-1] == nil {
 			continue
 		}
-		convertedData, _ := convertToNewFormat(songData[songNum-1])
+		convertedData, _ := convertToNewFormat(songData[songNum-1], songNum)
 		partPath := filepath.Join(partsDir, fmt.Sprintf("part%d.bin", songNum))
 		if err := os.WriteFile(partPath, convertedData, 0644); err != nil {
 			fmt.Printf("Error writing %s: %v\n", partPath, err)
@@ -2301,6 +2548,7 @@ func main() {
 	maxWave, maxArp, maxFilter, maxPatterns, maxOrders := 0, 0, 0, 0, 0
 	maxDictSize, maxPackedSize := 0, 0
 	totalOrigSize, totalNewSize := 0, 0
+	totalPrimary, totalExtended := 0, 0
 	mergedCoverage := make(map[uint16]bool)
 	mergedDataCoverage := make(map[int]bool)
 	maxDataSize := 0
@@ -2339,6 +2587,8 @@ func main() {
 			if s.PatternPackedSize > maxPackedSize {
 				maxPackedSize = s.PatternPackedSize
 			}
+			totalPrimary += s.PrimaryIndices
+			totalExtended += s.ExtendedIndices
 			for addr := range r.coverage {
 				mergedCoverage[addr] = true
 			}
@@ -2355,6 +2605,7 @@ func main() {
 		savings := totalOrigSize - totalNewSize
 		fmt.Printf("\nAll 9 songs passed! Saved %d bytes (%.1f%%)\n", savings, 100*float64(savings)/float64(totalOrigSize))
 		fmt.Printf("Max sizes: orders=%d, wave=%d, arp=%d, filter=%d, patterns=%d, dict=%d, packed=%d\n", maxOrders, maxWave, maxArp, maxFilter, maxPatterns, maxDictSize, maxPackedSize)
+		fmt.Printf("Pattern indices: %d primary (1 byte), %d extended (2 bytes) = %d extra bytes\n", totalPrimary, totalExtended, totalExtended)
 
 		// Report coverage gaps in player code
 		playerBase := uint16(0xF000)
@@ -2408,6 +2659,283 @@ func main() {
 
 	} else {
 		os.Exit(1)
+	}
+
+	// Dead entry test if requested
+	if len(os.Args) > 1 && os.Args[1] == "-equivtest" {
+		fmt.Println("\n=== Equivalence Test ===")
+		testEquivalence(songData, playerData)
+	}
+}
+
+// Equivalence types
+const (
+	EquivNOP      = "nop"       // [0,0,0] full NOP
+	EquivSameSig  = "same_sig"  // [*,y,z] same inst/effect/param
+	EquivSameNote = "same_note" // [x,*,*] same note
+	EquivSameEff  = "same_eff"  // [x,y,*] same note, same inst/effect
+)
+
+// EquivResult stores equivalence test results
+type EquivResult struct {
+	SongNum    int            `json:"song"`
+	Equiv      map[string]int `json:"equiv"`       // extended idx -> best primary idx
+	EquivTypes map[string]string `json:"equiv_types"` // extended idx -> type of match
+	Tested     int            `json:"tested"`
+	Found      int            `json:"found"`
+	TypeCounts map[string]int `json:"type_counts"` // count per type
+}
+
+// testEquivalence tests all candidate types:
+// 1. Full NOP [0,0,0] - the universal silent entry
+// 2. Same effect [x,y,*] - same note and inst/effect, any param
+// 3. Same signature [*,y,z] - same inst/effect/param, any note
+// 4. Same note [x,*,*] - same note, any inst/effect/param
+func testEquivalence(songData [][]byte, playerData []byte) {
+	cacheFile := "equiv_cache.json"
+
+	// Try to load cached results
+	var results []EquivResult
+	if data, err := os.ReadFile(cacheFile); err == nil {
+		if json.Unmarshal(data, &results) == nil && len(results) == 9 {
+			fmt.Println("Loaded cached equivalence results from", cacheFile)
+			analyzeEquivResults(results)
+			return
+		}
+	}
+
+	fmt.Println("Running equivalence tests (parallel)...")
+	fmt.Println("Testing: [0,0,0] NOP, [x,y,*] same_eff, [*,y,z] same_sig, [x,*,*] same_note")
+	results = make([]EquivResult, 9)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	resultChan := make(chan EquivResult, 9)
+
+	for songNum := 1; songNum <= 9; songNum++ {
+		if songData[songNum-1] == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(sn int, rawData []byte) {
+			defer wg.Done()
+			resultChan <- testEquivalenceSong(sn, rawData, playerData)
+		}(songNum, songData[songNum-1])
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	for r := range resultChan {
+		mu.Lock()
+		results[r.SongNum-1] = r
+		mu.Unlock()
+		fmt.Printf("Song %d: tested %d, found %d (nop=%d, same_eff=%d, same_sig=%d, same_note=%d)\n",
+			r.SongNum, r.Tested, r.Found,
+			r.TypeCounts[EquivNOP], r.TypeCounts[EquivSameEff], r.TypeCounts[EquivSameSig], r.TypeCounts[EquivSameNote])
+	}
+
+	// Save cache
+	if data, err := json.MarshalIndent(results, "", "  "); err == nil {
+		os.WriteFile(cacheFile, data, 0644)
+		fmt.Println("Saved results to", cacheFile)
+	}
+
+	analyzeEquivResults(results)
+}
+
+// testEquivalenceSong tests a single song's equivalence candidates
+func testEquivalenceSong(songNum int, rawData, playerData []byte) EquivResult {
+	testFrames := int(partTimes[songNum-1])
+
+	var bufferBase uint16
+	if songNum%2 == 1 {
+		bufferBase = 0x1000
+	} else {
+		bufferBase = 0x7000
+	}
+	playerBase := uint16(0xF000)
+
+	// Convert without equiv cache (pass songNum via local conversion)
+	convertedData, stats := convertSongForTest(songNum, rawData)
+	dictSize := stats.PatternDictSize
+
+	// Build candidate groups
+	type signature struct {
+		instEffect byte
+		param      byte
+	}
+	type noteEff struct {
+		note       byte
+		instEffect byte
+	}
+	sigGroups := make(map[signature][]int)
+	noteGroups := make(map[byte][]int)
+	noteEffGroups := make(map[noteEff][]int)
+
+	// Track special entries
+	nopIdx := -1 // [0,0,0]
+
+	for idx := 0; idx < dictSize; idx++ {
+		dictOff := 0x9D9 + idx*3
+		note := convertedData[dictOff]
+		instEffect := convertedData[dictOff+1]
+		param := convertedData[dictOff+2]
+
+		sig := signature{instEffect, param}
+		sigGroups[sig] = append(sigGroups[sig], idx)
+		noteGroups[note] = append(noteGroups[note], idx)
+		ne := noteEff{note, instEffect}
+		noteEffGroups[ne] = append(noteEffGroups[ne], idx)
+
+		if idx < 224 {
+			// [0,0,0] NOP
+			if note == 0 && instEffect == 0 && param == 0 {
+				nopIdx = idx
+			}
+		}
+	}
+
+	// Initialize player and take snapshot after init
+	cpu := NewCPU()
+	copy(cpu.Memory[bufferBase:], convertedData)
+	copy(cpu.Memory[playerBase:], playerData)
+	cpu.A = 0
+	cpu.X = byte(bufferBase >> 8)
+	cpu.Call(playerBase)
+	cpu.SIDWrites = nil
+	cpu.Cycles = 0
+	snapshot := cpu.Snapshot()
+
+	// Get baseline
+	baseline := serializeWrites(cpu.RunFrames(playerBase+3, testFrames))
+
+	// Test equivalences for each extended entry
+	equiv := make(map[string]int)
+	equivTypes := make(map[string]string)
+	typeCounts := make(map[string]int)
+	tested := 0
+	found := 0
+
+	for extIdx := 224; extIdx < dictSize; extIdx++ {
+		extOff := 0x9D9 + extIdx*3
+		extNote := convertedData[extOff]
+		extInstEffect := convertedData[extOff+1]
+		extSig := signature{extInstEffect, convertedData[extOff+2]}
+		extNE := noteEff{extNote, extInstEffect}
+
+		// Build ordered candidate list with types (test in priority order)
+		type candidate struct {
+			idx      int
+			equivTyp string
+		}
+		var candidates []candidate
+		seen := make(map[int]bool)
+
+		// 1. NOP [0,0,0] - highest priority
+		if nopIdx >= 0 && !seen[nopIdx] {
+			candidates = append(candidates, candidate{nopIdx, EquivNOP})
+			seen[nopIdx] = true
+		}
+
+		// 2. Same effect [x,y,*] - same note and inst/effect, any param
+		for _, idx := range noteEffGroups[extNE] {
+			if idx < 224 && !seen[idx] {
+				candidates = append(candidates, candidate{idx, EquivSameEff})
+				seen[idx] = true
+			}
+		}
+
+		// 3. Same signature [*,y,z]
+		for _, idx := range sigGroups[extSig] {
+			if idx < 224 && !seen[idx] {
+				candidates = append(candidates, candidate{idx, EquivSameSig})
+				seen[idx] = true
+			}
+		}
+
+		// 4. Same note [x,*,*]
+		for _, idx := range noteGroups[extNote] {
+			if idx < 224 && !seen[idx] {
+				candidates = append(candidates, candidate{idx, EquivSameNote})
+				seen[idx] = true
+			}
+		}
+
+		// Test each candidate in priority order
+		for _, cand := range candidates {
+			tested++
+
+			cpu.Restore(snapshot)
+
+			extMemOff := bufferBase + uint16(extOff)
+			priMemOff := bufferBase + 0x9D9 + uint16(cand.idx*3)
+			cpu.Memory[extMemOff] = cpu.Memory[priMemOff]
+			cpu.Memory[extMemOff+1] = cpu.Memory[priMemOff+1]
+			cpu.Memory[extMemOff+2] = cpu.Memory[priMemOff+2]
+
+			testResult := serializeWrites(cpu.RunFrames(playerBase+3, testFrames))
+
+			if bytes.Equal(baseline, testResult) {
+				key := fmt.Sprintf("%d", extIdx)
+				equiv[key] = cand.idx
+				equivTypes[key] = cand.equivTyp
+				typeCounts[cand.equivTyp]++
+				found++
+				break
+			}
+		}
+	}
+
+	return EquivResult{
+		SongNum:    songNum,
+		Equiv:      equiv,
+		EquivTypes: equivTypes,
+		Tested:     tested,
+		Found:      found,
+		TypeCounts: typeCounts,
+	}
+}
+
+// convertSongForTest converts a song without using global equiv cache
+func convertSongForTest(songNum int, rawData []byte) ([]byte, ConversionStats) {
+	// Temporarily disable caches
+	oldEquivCache := globalEquivCache
+	oldEquivLoaded := equivCacheLoaded
+	equivCacheLoaded = true
+	globalEquivCache = nil
+
+	convertedData, stats := convertToNewFormat(rawData, songNum)
+
+	// Restore
+	globalEquivCache = oldEquivCache
+	equivCacheLoaded = oldEquivLoaded
+
+	return convertedData, stats
+}
+
+func analyzeEquivResults(results []EquivResult) {
+	fmt.Println("\n=== Equivalence Analysis ===")
+	totalEquiv := 0
+	totalCounts := make(map[string]int)
+	for _, r := range results {
+		if len(r.Equiv) > 0 {
+			totalEquiv += len(r.Equiv)
+			for typ, cnt := range r.TypeCounts {
+				totalCounts[typ] += cnt
+			}
+		}
+	}
+	if totalEquiv > 0 {
+		fmt.Printf("Total: %d extended entries -> save %d bytes\n", totalEquiv, totalEquiv)
+		fmt.Printf("  [0,0,0] nop:      %d\n", totalCounts[EquivNOP])
+		fmt.Printf("  [x,y,*] same_eff: %d\n", totalCounts[EquivSameEff])
+		fmt.Printf("  [*,y,z] same_sig: %d\n", totalCounts[EquivSameSig])
+		fmt.Printf("  [x,*,*] same_note: %d\n", totalCounts[EquivSameNote])
+	} else {
+		fmt.Println("No equivalences found")
 	}
 }
 

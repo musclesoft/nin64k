@@ -1,0 +1,225 @@
+[
+  {
+    "song": 1,
+    "equiv": {
+      "294": 0,
+      "295": 0,
+      "304": 0,
+      "316": 5,
+      "318": 0,
+      "322": 0,
+      "325": 0,
+      "327": 0,
+      "329": 0,
+      "346": 0,
+      "361": 0
+    },
+    "equiv_types": {
+      "294": "nop",
+      "295": "nop",
+      "304": "nop",
+      "316": "same_note",
+      "318": "nop",
+      "322": "nop",
+      "325": "nop",
+      "327": "nop",
+      "329": "nop",
+      "346": "nop",
+      "361": "nop"
+    },
+    "tested": 1496,
+    "found": 11,
+    "type_counts": {
+      "nop": 10,
+      "same_note": 1
+    }
+  },
+  {
+    "song": 2,
+    "equiv": {
+      "258": 0
+    },
+    "equiv_types": {
+      "258": "nop"
+    },
+    "tested": 123,
+    "found": 1,
+    "type_counts": {
+      "nop": 1
+    }
+  },
+  {
+    "song": 3,
+    "equiv": {
+      "236": 13,
+      "247": 0,
+      "248": 0,
+      "251": 0,
+      "254": 177,
+      "259": 0,
+      "280": 0,
+      "289": 136
+    },
+    "equiv_types": {
+      "236": "same_eff",
+      "247": "nop",
+      "248": "nop",
+      "251": "nop",
+      "254": "same_sig",
+      "259": "nop",
+      "280": "nop",
+      "289": "same_note"
+    },
+    "tested": 681,
+    "found": 8,
+    "type_counts": {
+      "nop": 5,
+      "same_eff": 1,
+      "same_note": 1,
+      "same_sig": 1
+    }
+  },
+  {
+    "song": 4,
+    "equiv": {
+      "259": 0
+    },
+    "equiv_types": {
+      "259": "nop"
+    },
+    "tested": 208,
+    "found": 1,
+    "type_counts": {
+      "nop": 1
+    }
+  },
+  {
+    "song": 5,
+    "equiv": {
+      "301": 0,
+      "302": 0,
+      "339": 0,
+      "362": 0,
+      "375": 103
+    },
+    "equiv_types": {
+      "301": "nop",
+      "302": "nop",
+      "339": "nop",
+      "362": "nop",
+      "375": "same_sig"
+    },
+    "tested": 1409,
+    "found": 5,
+    "type_counts": {
+      "nop": 4,
+      "same_sig": 1
+    }
+  },
+  {
+    "song": 6,
+    "equiv": {},
+    "equiv_types": {},
+    "tested": 0,
+    "found": 0,
+    "type_counts": {}
+  },
+  {
+    "song": 7,
+    "equiv": {
+      "225": 129,
+      "226": 128,
+      "232": 40
+    },
+    "equiv_types": {
+      "225": "same_eff",
+      "226": "same_note",
+      "232": "same_note"
+    },
+    "tested": 96,
+    "found": 3,
+    "type_counts": {
+      "same_eff": 1,
+      "same_note": 2
+    }
+  },
+  {
+    "song": 8,
+    "equiv": {
+      "224": 0,
+      "233": 30,
+      "238": 30,
+      "253": 0,
+      "259": 0,
+      "263": 16,
+      "278": 0,
+      "291": 0,
+      "292": 0,
+      "293": 0,
+      "324": 0,
+      "326": 123,
+      "328": 74,
+      "333": 67,
+      "336": 154,
+      "337": 215,
+      "345": 158
+    },
+    "equiv_types": {
+      "224": "nop",
+      "233": "same_sig",
+      "238": "same_sig",
+      "253": "nop",
+      "259": "nop",
+      "263": "same_note",
+      "278": "nop",
+      "291": "nop",
+      "292": "nop",
+      "293": "nop",
+      "324": "nop",
+      "326": "same_eff",
+      "328": "same_note",
+      "333": "same_eff",
+      "336": "same_note",
+      "337": "same_note",
+      "345": "same_eff"
+    },
+    "tested": 844,
+    "found": 17,
+    "type_counts": {
+      "nop": 8,
+      "same_eff": 3,
+      "same_note": 4,
+      "same_sig": 2
+    }
+  },
+  {
+    "song": 9,
+    "equiv": {
+      "242": 184,
+      "274": 0,
+      "275": 0,
+      "344": 148,
+      "354": 0,
+      "355": 0,
+      "368": 151,
+      "411": 0
+    },
+    "equiv_types": {
+      "242": "same_eff",
+      "274": "nop",
+      "275": "nop",
+      "344": "same_eff",
+      "354": "nop",
+      "355": "nop",
+      "368": "same_sig",
+      "411": "nop"
+    },
+    "tested": 1441,
+    "found": 8,
+    "type_counts": {
+      "nop": 5,
+      "same_eff": 2,
+      "same_sig": 1
+    }
+  }
+]

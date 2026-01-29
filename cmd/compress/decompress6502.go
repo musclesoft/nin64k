@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -79,9 +80,19 @@ func GetDecompressorAsmWithCycleStats(lowestMaxGapOffset int, maxCycleGap uint64
 	base := uint16(0x0D00)
 
 	// Create reverse map: address -> label name
+	// Sort label names for deterministic output when multiple labels share an address
 	labelNames := make(map[uint16]string)
-	for name, offset := range labelMap {
-		labelNames[base+uint16(offset)] = name
+	var sortedNames []string
+	for name := range labelMap {
+		sortedNames = append(sortedNames, name)
+	}
+	sort.Strings(sortedNames)
+	for _, name := range sortedNames {
+		offset := labelMap[name]
+		addr := base + uint16(offset)
+		if _, exists := labelNames[addr]; !exists {
+			labelNames[addr] = name
+		}
 	}
 
 	// Helper to get label name for an address
@@ -486,19 +497,16 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	// ==================== MAIN_LOOP ====================
 	mainLoopPos := label("main_loop")
 
-	// Dispatch: X holds 3-adj value for backref d*3+(3-adj) calculation
-	emit(0xA2, 0x01) // LDX #1 (base for backref adj, modified by INX chain)
+	// Dispatch: X holds adj value for backref d*3+adj calculation
+	// New prefix order: literal=0, backref0=10, backref1=110, backref2=1110, fwdref=11110, copyother=11111
+	emit(0xA2, 0x01) // LDX #1 (base for backref adj and literal sentinel)
 	emit(0x20)
 	jsrReadBit1 := placeholder()
-	bccBackref := pos()
-	emit(0x90, 0x00) // BCC set_x3 (backref0: X=1 → INX INX → X=3)
-
-	emit(0x20)
-	jsrReadBit2 := placeholder()
 	bcsNotLiteral := pos()
-	emit(0xB0, 0x00) // BCS @not_literal
+	emit(0xB0, 0x00) // BCS not_literal (skip if bit=1)
 
-	// ==================== LITERAL ====================
+	// ==================== LITERAL (0) - fall through ====================
+	label("literal")
 	emit(0x8A) // TXA (X=1, sentinel for bit accumulation)
 	literalLoopPos := label("literal_loop")
 	emit(0x20)
@@ -506,35 +514,39 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	emit(0x2A) // ROL A
 	bccLoopOffset := literalLoopPos - pos() - 2
 	emit(0x90, byte(bccLoopOffset)) // BCC @loop
-	// No terminator check needed - terminator is now backref with dist.hi >= $80
 	emit(0x91, zpOutLo) // STA (zpOutLo),Y
 	emit(0xE6, zpOutLo) // INC zpOutLo
-	bneToMain := pos()
+	bneToMainLit := pos()
 	emit(0xD0, 0x00)    // BNE main_loop
 	emit(0xE6, zpOutHi) // INC zpOutHi
-	toMainFromLiteral := mainLoopPos - pos() - 2
-	emit(0xD0, byte(toMainFromLiteral)) // BNE main_loop (always taken)
-	patchRel(bneToMain, mainLoopPos)
+	toMainFromLit := mainLoopPos - pos() - 2
+	emit(0xD0, byte(toMainFromLit)) // BNE main_loop (always taken)
+	patchRel(bneToMainLit, mainLoopPos)
 
+	// Continue dispatch for non-literal commands
 	notLiteralPos := label("not_literal")
 	patchRel(bcsNotLiteral, notLiteralPos)
 
-	// X=1 already set, no manipulation needed
+	emit(0x20)
+	jsrReadBit2 := placeholder()
+	bccBackref0 := pos()
+	emit(0x90, 0x00) // BCC set_x3 (10 -> backref0: X=1 → INX INX → X=3)
+
 	emit(0x20)
 	jsrReadBit3 := placeholder()
 	bccBackref1 := pos()
-	emit(0x90, 0x00) // BCC backref_common (backref1: X=1)
+	emit(0x90, 0x00) // BCC backref_common (110 -> backref1: X=1)
 
 	emit(0x20)
 	jsrReadBit4 := placeholder()
-	bccFwdref := pos()
-	emit(0x90, 0x00) // BCC do_fwdref
+	bccBackref2 := pos()
+	emit(0x90, 0x00) // BCC set_x2 (1110 -> backref2: X=1 → INX → X=2)
 
 	emit(0x20)
 	jsrReadBit5 := placeholder()
-	bccBackref2 := pos()
-	emit(0x90, 0x00) // BCC set_x2 (backref2: X=1 → INX → X=2)
-	// C=1 means copyother - fall through (saves BCS branch!)
+	bccFwdref := pos()
+	emit(0x90, 0x00) // BCC do_fwdref (11110 -> fwdref)
+	// C=1 means copyother (11111) - fall through to fwdref/copyother handler
 
 	// ==================== FWDREF/COPYOTHER ====================
 	// fwdref: C=0 from BCC, copyother: C=1 from fall-through
@@ -569,7 +581,7 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	// ==================== BACKREF ====================
 	// X adjustment via fall-through INX chain (saves 1 byte vs DEX DEX INX)
 	setX3Pos := label("set_x3")
-	patchRel(bccBackref, setX3Pos) // backref0 enters here: X=1 → 2 → 3
+	patchRel(bccBackref0, setX3Pos) // backref0 enters here: X=1 → 2 → 3
 	emit(0xE8) // INX
 	setX2Pos := label("set_x2")
 	patchRel(bccBackref2, setX2Pos) // backref2 enters here: X=1 → 2

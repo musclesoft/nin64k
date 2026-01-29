@@ -21,4 +21,4 @@ selftest_sizes:
         .word   6686                ; Song 8
         .word   7695                ; Song 9
 
-selftest_stream_csum:  .word $EED7
+selftest_stream_csum:  .word $FF72

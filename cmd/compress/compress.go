@@ -263,7 +263,7 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 	choices := make([]choice, n)
 
 	for pos := n - 1; pos >= 0; pos-- {
-		bestCost := 10.0 + cost[pos+1]
+		bestCost := 9.0 + cost[pos+1] // literal: 1-bit prefix + 8-bit value
 		choices[pos] = choice{typ: 0}
 
 		if pos < n-1 {
@@ -304,7 +304,7 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 					if rem == 0 {
 						d--
 					}
-					prefixBits := []int{1, 3, 5}[rem]
+					prefixBits := []int{2, 3, 4}[rem] // backref0=10, backref1=110, backref2=1110
 					baseCost := float64(prefixBits + distBitsFast(d))
 
 					for length := 2; length <= maxLen; length++ {
@@ -340,7 +340,7 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 					if rem == 0 {
 						d--
 					}
-					prefixBits := []int{1, 3, 5}[rem]
+					prefixBits := []int{2, 3, 4}[rem] // backref0=10, backref1=110, backref2=1110
 					baseCost := float64(prefixBits + distBitsFast(d))
 
 					for length := 2; length <= maxLen; length++ {
@@ -353,7 +353,7 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 				}
 			}
 
-			// Fwdref (1110): forward copy from 48K ring buffer
+			// Fwdref (11110): forward copy from 48K ring buffer
 			// Uses memory map to check readability at current output position
 			if positions, ok := dictHash[key]; ok {
 				for _, addr := range positions {
@@ -368,7 +368,7 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 					if offset < 0 {
 						continue // can't encode negative offset for fwdref
 					}
-					baseCost := float64(4 + offsetBitsFast(offset))
+					baseCost := float64(5 + offsetBitsFast(offset))
 					for length := 2; length <= maxLen; length++ {
 						c := baseCost + float64(lenBitsFast(length-2)) + cost[pos+length]
 						if c < bestCost {
@@ -433,11 +433,11 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 			var prefixBits int
 			switch rem {
 			case 0:
-				prefixBits = 1
+				prefixBits = 2 // backref0: 10
 			case 1:
-				prefixBits = 3
+				prefixBits = 3 // backref1: 110
 			case 2:
-				prefixBits = 5
+				prefixBits = 4 // backref2: 1110
 			}
 			baseCost := float64(prefixBits + distBitsFast(d))
 			for length := 2; length <= maxLen; length++ {
@@ -490,11 +490,11 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 	for pos < n {
 		ch := choices[pos]
 		switch ch.typ {
-		case 0: // literal
+		case 0: // literal (0)
 			stats.literals++
-			stats.literalBits += 10
+			stats.literalBits += 9
 			stats.literalUsed[target[pos]] = true
-			writeBits(0b10, 2)
+			writeBits(0b0, 1)
 			writeBits(int(target[pos]), 8)
 			pos++
 		case 1: // self-ref
@@ -510,37 +510,37 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 			lenBits := expGolombBits(ch.length-2, kLen)
 			cmdBits := 0
 			switch rem {
-			case 0:
+			case 0: // backref0 (10)
 				stats.selfRef0++
-				cmdBits = 1 + distBits + lenBits
+				cmdBits = 2 + distBits + lenBits
 				stats.selfRef0Bits += cmdBits
-				writeBits(0b0, 1)
-			case 1:
+				writeBits(0b10, 2)
+			case 1: // backref1 (110)
 				stats.selfRef1++
 				cmdBits = 3 + distBits + lenBits
 				stats.selfRef1Bits += cmdBits
 				writeBits(0b110, 3)
-			case 2:
+			case 2: // backref2 (1110)
 				stats.selfRef2++
-				cmdBits = 5 + distBits + lenBits
+				cmdBits = 4 + distBits + lenBits
 				stats.selfRef2Bits += cmdBits
-				writeBits(0b11110, 5)
+				writeBits(0b1110, 4)
 			}
 			writeExpGolomb(d, kDist)
 			writeExpGolomb(ch.length-2, kLen)
 			pos += ch.length
-		case 2: // dict-self (no bias): offset = ringPos - pos
+		case 2: // fwdref (11110): offset = ringPos - pos
 			if ch.length > stats.maxLength {
 				stats.maxLength = ch.length
 			}
 			stats.dictSelf++
 			offset := ch.dictPos - pos
-			stats.dictSelfBits += 4 + expGolombBits(offset, kOffset) + expGolombBits(ch.length-2, kLen)
-			writeBits(0b1110, 4)
+			stats.dictSelfBits += 5 + expGolombBits(offset, kOffset) + expGolombBits(ch.length-2, kLen)
+			writeBits(0b11110, 5)
 			writeExpGolomb(offset, kOffset)
 			writeExpGolomb(ch.length-2, kLen)
 			pos += ch.length
-		case 3: // dict-other ($6000 bias): encoded = addr - pos - bufferSize
+		case 3: // copyother (11111): encoded = addr - pos - bufferSize
 			if ch.length > stats.maxLength {
 				stats.maxLength = ch.length
 			}
@@ -554,10 +554,10 @@ func compress(target, selfDict, otherDict []byte) ([]byte, int, compressStats) {
 		}
 	}
 
-	// Emit terminator: backref0 prefix + 12 zeros (13 bits total)
+	// Emit terminator: backref0 prefix (10) + 12 zeros (14 bits total)
 	// Data uses at most 11 zeros, so 12 zeros triggers early exit.
 	// Decoder checks for 12+ zeros BEFORE reading another bit, so no trailing 1 needed.
-	writeBits(0b0, 1)  // backref0 prefix
+	writeBits(0b10, 2) // backref0 prefix
 	writeBits(0, 12)   // 12 zeros (terminator signal)
 
 	// Record bit count before padding
@@ -633,6 +633,11 @@ func decompress(compressed, selfDict, otherDict []byte, expectedLen int) []byte 
 
 	for len(output) < expectedLen {
 		if reader.readBit() == 0 {
+			// Literal (0): read 8-bit value
+			b := reader.readBits(8)
+			output = append(output, byte(b))
+		} else if reader.readBit() == 0 {
+			// Backref0 (10): dist % 3 == 0
 			d := reader.readExpGolomb(kDist)
 			// Terminator: d with 12+ leading zeros in gamma (d >= 16380)
 			if d >= 16380 {
@@ -644,9 +649,7 @@ func decompress(compressed, selfDict, otherDict []byte, expectedLen int) []byte 
 				output = append(output, getBackrefByte(len(output), dist))
 			}
 		} else if reader.readBit() == 0 {
-			b := reader.readBits(8)
-			output = append(output, byte(b))
-		} else if reader.readBit() == 0 {
+			// Backref1 (110): dist % 3 == 1
 			d := reader.readExpGolomb(kDist)
 			length := reader.readExpGolomb(kLen) + 2
 			dist := 3*(d+1) - 2
@@ -654,6 +657,15 @@ func decompress(compressed, selfDict, otherDict []byte, expectedLen int) []byte 
 				output = append(output, getBackrefByte(len(output), dist))
 			}
 		} else if reader.readBit() == 0 {
+			// Backref2 (1110): dist % 3 == 2
+			d := reader.readExpGolomb(kDist)
+			length := reader.readExpGolomb(kLen) + 2
+			dist := 3*(d+1) - 1
+			for i := 0; i < length; i++ {
+				output = append(output, getBackrefByte(len(output), dist))
+			}
+		} else if reader.readBit() == 0 {
+			// Fwdref (11110): forward copy from ring buffer
 			offset := reader.readExpGolomb(kOffset)
 			length := reader.readExpGolomb(kLen) + 2
 			ringPos := len(output) + offset
@@ -664,14 +676,8 @@ func decompress(compressed, selfDict, otherDict []byte, expectedLen int) []byte 
 					output = append(output, otherDict[ringPos+i-bufferSize])
 				}
 			}
-		} else if reader.readBit() == 0 {
-			d := reader.readExpGolomb(kDist)
-			length := reader.readExpGolomb(kLen) + 2
-			dist := 3*(d+1) - 1
-			for i := 0; i < length; i++ {
-				output = append(output, getBackrefByte(len(output), dist))
-			}
 		} else {
+			// Copyother (11111): copy from other buffer
 			encoded := reader.readExpGolomb(kOffset)
 			length := reader.readExpGolomb(kLen) + 2
 			ringPos := len(output) + encoded + bufferSize
@@ -974,11 +980,11 @@ func main() {
 		100*float64(totalCompressed)/float64(totalOriginal))
 
 	fmt.Println("\nCommand usage:")
-	fmt.Printf("  backref0 (0):      %5d  %6d bits  %5d bytes\n", totalStats.selfRef0, totalStats.selfRef0Bits, totalStats.selfRef0Bits/8)
-	fmt.Printf("  literal (10):      %5d  %6d bits  %5d bytes\n", totalStats.literals, totalStats.literalBits, totalStats.literalBits/8)
+	fmt.Printf("  literal (0):       %5d  %6d bits  %5d bytes\n", totalStats.literals, totalStats.literalBits, totalStats.literalBits/8)
+	fmt.Printf("  backref0 (10):     %5d  %6d bits  %5d bytes\n", totalStats.selfRef0, totalStats.selfRef0Bits, totalStats.selfRef0Bits/8)
 	fmt.Printf("  backref1 (110):    %5d  %6d bits  %5d bytes\n", totalStats.selfRef1, totalStats.selfRef1Bits, totalStats.selfRef1Bits/8)
-	fmt.Printf("  fwdref (1110):     %5d  %6d bits  %5d bytes\n", totalStats.dictSelf, totalStats.dictSelfBits, totalStats.dictSelfBits/8)
-	fmt.Printf("  backref2 (11110):  %5d  %6d bits  %5d bytes\n", totalStats.selfRef2, totalStats.selfRef2Bits, totalStats.selfRef2Bits/8)
+	fmt.Printf("  backref2 (1110):   %5d  %6d bits  %5d bytes\n", totalStats.selfRef2, totalStats.selfRef2Bits, totalStats.selfRef2Bits/8)
+	fmt.Printf("  fwdref (11110):    %5d  %6d bits  %5d bytes\n", totalStats.dictSelf, totalStats.dictSelfBits, totalStats.dictSelfBits/8)
 	fmt.Printf("  copyother (11111): %5d  %6d bits  %5d bytes\n", totalStats.dictOther, totalStats.dictOtherBits, totalStats.dictOtherBits/8)
 	totalCmds := totalStats.literals + totalStats.selfRef0 + totalStats.selfRef1 + totalStats.selfRef2 + totalStats.dictSelf + totalStats.dictOther
 	totalBits := totalStats.literalBits + totalStats.selfRef0Bits + totalStats.selfRef1Bits + totalStats.selfRef2Bits + totalStats.dictSelfBits + totalStats.dictOtherBits
@@ -989,6 +995,42 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nERROR: max gamma zeros (%d) >= terminator zeros (%d)\n", totalStats.maxGammaZeros, TerminatorZeros)
 		fmt.Fprintf(os.Stderr, "Increase TerminatorZeros in decompress6502.go to at least %d\n", totalStats.maxGammaZeros+1)
 		os.Exit(1)
+	}
+	if totalStats.maxGammaZeros != TerminatorZeros-1 {
+		fmt.Printf("\nNOTE: Terminator uses %d zeros but max data uses %d.\n", TerminatorZeros, totalStats.maxGammaZeros)
+		fmt.Printf("      If this gap is large, consider reducing TerminatorZeros to %d.\n", totalStats.maxGammaZeros+1)
+	}
+
+	// Check if command prefixes are optimally assigned (shorter prefix = more frequent)
+	// Current prefix lengths: literal=1, backref0=2, backref1=3, backref2=4, fwdref=5, copyother=5
+	cmdFreqs := []struct {
+		name   string
+		count  int
+		prefix int
+	}{
+		{"literal", totalStats.literals, 1},
+		{"backref0", totalStats.selfRef0, 2},
+		{"backref1", totalStats.selfRef1, 3},
+		{"backref2", totalStats.selfRef2, 4},
+		{"fwdref", totalStats.dictSelf, 5},
+		{"copyother", totalStats.dictOther, 5},
+	}
+	suboptimal := false
+	for i := 0; i < len(cmdFreqs)-1; i++ {
+		for j := i + 1; j < len(cmdFreqs); j++ {
+			if cmdFreqs[i].prefix < cmdFreqs[j].prefix && cmdFreqs[i].count < cmdFreqs[j].count {
+				if !suboptimal {
+					fmt.Printf("\nWARNING: Command prefix lengths not optimal for frequencies:\n")
+					suboptimal = true
+				}
+				fmt.Printf("  %s (prefix %d bits, count %d) < %s (prefix %d bits, count %d)\n",
+					cmdFreqs[i].name, cmdFreqs[i].prefix, cmdFreqs[i].count,
+					cmdFreqs[j].name, cmdFreqs[j].prefix, cmdFreqs[j].count)
+			}
+		}
+	}
+	if suboptimal {
+		fmt.Printf("  Consider reordering command prefixes in compress.go and decompress6502.go\n")
 	}
 
 	var unusedLits []string

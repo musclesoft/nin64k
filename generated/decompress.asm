@@ -39,8 +39,6 @@ store_delta:
 main_loop:
         ldx     #$01
         jsr     read_bit
-        bcc     set_x3
-        jsr     read_bit
         bcs     not_literal
         txa
 literal_loop:
@@ -54,11 +52,13 @@ literal_loop:
         bne     main_loop
 not_literal:
         jsr     read_bit
+        bcc     set_x3
+        jsr     read_bit
         bcc     backref_common
         jsr     read_bit
-        bcc     fwdref
-        jsr     read_bit
         bcc     set_x2
+        jsr     read_bit
+        bcc     fwdref
 fwdref:
         php
         jsr     read_expgol

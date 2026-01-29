@@ -16,6 +16,7 @@
 ; Zero page
 zp_part_num     = $7B
 zp_preloaded    = $7C              ; Song number that's been preloaded
+zp_last_line    = $0D
 
 ; Decompressor zero page (external interface)
 zp_src_lo       = $02
@@ -24,11 +25,9 @@ zp_bitbuf       = $04
 zp_out_lo       = $05
 zp_out_hi       = $06
 
-; Tune entry points
-TUNE1_INIT      = $1000
-TUNE1_PLAY      = $1003
-TUNE2_INIT      = $7000
-TUNE2_PLAY      = $7003
+; Buffer addresses (new format)
+TUNE1_BASE      = $1800            ; Odd songs (1,3,5,7,9)
+TUNE2_BASE      = $6800            ; Even songs (2,4,6,8)
 
 .segment "RSIDHEADER"
         .byte   "RSID"                  ; $00: Magic
@@ -60,23 +59,29 @@ TUNE2_PLAY      = $7003
 ; ----------------------------------------------------------------------------
 sid_init:
         sei
-        jsr     setup_irq           ; Set up IRQ before stream copy overwrites $DC0D
-        lda     #$30                ; All RAM for stream access
-        sta     $01
+        jsr     setup_irq           ; Set up IRQ before stream copy
+        ; Init player for song 1
         lda     #1
         sta     zp_part_num
         sta     zp_preloaded
-        lda     #0
-        jsr     TUNE1_INIT
-        cli
+        lda     #$00
+        ldx     #>TUNE1_BASE
+        jsr     player_init
+        cli                         ; Enable IRQ - music starts playing
+        lda     #$30                ; All RAM for stream access
+        sta     $01
         jsr     copy_streams
         jsr     init_stream
-@loop:
+
+; ----------------------------------------------------------------------------
+; Main loop - just preloading, playback happens in IRQ
+; ----------------------------------------------------------------------------
+main_loop:
         lda     zp_part_num
         cmp     zp_preloaded
-        bcc     @loop               ; Already preloaded
-        jsr     do_preload          ; Preload next song
-        jmp     @loop
+        bcc     main_loop           ; Already preloaded
+        jsr     do_preload
+        jmp     main_loop
 
 ; ----------------------------------------------------------------------------
 ; Set up raster IRQ
@@ -93,12 +98,10 @@ setup_irq:
         sta     $FFFE
         lda     #>irq_handler
         sta     $FFFF
-        lda     #$30                ; Restore $01 for main loop
-        sta     $01
         rts
 
 ; ----------------------------------------------------------------------------
-; IRQ handler
+; IRQ handler - called on vblank
 ; ----------------------------------------------------------------------------
 irq_handler:
         pha
@@ -112,7 +115,8 @@ irq_handler:
         sta     $01
         lda     $D019
         sta     $D019
-        jsr     do_play
+        jsr     player_play
+        jsr     check_countdown
         pla
         tay
         pla
@@ -123,24 +127,13 @@ irq_handler:
         rti
 
 ; ----------------------------------------------------------------------------
-; PLAY - Call once per frame
+; Checkpoint - called during decompression, just returns (IRQ handles playback)
 ; ----------------------------------------------------------------------------
-do_play:
-        lda     zp_part_num
-        beq     @done
-        and     #$01
-        beq     @play_even
-        jsr     TUNE1_PLAY
-        jmp     @after_play
-@play_even:
-        jsr     TUNE2_PLAY
-@after_play:
-        jsr     check_countdown
-@done:
+checkpoint:
         rts
 
 ; ----------------------------------------------------------------------------
-; do_preload - Decompress and init next song (like nin64k's load_and_init)
+; Preload next song (decompress to alternate buffer)
 ; ----------------------------------------------------------------------------
 do_preload:
         ldx     zp_part_num
@@ -149,26 +142,28 @@ do_preload:
         inx                         ; Next song number
         txa
         pha                         ; Save next song number
-        jsr     decompress_one      ; Decompress next song
-        ; Init the decompressed song ($01=$30 from main loop, tune data spans $A000+)
-        lda     zp_part_num
+        ; Decompress to alternate buffer
+        lda     #$00
+        sta     zp_out_lo
+        txa
         and     #$01
-        bne     @init_even          ; Current odd -> next even -> $7000
-        ; Current even -> next odd -> $1000
-        lda     #$00
-        jsr     TUNE1_INIT
-        jmp     @restore
-@init_even:
-        lda     #$00
-        jsr     TUNE2_INIT
-@restore:
+        bne     @preload_odd
+        ; Even song -> $6800
+        lda     #>TUNE2_BASE
+        bne     @decompress
+@preload_odd:
+        ; Odd song -> $1800
+        lda     #>TUNE1_BASE
+@decompress:
+        sta     zp_out_hi
+        jsr     decompress
         pla                         ; Recover next song number
-        sta     zp_preloaded        ; Mark as preloaded (after decompress+init done)
+        sta     zp_preloaded        ; Mark as preloaded
 @done:
         rts
 
 ; ----------------------------------------------------------------------------
-; check_countdown - Decrement timer, switch songs when expired
+; Check countdown timer, switch to preloaded song when expired
 ; ----------------------------------------------------------------------------
 check_countdown:
         lda     zp_part_num
@@ -182,54 +177,33 @@ check_countdown:
         sta     part_times,x
         lda     #$FF
         cmp     part_times,x
-        bne     @not_underflow
+        bne     @check_zero
         dec     part_times+1,x
-@not_underflow:
+@check_zero:
         lda     part_times,x
         bne     @done
         lda     part_times+1,x
         bne     @done
         lda     zp_part_num
         cmp     #$09
-        bcs     @done               ; Don't advance past song 9
-        ; Song ended - switch to preloaded song (preload happens next frame)
+        beq     @done
+        ; Song ended - switch to preloaded song immediately
         inc     zp_part_num
-@done:
-        rts
-
-; ----------------------------------------------------------------------------
-; decompress_one - Decompress song X (1-9)
-; Song 9 is split: first part in stream_main, rest in stream_tail
-; ----------------------------------------------------------------------------
-decompress_one:
-        txa
-        pha                         ; Save song number
-        lda     #$00
-        sta     zp_out_lo
-        txa
+        ; Init player for the preloaded buffer
+        lda     zp_part_num
         and     #$01
-        bne     @odd
-        lda     #$70
-        bne     @set
-@odd:
-        lda     #$10
-@set:
-        sta     zp_out_hi
-        jsr     decompress
-        pla                         ; Get song number
-        cmp     #9
-        bne     @done
-        pha                         ; Save for return
-        lda     #<STREAM_TAIL_DEST
-        sta     zp_src_lo
-        lda     #>STREAM_TAIL_DEST
-        sta     zp_src_hi
-        lda     #$80
-        sta     zp_bitbuf
-        jsr     decompress
-        pla
+        bne     @switch_odd
+        ; Even part num (2,4,6,8) -> buffer at $6800
+        lda     #$00
+        ldx     #>TUNE2_BASE
+        jsr     player_init
+        jmp     @done
+@switch_odd:
+        ; Odd part num (3,5,7,9) -> buffer at $1800
+        lda     #$00
+        ldx     #>TUNE1_BASE
+        jsr     player_init
 @done:
-        tax                         ; Restore X
         rts
 
 ; ----------------------------------------------------------------------
@@ -239,35 +213,35 @@ part_times:
 .include "part_times.inc"
 
 ; ----------------------------------------------------------------------------
-; init_stream - Initialize stream pointer to song 2 (song 1 is preloaded)
-; Song 1 = 39981 bits = 4997 bytes + 5 bits, so song 2 starts mid-byte
+; Initialize stream pointer to song 2
+; Stream is included with STREAM_OFFSET=3026 so byte 0 = original byte 3026
+; Song 1 = 24210 bits = byte 3026, bit 2 of original stream
 ; ----------------------------------------------------------------------------
-STREAM_OFFSET = 4997                    ; Byte offset where song 2 starts
-
 init_stream:
-        lda     #<(STREAM_MAIN_DEST + 1)
-        sta     zp_src_lo
-        lda     #>(STREAM_MAIN_DEST + 1)
-        sta     zp_src_hi
-        lda     STREAM_MAIN_DEST        ; Load partial byte
-        asl     a                       ; Shift out 5 bits consumed by song 1
+        lda     STREAM_DEST             ; First byte of offset stream
+        sec
+        rol     a
         asl     a
-        asl     a
-        asl     a
-        asl     a
-        ora     #$10                    ; Add sentinel (3 bits remain at 7,6,5)
         sta     zp_bitbuf
+        lda     #<(STREAM_DEST + 1)
+        sta     zp_src_lo
+        lda     #>(STREAM_DEST + 1)
+        sta     zp_src_hi
         rts
 
 ; ============================================================================
-; Decompressor
+; Decompressor (calls checkpoint for vblank detection during decompression)
 ; ============================================================================
-checkpoint:
-        rts
 .include "../generated/decompress.asm"
+
+; ============================================================================
+; Standalone player (new format)
+; ============================================================================
+.include "odin_player.inc"
 
 .segment "PART1"
 .incbin "../generated/part1.bin"
 
 .segment "DATA"
+STREAM_OFFSET = 3026            ; Skip song 1's compressed data (pre-loaded from part1.bin)
 .include "stream.inc"

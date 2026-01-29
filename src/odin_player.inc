@@ -10,19 +10,39 @@
         jmp     player_init             ; +$00: Init (A=song, X=buffer)
         jmp     player_play             ; +$03: Play one frame
 
-; Zero page usage (contiguous block $70-$75)
+; Zero page usage (contiguous block $70-$7D)
 zp_song_base     = $70          ; 2 bytes: base address of current song data
 zp_ptr           = $72          ; 2 bytes: temp pointer / temp values
 zp_trackptr      = $74          ; 2 bytes: track pointer
+zp_row_dict      = $76          ; 2 bytes: row dictionary address
+zp_packed_data   = $78          ; 2 bytes: packed data address
+zp_decode_src    = $7A          ; 2 bytes: decode source pointer (temp)
+zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 
-; New format: packed offsets (all tables deduplicated)
+; Song format: fixed offsets (all tables deduplicated)
 ; $000: Instruments (512 bytes) - interleaved: inst N at offset N*16
 ; $200: Transpose ch0-2 (256 bytes each)
 ; $500: Trackptr ch0-2 (256 bytes each)
 ; $800: Filtertable (234 bytes max)
 ; $8EA: Wavetable (51 bytes max)
 ; $91D: Arptable (188 bytes max)
-; $9D9: Patterns
+; $9D9: Row dictionary (1236 bytes = 412 entries × 3)
+; $EAD: Packed pointers (182 bytes = 91 patterns × 2)
+; $F63: Packed pattern data
+;
+; Pattern packing format:
+;   Row dictionary: 3 bytes per entry [note, inst|effect, param], sorted by frequency
+;   Packed pointers: 2-byte offset into packed data for each pattern
+;   Packed data encoding:
+;     $00-$DF: dictionary index 0-223
+;     $E0-$FE: RLE repeat previous row 1-31 times
+;     $FF + byte: extended dictionary index (224 + byte)
+;   Each pattern decodes to 64 rows × 3 bytes = 192 bytes
+
+; Pattern packing constants
+ROW_DICT_OFF        = $9D9
+PACKED_PTRS_OFF     = $EAD
+PACKED_DATA_OFF     = $F63
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0
@@ -104,6 +124,35 @@ player_init:
         sta     chn_inst_ptr_hi+2
         lda     #$0f
         sta     globalvolume
+        ; Initialize decode buffer state (mark all as empty)
+        lda     #$FF
+        sta     chn_decoded_pat+0
+        sta     chn_decoded_pat+1
+        sta     chn_decoded_pat+2
+        ; Set row_dict_addr = song_base + $9D9
+        lda     zp_song_base
+        clc
+        adc     #<ROW_DICT_OFF
+        sta     zp_row_dict
+        lda     zp_song_base+1
+        adc     #>ROW_DICT_OFF
+        sta     zp_row_dict+1
+        ; Set packed_ptrs_addr = song_base + $EAD
+        lda     zp_song_base
+        clc
+        adc     #<PACKED_PTRS_OFF
+        sta     packed_ptrs_addr
+        lda     zp_song_base+1
+        adc     #>PACKED_PTRS_OFF
+        sta     packed_ptrs_addr+1
+        ; Set packed_data = song_base + $F63
+        lda     zp_song_base
+        clc
+        adc     #<PACKED_DATA_OFF
+        sta     zp_packed_data
+        lda     zp_song_base+1
+        adc     #>PACKED_DATA_OFF
+        sta     zp_packed_data+1
         rts
 
 ; ============================================================================
@@ -912,8 +961,11 @@ get_transpose_order:
         rts
 
 ; get_trackptr_order - Set zp_trackptr for channel Y at order X
-; Trackptr tables at page-aligned offsets: ch0=$600, ch1=$700, ch2=$800
+; Trackptr tables at page-aligned offsets: ch0=$500, ch1=$600, ch2=$700
+; Uses decode buffers for packed pattern format
 get_trackptr_order:
+        ; Save channel in temp location
+        sty     @channel+1          ; SMC: save channel
         ; Get pattern index from page-aligned table
         lda     trackptr_page,y
         sta     zp_ptr+1
@@ -922,16 +974,179 @@ get_trackptr_order:
         txa
         tay
         lda     (zp_ptr),y          ; A = pattern index
-        tay                         ; Y = pattern index for lookup
-        ; Look up pre-computed pattern address from constant tables
-        lda     pattern_off_lo,y
-        clc
-        adc     zp_song_base
+        ; Check if pattern is already decoded for this channel
+@channel:
+        ldx     #0                  ; SMC: channel
+        cmp     chn_decoded_pat,x
+        beq     @already_decoded
+        ; Need to decode pattern
+        sta     chn_decoded_pat,x   ; Mark as being decoded
+        jsr     decode_pattern      ; A = pattern index, X = channel
+@already_decoded:
+        ; Set zp_trackptr to channel's decode buffer
+        lda     decode_buffer_lo,x
         sta     zp_trackptr
-        lda     pattern_off_hi,y
-        adc     zp_song_base+1
+        lda     decode_buffer_hi,x
         sta     zp_trackptr+1
         rts
+
+; Decode buffer address table
+decode_buffer_lo:
+        .byte   <decode_buffer_0, <decode_buffer_1, <decode_buffer_2
+decode_buffer_hi:
+        .byte   >decode_buffer_0, >decode_buffer_1, >decode_buffer_2
+
+; decode_pattern - Decode packed pattern to channel's decode buffer
+; Input: A = pattern index, X = channel (0-2)
+; Preserves: X (channel)
+; Uses: zp_decode_src, zp_decode_dst, zp_ptr
+decode_pattern:
+        stx     @save_channel       ; preserve channel for caller
+        ; Calculate source: packed_data + packed_ptrs[pattern_idx]
+        asl     a                   ; pattern index * 2 for word offset
+        tay
+        lda     packed_ptrs_addr
+        sta     zp_ptr
+        lda     packed_ptrs_addr+1
+        sta     zp_ptr+1
+        lda     (zp_ptr),y          ; ptr lo
+        clc
+        adc     zp_packed_data
+        sta     zp_decode_src
+        iny
+        lda     (zp_ptr),y          ; ptr hi
+        adc     zp_packed_data+1
+        sta     zp_decode_src+1
+        ; Set destination to channel's decode buffer
+        ldx     @save_channel
+        lda     decode_buffer_lo,x
+        sta     zp_decode_dst
+        lda     decode_buffer_hi,x
+        sta     zp_decode_dst+1
+        ; Decode 64 rows (192 bytes output)
+        ; Initialize: src_off=0, dst_off=0, prev_row=0,0,0
+        lda     #0
+        sta     @src_off
+        sta     @dst_off
+        sta     @prev_row
+        sta     @prev_row+1
+        sta     @prev_row+2
+@decode_loop:
+        lda     @dst_off
+        cmp     #192
+        bcs     @decode_done
+        ldy     @src_off
+        lda     (zp_decode_src),y
+        cmp     #$E0
+        bcs     @check_rle
+        ; 0x00-0xDF: primary dict index
+        jsr     @copy_dict_entry
+        jmp     @decode_loop
+@check_rle:
+        cmp     #$FF
+        beq     @extended
+        ; 0xE0-0xFE: RLE 1-31 (repeat prev row)
+        sec
+        sbc     #$DF                ; count = byte - 0xDF (1-31)
+        sta     @rle_count
+        inc     @src_off            ; advance src past RLE byte
+@rle_loop:
+        ; Copy prev row to dst using (zp),Y
+        ldy     @dst_off
+        lda     @prev_row
+        sta     (zp_decode_dst),y
+        iny
+        lda     @prev_row+1
+        sta     (zp_decode_dst),y
+        iny
+        lda     @prev_row+2
+        sta     (zp_decode_dst),y
+        iny
+        sty     @dst_off
+        dec     @rle_count
+        bne     @rle_loop
+        jmp     @decode_loop
+@extended:
+        ; 0xFF + byte: extended dict index = 224 + next byte (16-bit)
+        inc     @src_off
+        ldy     @src_off
+        lda     (zp_decode_src),y
+        clc
+        adc     #224                ; index lo = 224 + byte
+        sta     @dict_idx
+        lda     #0
+        adc     #0                  ; index hi = carry
+        sta     @dict_idx_hi
+        jsr     @copy_dict_entry_16
+        jmp     @decode_loop
+@decode_done:
+        ldx     @save_channel       ; restore channel for caller
+        rts
+
+; Copy dict entry A to dst (primary index < 224)
+@copy_dict_entry:
+        sta     @dict_idx
+        lda     #0
+        sta     @dict_idx_hi
+        ; Fall through to 16-bit version
+
+; Copy dict entry @dict_idx/@dict_idx_hi to dst
+@copy_dict_entry_16:
+        ; Calculate dict offset: index * 3 (16-bit index)
+        ; index*3 = index + index*2
+        ; First calculate index*2
+        lda     @dict_idx
+        asl     a                   ; A*2 lo, C = A*2 hi bit
+        sta     zp_ptr
+        lda     @dict_idx_hi
+        rol     a                   ; (A*2 hi) = dict_idx_hi*2 + carry
+        sta     zp_ptr+1
+        ; Add original index to get index*3
+        lda     zp_ptr
+        clc
+        adc     @dict_idx
+        sta     zp_ptr
+        lda     zp_ptr+1
+        adc     @dict_idx_hi
+        sta     zp_ptr+1
+        ; Add row_dict base
+        lda     zp_ptr
+        clc
+        adc     zp_row_dict
+        sta     zp_ptr
+        lda     zp_ptr+1
+        adc     zp_row_dict+1
+        sta     zp_ptr+1
+        ; Copy 3 bytes from row_dict to dst and prev_row
+        ldy     #0
+        lda     (zp_ptr),y
+        sta     @prev_row
+        ldy     @dst_off
+        sta     (zp_decode_dst),y
+        inc     @dst_off
+        ldy     #1
+        lda     (zp_ptr),y
+        sta     @prev_row+1
+        ldy     @dst_off
+        sta     (zp_decode_dst),y
+        inc     @dst_off
+        ldy     #2
+        lda     (zp_ptr),y
+        sta     @prev_row+2
+        ldy     @dst_off
+        sta     (zp_decode_dst),y
+        inc     @dst_off
+        inc     @src_off            ; advance src past dict index byte
+        rts
+
+; Local variables for decode
+@prev_row:      .byte   0, 0, 0
+@rle_count:     .byte   0
+@dict_idx:      .byte   0
+@dict_idx_hi:   .byte   0
+@src_off:       .byte   0
+@dst_off:       .byte   0
+@save_channel:  .byte   0
 
 ; get_filtertable_y - Get filtertable entry Y (SMC: address patched in init)
 get_filtertable_y:
@@ -975,24 +1190,6 @@ vibrato_table:
         .byte   $00,$0d,$19,$25,$31,$3c,$47,$51,$5b,$63,$6a,$71,$76,$7a,$7e,$7f  ; old depth 8 -> new 7
         .byte   $00,$00,$00,$00,$00,$00,$00,$66,$71,$00,$00,$00,$00,$00,$00,$9f  ; old depth 10 -> new 8 (cols 1-6,9-14 unused)
         .byte   $00,$18,$2f,$46,$5c,$71,$85,$98,$aa,$ba,$c8,$d4,$de,$e6,$eb,$ef  ; old depth 15 -> new 9
-
-; Pattern offset lookup tables (offset = $9D9 + index * 192)
-; 91 entries for patterns 0-90
-pattern_off_lo:
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59,$19
-        .byte   $d9,$99,$59,$19,$d9,$99,$59,$19,$d9,$99,$59
-
-pattern_off_hi:
-        .byte   $09,$0a,$0b,$0c,$0c,$0d,$0e,$0f,$0f,$10,$11,$12,$12,$13,$14,$15
-        .byte   $15,$16,$17,$18,$18,$19,$1a,$1b,$1b,$1c,$1d,$1e,$1e,$1f,$20,$21
-        .byte   $21,$22,$23,$24,$24,$25,$26,$27,$27,$28,$29,$2a,$2a,$2b,$2c,$2d
-        .byte   $2d,$2e,$2f,$30,$30,$31,$32,$33,$33,$34,$35,$36,$36,$37,$38,$39
-        .byte   $39,$3a,$3b,$3c,$3c,$3d,$3e,$3f,$3f,$40,$41,$42,$42,$43,$44,$45
-        .byte   $45,$46,$47,$48,$48,$49,$4a,$4b,$4b,$4c,$4d
 
 ; ============================================================================
 ; Player Variables
@@ -1055,6 +1252,15 @@ PLAYERVARSSIZE = * - chn_hardrestart
 ; Values computed from song base during init
 transpose_page:         .byte   0, 0, 0
 trackptr_page:          .byte   0, 0, 0
+packed_ptrs_addr:       .word   0       ; Address of packed pointers table
+
+; Pattern decode state
+chn_decoded_pat:        .byte   $FF, $FF, $FF  ; Pattern index in each channel's decode buffer
+
+; Decode buffers (192 bytes × 3 channels = 576 bytes)
+decode_buffer_0:        .res    192
+decode_buffer_1:        .res    192
+decode_buffer_2:        .res    192
 
 ; Split frequency tables (104 entries: notes 0-103)
 ; Note 103 holds remapped absolute note value (was 127)

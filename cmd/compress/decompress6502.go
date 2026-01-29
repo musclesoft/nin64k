@@ -24,6 +24,24 @@ const (
 	zpCallerX    = 0x0C // Caller's X saved by read_expgol (backref uses for adj 1/2/3)
 )
 
+// Buffer layout constants for dual-buffer decompression
+// Buffer 1 (odd songs): $2000-$3FFF
+// Buffer 2 (even songs): $7000-$8FFF
+// Gap between buffers: $5000
+//
+// To change buffer addresses:
+//   1. Update these constants
+//   2. Update TUNE1_BASE/TUNE2_BASE in: nin64k.asm, nin64sid.asm, nin64selftest.asm
+//   3. Update PART1 segment start in: c64.cfg, sid.cfg
+//   4. Run: go run ./cmd/compress && make clean && make
+const (
+	DecompBuf1Hi  = 0x20 // Buffer 1 high byte ($2000)
+	DecompBuf2Hi  = 0x70 // Buffer 2 high byte ($7000)
+	DecompBufGap  = 0x50 // Gap between buffers ($5000 >> 8)
+	DecompWrapHi  = 0xC0 // Buffer 2 + gap ($7000 + $5000 = $C000)
+	DecompWrapAdj = DecompWrapHi - DecompBuf1Hi // $A0 = wrap adjustment
+)
+
 // Terminator detection: must be > max gamma zeros in compressed data
 // X counts down from 1: after N zeros, X = 1-(N+1) = -N (mod 256)
 // Threshold = 256 - terminatorZeros detects exactly terminatorZeros consecutive zeros
@@ -339,12 +357,6 @@ func GetDecompressorCodeSize() int {
 	return len(GetDecompressorCode())
 }
 
-// PrintDecompressorAsm prints the assembly source to stdout
-func PrintDecompressorAsm() {
-	fmt.Printf("; Size: %d bytes\n", GetDecompressorCodeSize())
-	fmt.Print(GetDecompressorAsm())
-}
-
 // WriteDecompressorBin writes the decompressor machine code to a file
 func WriteDecompressorBin(path string) error {
 	return os.WriteFile(path, GetDecompressorCode(), 0644)
@@ -357,16 +369,25 @@ func WriteDecompressorAsm(path string) error {
 
 // WriteDecompressorAsmWithCycleStats writes the decompressor assembly with cycle stats
 func WriteDecompressorAsmWithCycleStats(path string, lowestMaxGapOffset int, maxCycleGap uint64) error {
-	zpDefs := `; External zero page variables (must be defined by caller)
+	zpDefs := fmt.Sprintf(`; External zero page variables (must be defined by caller)
 ; zp_src_lo       = $02   ; Source pointer (compressed data)
 ; zp_src_hi       = $03
 ; zp_bitbuf       = $04   ; Bit buffer (set to $80 for first call)
-; zp_out_lo       = $05   ; Output pointer ($1000 or $7000)
+; zp_out_lo       = $05   ; Output pointer
 ; zp_out_hi       = $06
 ;
 ; IMPORTANT: Define 'checkpoint' globally before including this file.
 ; Called frequently (every bit, every byte). Can trash A and P.
 ; Minimal: checkpoint: rts
+
+; Buffer layout constants (dual-buffer decompression)
+; Buffer 1 (odd songs):  $%02X00
+; Buffer 2 (even songs): $%02X00
+; To change: update constants in cmd/compress/decompress6502.go, then rebuild
+DECOMP_BUF1_HI   = $%02X           ; Buffer 1 high byte
+DECOMP_BUF2_HI   = $%02X           ; Buffer 2 high byte
+DECOMP_BUF_GAP   = $%02X           ; Gap between buffers ($5000 >> 8)
+DECOMP_WRAP_HI   = $%02X           ; Buffer 2 + gap (wrap threshold)
 
 ; Internal zero page variables
 zp_val_lo       = $07
@@ -376,7 +397,7 @@ zp_ref_hi       = $0A
 zp_other_delta  = $0B
 zp_caller_x     = $0C
 
-`
+`, DecompBuf1Hi, DecompBuf2Hi, DecompBuf1Hi, DecompBuf2Hi, DecompBufGap, DecompWrapHi)
 	// Size excludes checkpoint RTS (1 byte) which is defined externally
 	content := fmt.Sprintf("; Size: %d bytes\n%s%s", GetDecompressorCodeSize()-1, zpDefs, GetDecompressorAsmIncludeWithCycleStats(lowestMaxGapOffset, maxCycleGap))
 	return os.WriteFile(path, []byte(content), 0644)
@@ -451,14 +472,14 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	// ==================== ENTRY ====================
 	label("decompress")
 	// Entry: zpOutLo/zpOutHi already set to target address
-	// Compute zpOtherDelta from zpOutHi (< $68 = odd buffer at $1800, >= $68 = even buffer at $6800)
-	// zpOtherDelta used with SBC (C=1): $B0 gives +$50, $50 gives -$50
-	emit(0xA0, 0x00)         // LDY #0 (Y stays 0 throughout)
-	emit(0xA5, zpOutHi)      // LDA zpOutHi
-	emit(0xC9, 0x68)         // CMP #$68
-	emit(0xA9, 0xB0)         // LDA #$B0 (odd buffer delta: +$50 via SBC)
-	emit(0x90, 0x02)         // BCC +2 (if < $68, keep $B0)
-	emit(0xA9, 0x50)         // LDA #$50 (even buffer delta: -$50 via SBC)
+	// Compute zpOtherDelta from zpOutHi to determine which buffer we're in
+	// zpOtherDelta used with SBC (C=1): -gap gives +gap, +gap gives -gap
+	emit(0xA0, 0x00)             // LDY #0 (Y stays 0 throughout)
+	emit(0xA5, zpOutHi)          // LDA zpOutHi
+	emit(0xC9, DecompBuf2Hi)     // CMP #DecompBuf2Hi ($70)
+	emit(0xA9, 0x100-DecompBufGap) // LDA #$B0 (buffer 1 delta: -$50 = $B0)
+	emit(0x90, 0x02)             // BCC +2 (if < buf2, keep $B0)
+	emit(0xA9, DecompBufGap)     // LDA #$50 (buffer 2 delta: +$50)
 	label("store_delta")
 	emit(0x85, zpOtherDelta) // STA zpOtherDelta
 
@@ -536,10 +557,10 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 
 	storeAndCheckPos := label("store_and_check")
 	patchRel(bccStoreAndCheck, storeAndCheckPos)
-	emit(0xC9, 0xB8) // CMP #$B8 (above buffer B end at $B7FF?)
+	emit(0xC9, DecompWrapHi) // CMP #DecompWrapHi ($C0)
 	bccNoHighWrap := pos()
 	emit(0x90, 0x00) // BCC @no_high_wrap
-	emit(0xE9, 0xA0) // SBC #$A0 (wrap by total span)
+	emit(0xE9, DecompWrapAdj) // SBC #DecompWrapAdj ($A0)
 	noHighWrapPos := label("no_high_wrap")
 	patchRel(bccNoHighWrap, noHighWrapPos)
 	bneFwdrefToCopy := pos()
@@ -588,12 +609,12 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	emit(0xE5, zpValHi) // SBC zpValHi
 	bccNeedAdjust := pos()
 	emit(0x90, 0x00) // BCC need_adjust (borrow means dist > dst)
-	emit(0xC9, 0x18) // CMP #$18 (below buffer A start at $1800?)
+	emit(0xC9, DecompBuf1Hi) // CMP #DecompBuf1Hi ($20)
 	bcsNoAdjust := pos()
-	emit(0xB0, 0x00) // BCS no_adjust (address >= $1800 is valid)
+	emit(0xB0, 0x00) // BCS no_adjust (address >= buf1 is valid)
 	needAdjustPos := label("backref_adjust")
 	patchRel(bccNeedAdjust, needAdjustPos)
-	emit(0x69, 0xA0) // ADC #$A0 (wrap by total span, C=0)
+	emit(0x69, DecompWrapAdj) // ADC #DecompWrapAdj ($A0, wrap by span)
 	backrefNoAdjustPos := label("backref_no_adjust")
 	patchRel(bcsNoAdjust, backrefNoAdjustPos)
 	patchRel(bneFwdrefToCopy, backrefNoAdjustPos)

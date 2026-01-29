@@ -14,10 +14,10 @@ const (
 	kDist   = 2
 	kOffset = 2
 
-	// Memory regions on C64 (back-to-back buffers)
-	addrLow    = 0x1800 // $1800-$67FF - odd songs (S1, S3, S5, S7, S9)
-	addrHigh   = 0x6800 // $6800-$B7FF - even songs (S2, S4, S6, S8)
-	bufferSize = 0x5000 // 20KB per buffer (enough for largest song ~20KB)
+	// Memory regions on C64 - derived from decompress6502.go constants
+	addrLow    = DecompBuf1Hi << 8  // Odd songs (S1, S3, S5, S7, S9)
+	addrHigh   = DecompBuf2Hi << 8  // Even songs (S2, S4, S6, S8)
+	bufferSize = DecompBufGap << 8  // Gap between buffers
 )
 
 var (
@@ -751,14 +751,10 @@ func main() {
 		case "-vmtest":
 			vmTestMain()
 			return
-		case "-asm":
-			PrintDecompressorAsm()
-			return
 		default:
 			fmt.Fprintf(os.Stderr, "Usage: %s [option]\n", os.Args[0])
 			fmt.Fprintln(os.Stderr, "Options:")
-			fmt.Fprintln(os.Stderr, "  (none)    Compress songs and write to build/")
-			fmt.Fprintln(os.Stderr, "  -asm      Print 6502 decompressor assembly")
+			fmt.Fprintln(os.Stderr, "  (none)    Compress songs and write to generated/")
 			fmt.Fprintln(os.Stderr, "  -vmtest   Run decompressor VM tests")
 			os.Exit(1)
 		}
@@ -1018,10 +1014,21 @@ func main() {
 	os.WriteFile(concatPath, w.data, 0644)
 	fmt.Printf("\nConcatenated bitstream: %d bits (%d bytes) -> %s\n", w.totalBits(), len(w.data), concatPath)
 
-	// Single stream output (no split - rely on sequential decompression)
+	// Full stream for selftest (all songs)
 	streamPath := filepath.Join("generated", "stream.bin")
 	asmPath := filepath.Join("generated", "decompress.asm")
 	os.WriteFile(streamPath, w.data, 0644)
+
+	// Separate stream for songs 2-9 (byte-aligned, no bit offset needed)
+	w2 := &bitWriter{}
+	for song := 2; song <= 9; song++ {
+		r := resultMap[song]
+		w2.copyBits(r.compressed, r.bitCount)
+	}
+	w2.padToByte()
+	stream2Path := filepath.Join("generated", "stream2.bin")
+	os.WriteFile(stream2Path, w2.data, 0644)
+	fmt.Printf("Stream 2-9: %d bytes -> %s\n", len(w2.data), stream2Path)
 
 	// Run VM to get cycle stats for ASM generation
 	cycleStats, err := RunDecompressorForCycleStats(songs, w.data, nil)

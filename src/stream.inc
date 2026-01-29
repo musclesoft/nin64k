@@ -91,8 +91,9 @@ copy_bytes_bwd:
 ; Compressed stream data
 ; ----------------------------------------------------------------------
 stream_data:
-.ifndef STREAM_OFFSET
-    STREAM_OFFSET = 0
+.ifdef USE_STREAM2
+        .incbin "../generated/stream2.bin"
+.else
+        .incbin "../generated/stream.bin"
 .endif
-        .incbin "../generated/stream.bin", STREAM_OFFSET
 stream_end:

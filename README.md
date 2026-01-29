@@ -62,3 +62,15 @@ $AC7E-$FFFD   Compressed stream (21KB)
 ```
 
 Sequential decompression: S1 to buffer A, S2 to buffer B (referencing S1), S3 to buffer A (referencing S2), etc. The stream is consumed faster than output is written, allowing in-place decompression.
+
+## Development
+
+After modifying the song format:
+
+```bash
+make test                       # Rebuild converter and generate parts
+go run cmd/compress/*.go        # Regenerate stream, outputs checksums
+# Copy checksums to src/nin64selftest.asm
+make                            # Rebuild PRG/SID
+make selftest && make run-selftest  # Verify
+```

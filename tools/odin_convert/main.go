@@ -457,15 +457,17 @@ func findReachableOrders(raw []byte, baseAddr, startOrder, numOrders int,
 
 // ConversionStats holds before/after statistics
 type ConversionStats struct {
-	OrigOrders     int
-	NewOrders      int
-	OrigPatterns   int
-	UniquePatterns int
-	OrigWaveSize   int
-	NewWaveSize    int
-	OrigArpSize    int
-	NewArpSize     int
-	NewFilterSize  int
+	OrigOrders        int
+	NewOrders         int
+	OrigPatterns      int
+	UniquePatterns    int
+	OrigWaveSize      int
+	NewWaveSize       int
+	OrigArpSize       int
+	NewArpSize        int
+	NewFilterSize     int
+	PatternDictSize   int
+	PatternPackedSize int
 }
 
 func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
@@ -860,7 +862,7 @@ func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
 	// $800: Filtertable (234 bytes max deduped)
 	// $8EA: Wavetable (51 bytes max deduped)
 	// $91D: Arptable (188 bytes max deduped)
-	// $9D9: Patterns (numPatterns × 192 bytes)
+	// $9D9: Packed pattern header + dictionary + data
 
 	newInstOff := 0x000    // Instruments at start
 	transpose0Off := 0x200 // Page-aligned offsets
@@ -869,11 +871,61 @@ func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
 	trackptr0Off := 0x500
 	trackptr1Off := 0x600
 	trackptr2Off := 0x700
-	filterOff := 0x800   // Filter at $800 (234 bytes max)
-	waveOff := 0x8EA     // Wave at $8EA (51 bytes max)
-	arpOff := 0x91D      // Arp at $91D (188 bytes max)
-	patternsOff := 0x9D9 // Pattern data starts here
-	totalSize := patternsOff + numPatterns*192
+	filterOff := 0x800         // Filter at $800 (234 bytes max)
+	waveOff := 0x8EA           // Wave at $8EA (51 bytes max)
+	arpOff := 0x91D            // Arp at $91D (188 bytes max)
+	rowDictOff := 0x9D9     // Row dictionary (1236 bytes = 412 entries × 3)
+	packedPtrsOff := 0xEAD  // Packed pointers (182 bytes = 91 patterns × 2)
+	packedDataOff := 0xF63  // Packed pattern data
+
+	// Extract patterns to slice for packing (do effect/order remapping first)
+	effectRemap := [16]byte{
+		0,  // 0 -> 0 (no effect)
+		1,  // 1 -> 1
+		2,  // 2 -> 2
+		3,  // 3 -> 3
+		4,  // 4 -> 4
+		0,  // 5 -> unused
+		0,  // 6 -> unused
+		5,  // 7 -> 5
+		6,  // 8 -> 6
+		7,  // 9 -> 7
+		8,  // A -> 8
+		9,  // B -> 9
+		0,  // C -> unused
+		10, // D -> A
+		11, // E -> B
+		12, // F -> C
+	}
+	patternData := make([][]byte, numPatterns)
+	for i, addr := range patterns {
+		srcOff := int(addr) - baseAddr
+		pat := make([]byte, 192)
+		if srcOff >= 0 && srcOff+192 <= len(raw) {
+			copy(pat, raw[srcOff:srcOff+192])
+			remapPatternPositionJumps(pat, orderMap)
+			remapPatternEffects(pat, effectRemap)
+		}
+		patternData[i] = pat
+	}
+
+	// Pack patterns with per-song dictionary + RLE
+	dict, packed, patOffsets := packPatterns(patternData)
+
+	// Fixed layout:
+	// $9D9: row dictionary (1236 bytes = 412 entries × 3)
+	// $EAD: packed pointers (182 bytes = 91 patterns × 2)
+	// $F63: packed data
+	packedSize := len(packed)
+	totalSize := packedDataOff + packedSize
+
+	// Validate limits
+	if numPatterns > 91 {
+		panic(fmt.Sprintf("too many patterns: %d (max 91)", numPatterns))
+	}
+	if len(dict)/3 > 412 {
+		panic(fmt.Sprintf("dictionary too large: %d entries (max 412)", len(dict)/3))
+	}
 
 	out := make([]byte, totalSize)
 
@@ -962,38 +1014,20 @@ func convertToNewFormat(raw []byte) ([]byte, ConversionStats) {
 	copy(out[waveOff:], newWaveTable)
 	copy(out[arpOff:], newArpTable)
 
-	// Effect remap table: old effect -> new effect
-	// Used: 1,2,3,4,7,8,9,A,B,D,E,F -> 1,2,3,4,5,6,7,8,9,A,B,C
-	// Unused: 0,5,6,C -> 0 (or don't care)
-	effectRemap := [16]byte{
-		0,  // 0 -> 0 (no effect)
-		1,  // 1 -> 1
-		2,  // 2 -> 2
-		3,  // 3 -> 3
-		4,  // 4 -> 4
-		0,  // 5 -> unused
-		0,  // 6 -> unused
-		5,  // 7 -> 5
-		6,  // 8 -> 6
-		7,  // 9 -> 7
-		8,  // A -> 8
-		9,  // B -> 9
-		0,  // C -> unused
-		10, // D -> A
-		11, // E -> B
-		12, // F -> C
+	// Write pattern packing data
+	// Row dictionary
+	copy(out[rowDictOff:], dict)
+	// Packed pointers (offset into packed data per pattern)
+	for i, pOff := range patOffsets {
+		out[packedPtrsOff+i*2] = byte(pOff & 0xFF)
+		out[packedPtrsOff+i*2+1] = byte(pOff >> 8)
 	}
+	// Packed pattern data
+	copy(out[packedDataOff:], packed)
 
-	// Copy pattern data and remap position jump targets + effects
-	for i, addr := range patterns {
-		srcOff := int(addr) - baseAddr
-		dstOff := patternsOff + i*192
-		if srcOff >= 0 && srcOff+192 <= len(raw) {
-			copy(out[dstOff:], raw[srcOff:srcOff+192])
-			remapPatternPositionJumps(out[dstOff:dstOff+192], orderMap)
-			remapPatternEffects(out[dstOff:dstOff+192], effectRemap)
-		}
-	}
+	stats.PatternDictSize = len(dict) / 3
+	stats.PatternPackedSize = len(packed)
+
 
 	return out, stats
 }
@@ -1013,6 +1047,156 @@ func remapPatternEffects(pattern []byte, remap [16]byte) {
 		pattern[off] = byte0
 		pattern[off+1] = byte1
 	}
+}
+
+// packPatterns packs pattern data using per-song row dictionary + RLE
+// Encoding: 0x00-0xDF (224) = primary dict, 0xE0-0xFE (31) = RLE 1-31, 0xFF+byte = extended dict
+// Returns: dictionary (N×3 bytes), packed patterns, pattern offsets (relative to packed data start)
+func packPatterns(patterns [][]byte) (dict []byte, packed []byte, offsets []uint16) {
+	// Build frequency map of non-repeat rows
+	rowFreq := make(map[string]int)
+	for _, pat := range patterns {
+		var prevRow [3]byte
+		for row := 0; row < 64; row++ {
+			off := row * 3
+			curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
+			if curRow != prevRow {
+				rowFreq[string(curRow[:])]++
+			}
+			prevRow = curRow
+		}
+	}
+
+	// Sort rows by frequency (descending)
+	type rowEntry struct {
+		row  string
+		freq int
+	}
+	var sortedRows []rowEntry
+	for row, freq := range rowFreq {
+		sortedRows = append(sortedRows, rowEntry{row, freq})
+	}
+	for i := 0; i < len(sortedRows)-1; i++ {
+		for j := i + 1; j < len(sortedRows); j++ {
+			// Sort by frequency desc, then by content for determinism
+			if sortedRows[j].freq > sortedRows[i].freq ||
+				(sortedRows[j].freq == sortedRows[i].freq && sortedRows[j].row < sortedRows[i].row) {
+				sortedRows[i], sortedRows[j] = sortedRows[j], sortedRows[i]
+			}
+		}
+	}
+
+	// Build dictionary: all unique rows indexed by frequency rank
+	rowToIdx := make(map[string]int)
+	for i, entry := range sortedRows {
+		rowToIdx[entry.row] = i
+		dict = append(dict, entry.row[0], entry.row[1], entry.row[2])
+	}
+
+	// Pack each pattern
+	const primaryMax = 224  // 0x00-0xDF
+	const rleMax = 31       // 0xE0-0xFE = RLE 1-31
+	const rleBase = 0xE0
+	const extMarker = 0xFF
+
+	for _, pat := range patterns {
+		offsets = append(offsets, uint16(len(packed)))
+
+		var prevRow [3]byte
+		repeatCount := 0
+
+		for row := 0; row < 64; row++ {
+			off := row * 3
+			curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
+
+			if curRow == prevRow {
+				repeatCount++
+				if repeatCount == rleMax || row == 63 {
+					// Emit RLE
+					packed = append(packed, byte(rleBase+repeatCount-1))
+					repeatCount = 0
+				}
+			} else {
+				// Emit pending RLE if any
+				if repeatCount > 0 {
+					packed = append(packed, byte(rleBase+repeatCount-1))
+					repeatCount = 0
+				}
+				// Emit row
+				idx := rowToIdx[string(curRow[:])]
+				if idx < primaryMax {
+					packed = append(packed, byte(idx))
+				} else {
+					packed = append(packed, extMarker, byte(idx-primaryMax))
+				}
+			}
+			prevRow = curRow
+		}
+		// Emit final RLE if any
+		if repeatCount > 0 {
+			packed = append(packed, byte(rleBase+repeatCount-1))
+		}
+	}
+
+	// Verify decoding produces original patterns
+	for i, origPat := range patterns {
+		decoded := decodePattern(dict, packed, offsets[i])
+		if !bytes.Equal(origPat, decoded) {
+			panic(fmt.Sprintf("Pattern %d decode mismatch! First diff at byte %d", i, findFirstDiff(origPat, decoded)))
+		}
+	}
+
+	return dict, packed, offsets
+}
+
+// decodePattern simulates the 6502 decode routine for verification
+func decodePattern(dict, packed []byte, offset uint16) []byte {
+	const primaryMax = 224
+	const rleBase = 0xE0
+
+	decoded := make([]byte, 192)
+	srcOff := int(offset)
+	dstOff := 0
+	prevRow := [3]byte{0, 0, 0}
+
+	for dstOff < 192 {
+		b := packed[srcOff]
+		srcOff++
+
+		if b < rleBase {
+			// Primary dict index
+			idx := int(b)
+			copy(decoded[dstOff:], dict[idx*3:idx*3+3])
+			copy(prevRow[:], dict[idx*3:idx*3+3])
+			dstOff += 3
+		} else if b < 0xFF {
+			// RLE
+			count := int(b - rleBase + 1)
+			for j := 0; j < count; j++ {
+				copy(decoded[dstOff:], prevRow[:])
+				dstOff += 3
+			}
+		} else {
+			// Extended dict index
+			extIdx := int(packed[srcOff])
+			srcOff++
+			idx := primaryMax + extIdx
+			copy(decoded[dstOff:], dict[idx*3:idx*3+3])
+			copy(prevRow[:], dict[idx*3:idx*3+3])
+			dstOff += 3
+		}
+	}
+
+	return decoded
+}
+
+func findFirstDiff(a, b []byte) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return -1
 }
 
 // SIDWrite represents a single write to a SID register
@@ -2115,6 +2299,7 @@ func main() {
 
 	allPassed := true
 	maxWave, maxArp, maxFilter, maxPatterns, maxOrders := 0, 0, 0, 0, 0
+	maxDictSize, maxPackedSize := 0, 0
 	totalOrigSize, totalNewSize := 0, 0
 	mergedCoverage := make(map[uint16]bool)
 	mergedDataCoverage := make(map[int]bool)
@@ -2148,6 +2333,12 @@ func main() {
 			if s.NewOrders > maxOrders {
 				maxOrders = s.NewOrders
 			}
+			if s.PatternDictSize > maxDictSize {
+				maxDictSize = s.PatternDictSize
+			}
+			if s.PatternPackedSize > maxPackedSize {
+				maxPackedSize = s.PatternPackedSize
+			}
 			for addr := range r.coverage {
 				mergedCoverage[addr] = true
 			}
@@ -2163,7 +2354,7 @@ func main() {
 	if allPassed {
 		savings := totalOrigSize - totalNewSize
 		fmt.Printf("\nAll 9 songs passed! Saved %d bytes (%.1f%%)\n", savings, 100*float64(savings)/float64(totalOrigSize))
-		fmt.Printf("Max sizes: orders=%d, wave=%d, arp=%d, filter=%d, patterns=%d\n", maxOrders, maxWave, maxArp, maxFilter, maxPatterns)
+		fmt.Printf("Max sizes: orders=%d, wave=%d, arp=%d, filter=%d, patterns=%d, dict=%d, packed=%d\n", maxOrders, maxWave, maxArp, maxFilter, maxPatterns, maxDictSize, maxPackedSize)
 
 		// Report coverage gaps in player code
 		playerBase := uint16(0xF000)

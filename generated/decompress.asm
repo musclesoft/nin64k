@@ -3,12 +3,21 @@
 ; zp_src_lo       = $02   ; Source pointer (compressed data)
 ; zp_src_hi       = $03
 ; zp_bitbuf       = $04   ; Bit buffer (set to $80 for first call)
-; zp_out_lo       = $05   ; Output pointer ($1000 or $7000)
+; zp_out_lo       = $05   ; Output pointer
 ; zp_out_hi       = $06
 ;
 ; IMPORTANT: Define 'checkpoint' globally before including this file.
 ; Called frequently (every bit, every byte). Can trash A and P.
 ; Minimal: checkpoint: rts
+
+; Buffer layout constants (dual-buffer decompression)
+; Buffer 1 (odd songs):  $2000
+; Buffer 2 (even songs): $7000
+; To change: update constants in cmd/compress/decompress6502.go, then rebuild
+DECOMP_BUF1_HI   = $20           ; Buffer 1 high byte
+DECOMP_BUF2_HI   = $70           ; Buffer 2 high byte
+DECOMP_BUF_GAP   = $50           ; Gap between buffers ($5000 >> 8)
+DECOMP_WRAP_HI   = $C0           ; Buffer 2 + gap (wrap threshold)
 
 ; Internal zero page variables
 zp_val_lo       = $07
@@ -21,7 +30,7 @@ zp_caller_x     = $0C
 .proc decompress
         ldy     #$00
         lda     zp_out_hi
-        cmp     #$68
+        cmp     #$70
         lda     #$B0
         bcc     store_delta
         lda     #$50
@@ -61,7 +70,7 @@ fwdref:
         bcc     store_and_check
         sbc     zp_other_delta
 store_and_check:
-        cmp     #$B8
+        cmp     #$C0
         bcc     no_high_wrap
         sbc     #$A0
 no_high_wrap:
@@ -94,7 +103,7 @@ backref_common:
         lda     zp_out_hi
         sbc     zp_val_hi
         bcc     backref_adjust
-        cmp     #$18
+        cmp     #$20
         bcs     backref_no_adjust
 backref_adjust:
         adc     #$A0
@@ -168,14 +177,14 @@ read_bit:
         pha
         jsr     checkpoint
         asl     zp_bitbuf
-        bne     read_bit_done
+        bne     skip_src_hi_inc
         lda     (zp_src_lo),y
         rol a
         sta     zp_bitbuf
         inc     zp_src_lo
-        bne     read_bit_done
+        bne     skip_src_hi_inc
         inc     zp_src_hi
-read_bit_done:
+skip_src_hi_inc:
         pla
         rts
 terminator:

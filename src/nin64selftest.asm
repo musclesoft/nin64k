@@ -23,17 +23,17 @@
 ;   zp_part_num - Current part number (1-9)
 ;
 ; Tune buffers:
-;   $1800 - Buffer 1 (odd parts: 1,3,5,7,9)
-;   $6800 - Buffer 2 (even parts: 2,4,6,8)
+;   $2000 - Buffer 1 (odd parts: 1,3,5,7,9)
+;   $7000 - Buffer 2 (even parts: 2,4,6,8)
 ;
 ; ============================================================================
 
 .setcpu "6502"
 
-; Zero page
-zp_selected     = $78
-zp_load_flag    = $79
-zp_part_num     = $7B
+; Zero page (avoid player's $70-$7D)
+zp_selected     = $7E
+zp_load_flag    = $7F
+zp_part_num     = $80
 ; Selftest zero page ($D9-$E6 to avoid player's $FB-$FE)
 zp_csum_lo      = $D9
 zp_csum_hi      = $DA
@@ -74,9 +74,10 @@ GETIN           = $FFE4
 CHROUT          = $FFD2
 IRQ_RETURN      = $EA31
 
-; Buffer destinations for decompressed parts (new format: data only, no embedded player)
-TUNE1_BASE      = $1800
-TUNE2_BASE      = $6800
+; Buffer destinations (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
+; Note: selftest code extends to ~$1A00, so buffers must start after that
+TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
+TUNE2_BASE      = $7000         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801
@@ -280,10 +281,10 @@ selftest_output_checksum:
         lda     zp_song_idx
         and     #$01
         bne     @out_odd
-        lda     #$18                ; Even index (0,2,4,6,8) -> $1800
+        lda     #>TUNE1_BASE        ; Even index (0,2,4,6,8) -> TUNE1
         bne     @out_set
 @out_odd:
-        lda     #$68                ; Odd index (1,3,5,7) -> $6800
+        lda     #>TUNE2_BASE        ; Odd index (1,3,5,7) -> TUNE2
 @out_set:
         sta     zp_ptr_hi
         lda     #$00
@@ -523,19 +524,19 @@ L9BC:
         bne     init_buf2
 
 ; ----------------------------------------------------------------------------
-; init_buf1: Called for EVEN part num (2,4,6,8) → even songs to $6800
+; init_buf1: Called for EVEN part num (2,4,6,8) → even songs to TUNE2
 init_buf1:
         lda     #$00
-        ldx     #$68
+        ldx     #>TUNE2_BASE
         jsr     player_init
 load_done:
         rts
 
 ; ----------------------------------------------------------------------------
-; init_buf2: Called for ODD part num (1,3,5,7,9) → odd songs to $1800
+; init_buf2: Called for ODD part num (1,3,5,7,9) → odd songs to TUNE1
 init_buf2:
         lda     #$00
-        ldx     #$18
+        ldx     #>TUNE1_BASE
         jsr     player_init
         jmp     load_done
 
@@ -608,10 +609,10 @@ load_tune_impl:
         lda     zp_part_num
         and     #$01
         beq     @even_part
-        lda     #$18                ; Odd part num (1,3,5,7,9) -> $1800
+        lda     #>TUNE1_BASE        ; Odd part num (1,3,5,7,9) -> TUNE1
         bne     @do_decompress
 @even_part:
-        lda     #$68                ; Even part num (2,4,6,8) -> $6800
+        lda     #>TUNE2_BASE        ; Even part num (2,4,6,8) -> TUNE2
 @do_decompress:
         sta     zp_out_hi
         ; Call decompressor (reads from zp_src, writes to zp_out)
@@ -665,31 +666,32 @@ init_timing_data:
 ; ============================================================================
 
 ; Expected checksums for decompressed songs 1-9 (16-bit additive)
+; Update: run `go run cmd/compress/*.go` and copy output
 selftest_checksums:
-        .word   $8F57               ; Song 1
-        .word   $09AC               ; Song 2
-        .word   $31E7               ; Song 3
-        .word   $83F9               ; Song 4
-        .word   $9A93               ; Song 5
-        .word   $66E8               ; Song 6
-        .word   $44B1               ; Song 7
-        .word   $7207               ; Song 8
-        .word   $F78D               ; Song 9
+        .word   $6033               ; Song 1
+        .word   $C39D               ; Song 2
+        .word   $4651               ; Song 3
+        .word   $A097               ; Song 4
+        .word   $5834               ; Song 5
+        .word   $FE2A               ; Song 6
+        .word   $9275               ; Song 7
+        .word   $6E9D               ; Song 8
+        .word   $3A54               ; Song 9
 
 ; Song sizes in bytes (songs 1-9)
 selftest_sizes:
-        .word   17113               ; Song 1
-        .word   18265               ; Song 2
-        .word   16537               ; Song 3
-        .word   19993               ; Song 4
-        .word   18649               ; Song 5
-        .word   17305               ; Song 6
-        .word   11353               ; Song 7
-        .word   17305               ; Song 8
-        .word   19033               ; Song 9
+        .word   7734                ; Song 1
+        .word   6494                ; Song 2
+        .word   7073                ; Song 3
+        .word   7649                ; Song 4
+        .word   7266                ; Song 5
+        .word   6749                ; Song 6
+        .word   6160                ; Song 7
+        .word   6869                ; Song 8
+        .word   7748                ; Song 9
 
-; Expected stream checksums
-selftest_stream_csum:  .word $16E8
+; Expected stream checksum
+selftest_stream_csum:  .word $7CE8
 
 ; Screen codes for display
 char_0          = $30
@@ -763,6 +765,7 @@ selftest:
         ; Test all 9 songs
         lda     #0
         sta     zp_song_idx
+        jsr     init_stream             ; Reset stream pointer for decompression tests
 
 @song_loop:
         ; Display "Sx:" where x is song number
@@ -790,10 +793,10 @@ selftest:
         lda     zp_song_idx
         and     #$01
         bne     @odd_idx
-        lda     #$18                ; Even index -> odd songs -> $1800
+        lda     #>TUNE1_BASE        ; Even index -> odd songs -> TUNE1
         bne     @set_dest
 @odd_idx:
-        lda     #$68                ; Odd index -> even songs -> $6800
+        lda     #>TUNE2_BASE        ; Odd index -> even songs -> TUNE2
 @set_dest:
         sta     zp_out_hi
 
@@ -819,10 +822,10 @@ selftest:
         lda     zp_song_idx
         and     #$01
         bne     @init_odd
-        ldx     #$18                ; Even index -> odd songs -> buffer $1800
+        ldx     #>TUNE1_BASE        ; Even index -> odd songs -> buffer TUNE1
         bne     @init_player
 @init_odd:
-        ldx     #$68                ; Odd index -> even songs -> buffer $6800
+        ldx     #>TUNE2_BASE        ; Odd index -> even songs -> buffer TUNE2
 @init_player:
         lda     #$00
         jsr     player_init

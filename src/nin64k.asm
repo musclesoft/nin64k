@@ -4,9 +4,9 @@
 
 .setcpu "6502"
 
-; Zero page
-zp_part_num     = $7B
-zp_preloaded    = $7C              ; Song number that's been preloaded
+; Zero page (avoid player's $70-$7D)
+zp_part_num     = $7E
+zp_preloaded    = $7F              ; Song number that's been preloaded
 zp_last_line    = $0D
 
 ; Decompressor zero page (external interface)
@@ -16,9 +16,9 @@ zp_bitbuf       = $04
 zp_out_lo       = $05
 zp_out_hi       = $06
 
-; Buffer addresses (new format)
-TUNE1_BASE      = $1800         ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $6800         ; Even songs (2,4,6,8)
+; Buffer addresses (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
+TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
+TUNE2_BASE      = $7000         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801
@@ -251,18 +251,14 @@ part_times:
 
 ; ----------------------------------------------------------------------------
 ; Initialize stream pointer to song 2
-; Stream is included with STREAM_OFFSET=3026 so byte 0 = original byte 3026
-; Song 1 = 24210 bits = byte 3026, bit 2 of original stream
+; Stream2 starts byte-aligned at song 2 (no bit offset needed)
 ; ----------------------------------------------------------------------------
 init_stream:
-        lda     STREAM_DEST             ; First byte of offset stream
-        sec
-        rol     a
-        asl     a
+        lda     #$80                    ; Empty buffer, will load on first read
         sta     zp_bitbuf
-        lda     #<(STREAM_DEST + 1)
+        lda     #<STREAM_DEST
         sta     zp_src_lo
-        lda     #>(STREAM_DEST + 1)
+        lda     #>STREAM_DEST
         sta     zp_src_hi
         rts
 
@@ -280,5 +276,5 @@ init_stream:
 .incbin "../generated/parts/part1.bin"
 
 .segment "DATA"
-STREAM_OFFSET = 3026            ; Skip song 1's compressed data (pre-loaded from part1.bin)
+USE_STREAM2 = 1                 ; Use stream2.bin (songs 2-9 only, byte-aligned)
 .include "stream.inc"

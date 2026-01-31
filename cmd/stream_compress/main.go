@@ -143,6 +143,172 @@ func extractTranspose(data []byte, maxFrames int) [3][]int8 {
 	return transpose
 }
 
+func extractOrderTable(data []byte, maxFrames int) [3][]byte {
+	numOrders := getNumOrders(data, maxFrames)
+	var orders [3][]byte
+	for ch := 0; ch < 3; ch++ {
+		off := 0x500 + ch*0x100
+		for order := 0; order < numOrders; order++ {
+			orders[ch] = append(orders[ch], data[off+order])
+		}
+	}
+	return orders
+}
+
+func extractInstruments(data []byte) []byte {
+	// 32 instruments × 16 bytes = 512 bytes
+	if len(data) < 512 {
+		return nil
+	}
+	inst := make([]byte, 512)
+	copy(inst, data[:512])
+	return inst
+}
+
+func extractFilterTable(data []byte) []byte {
+	const filterOff = 0x800
+	const filterSize = 234
+	if len(data) < filterOff+filterSize {
+		return nil
+	}
+	filter := make([]byte, filterSize)
+	copy(filter, data[filterOff:filterOff+filterSize])
+	return filter
+}
+
+func extractWaveTable(data []byte) []byte {
+	const waveOff = 0x8EA
+	const waveSize = 256 // Match validation's size
+	if len(data) < waveOff+waveSize {
+		return nil
+	}
+	wave := make([]byte, waveSize)
+	copy(wave, data[waveOff:waveOff+waveSize])
+	return wave
+}
+
+func extractArpTable(data []byte) []byte {
+	const arpOff = 0x91D
+	const arpSize = 256 // Match validation's size
+	if len(data) < arpOff+arpSize {
+		return nil
+	}
+	arp := make([]byte, arpSize)
+	copy(arp, data[arpOff:arpOff+arpSize])
+	return arp
+}
+
+func countUsedBytes(data []byte) int {
+	if data == nil {
+		return 0
+	}
+	// Find last non-zero byte
+	for i := len(data) - 1; i >= 0; i-- {
+		if data[i] != 0 {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func countUniqueTables[T any](tables []T, extract func(T) []byte) int {
+	seen := make(map[string]bool)
+	for _, t := range tables {
+		data := extract(t)
+		if data == nil {
+			continue
+		}
+		key := string(data)
+		seen[key] = true
+	}
+	return len(seen)
+}
+
+func countUniqueBytes(data []byte) int {
+	seen := make(map[byte]bool)
+	for _, b := range data {
+		seen[b] = true
+	}
+	return len(seen)
+}
+
+func calculateEntropy(data []byte) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	counts := make(map[byte]int)
+	for _, b := range data {
+		counts[b]++
+	}
+	entropy := 0.0
+	n := float64(len(data))
+	for _, count := range counts {
+		p := float64(count) / n
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
+}
+
+func countRuns(data []byte) int {
+	runs := 0
+	for i := 1; i < len(data); i++ {
+		if data[i] == data[i-1] {
+			runs++
+		}
+	}
+	return runs
+}
+
+func count4GramsInt(data []int) (distinct int, repeats int) {
+	grams := make(map[[4]int]int)
+	for i := 0; i <= len(data)-4; i++ {
+		var g [4]int
+		copy(g[:], data[i:i+4])
+		grams[g]++
+	}
+	for _, count := range grams {
+		distinct++
+		if count > 1 {
+			repeats += count - 1
+		}
+	}
+	return
+}
+
+func calculateEntropyInt(data []int) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	counts := make(map[int]int)
+	for _, v := range data {
+		counts[v]++
+	}
+	entropy := 0.0
+	n := float64(len(data))
+	for _, count := range counts {
+		p := float64(count) / n
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
+}
+
+func calculateEntropyInt8(data []int8) float64 {
+	if len(data) == 0 {
+		return 0
+	}
+	counts := make(map[int8]int)
+	for _, v := range data {
+		counts[v]++
+	}
+	entropy := 0.0
+	n := float64(len(data))
+	for _, count := range counts {
+		p := float64(count) / n
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
+}
+
 type compressResult struct {
 	song         int
 	numOrders    int
@@ -328,8 +494,6 @@ func captureSIDFrequencies() [3][]uint16 {
 		for ch := 0; ch < 3; ch++ {
 			sidFreqs[ch] = append(sidFreqs[ch], songFreqs[ch]...)
 		}
-
-		fmt.Printf("Song %d: captured %d frames\n", song, numFrames)
 	}
 
 	return sidFreqs
@@ -337,19 +501,27 @@ func captureSIDFrequencies() [3][]uint16 {
 
 // Instrument offsets in partX.bin
 const (
-	INST_AD        = 0
-	INST_SR        = 1
-	INST_WAVESTART = 2
-	INST_WAVEEND   = 3
-	INST_WAVELOOP  = 4
-	INST_ARPSTART  = 5
-	INST_ARPEND    = 6
-	INST_ARPLOOP   = 7
-	INST_VIBDELAY  = 8
-	INST_VIBDEPSP  = 9
-	INST_SIZE      = 16
-	WAVETABLE_OFF  = 0x8EA // Player patches: wave_load_addr = song_base + $08EA
-	ARPTABLE_OFF   = 0x91D // Player patches: arp_load_addr = song_base + $091D
+	INST_AD          = 0
+	INST_SR          = 1
+	INST_WAVESTART   = 2
+	INST_WAVEEND     = 3
+	INST_WAVELOOP    = 4
+	INST_ARPSTART    = 5
+	INST_ARPEND      = 6
+	INST_ARPLOOP     = 7
+	INST_VIBDELAY    = 8
+	INST_VIBDEPSP    = 9
+	INST_PULSEWIDTH  = 10
+	INST_PULSESPEED  = 11
+	INST_PULSELIMITS = 12
+	INST_FILTSTART   = 13
+	INST_FILTEND     = 14
+	INST_FILTLOOP    = 15
+	INST_SIZE        = 16
+	WAVETABLE_OFF   = 0x8EA // Player patches: wave_load_addr = song_base + $08EA
+	ARPTABLE_OFF    = 0x91D // Player patches: arp_load_addr = song_base + $091D
+	FILTERTABLE_OFF = 0x800 // Filter table offset
+	FILTERTABLE_SZ  = 234   // Filter table size
 )
 
 // simulateStreamPlayer runs a frame-exact player simulation using extracted stream data
@@ -645,59 +817,54 @@ func simulateStreamPlayer(streams [3][]byte, transpose [3][]int8, songBoundaries
 
 // runSideBySideValidation runs VM and simulation frame-by-frame, comparing as we go
 // This helps identify exactly where and why divergence occurs
-// Returns: vmFreqs, simFreqs, noteFreqs, isDrum, isSync, isRingMod
-func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundaries []int, orderBoundaries []int) ([3][]uint16, [3][]uint16, [3][]uint16, [3][]bool) {
-	fmt.Println("\nRunning side-by-side VM vs Simulation validation...")
+// SongTableData holds per-song table data for validation
+type SongTableData struct {
+	InstData    []byte
+	WaveTable   []byte
+	ArpTable    []byte
+	FilterTable []byte
+}
+
+// Returns: vmRegs, simRegs, noteFreqs, isDrum, patternStartFrames
+// If tableDatas is nil, loads tables from files; otherwise uses provided data
+func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundaries []int, orderBoundaries []int, tableDatas []SongTableData) (SIDRegisters, SIDRegisters, [3][]uint16, [3][]bool, []int) {
+	// Run side-by-side VM vs Simulation validation (quiet mode)
 
 	playerData, err := os.ReadFile("build/player.bin")
 	if err != nil {
 		fmt.Printf("Error: could not load player: %v\n", err)
-		return [3][]uint16{}, [3][]uint16{}, [3][]uint16{}, [3][]bool{}
+		return SIDRegisters{}, SIDRegisters{}, [3][]uint16{}, [3][]bool{}, nil
 	}
+
+	var patternStartFrames []int // Frame numbers where each pattern starts
 
 	// Load song data for instrument/wave/arp tables
 	type songData struct {
-		data      []byte
-		instData  []byte
-		waveTable []byte
-		arpTable  []byte
-		drumInst  [32]bool // Pre-classified drum instruments
+		data        []byte
+		instData    []byte
+		waveTable   []byte
+		arpTable    []byte
+		filterTable []byte
+		drumInst    [32]bool // Pre-classified drum instruments
 	}
-	var songs []songData
-	for song := 1; song <= 9; song++ {
-		data, err := os.ReadFile(filepath.Join("generated", "parts", fmt.Sprintf("part%d.bin", song)))
-		if err != nil {
-			songs = append(songs, songData{})
-			continue
-		}
-		inst := make([]byte, 32*INST_SIZE)
-		if len(data) >= 32*INST_SIZE {
-			copy(inst, data[:32*INST_SIZE])
-		}
-		wave := make([]byte, 256)
-		if len(data) > WAVETABLE_OFF+256 {
-			copy(wave, data[WAVETABLE_OFF:WAVETABLE_OFF+256])
-		}
-		arp := make([]byte, 256)
-		if len(data) > ARPTABLE_OFF+256 {
-			copy(arp, data[ARPTABLE_OFF:ARPTABLE_OFF+256])
-		}
 
-		// Pre-classify drum instruments based on arp table and wave table analysis
+	classifyDrums := func(inst, wave, arp []byte) [32]bool {
 		var drumInst [32]bool
 		for i := 1; i < 32; i++ {
 			off := i * INST_SIZE
+			if off+INST_WAVEEND >= len(inst) {
+				continue
+			}
 			arpStart := int(inst[off+INST_ARPSTART])
 			arpEnd := int(inst[off+INST_ARPEND])
 			waveStart := int(inst[off+INST_WAVESTART])
 			waveEnd := int(inst[off+INST_WAVEEND])
 
-			// Analyze arp table: count abs/rel and track range of absolute notes
 			absCount := 0
 			relCount := 0
 			minAbsNote := 255
 			maxAbsNote := 0
-			for j := arpStart; j <= arpEnd && j < 256; j++ {
+			for j := arpStart; j <= arpEnd && j < len(arp); j++ {
 				if arp[j] >= 0x80 {
 					absCount++
 					noteIdx := int(arp[j] & 0x7F)
@@ -712,36 +879,87 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 				}
 			}
 
-			// Count noise waveforms in wave table
 			noiseCount := 0
 			totalWave := 0
-			for j := waveStart; j <= waveEnd && j < 256; j++ {
+			for j := waveStart; j <= waveEnd && j < len(wave); j++ {
 				totalWave++
 				if wave[j]&0xF0 == 0x80 {
 					noiseCount++
 				}
 			}
 
-			// Classify as drum if: ALL absolute notes (no relative) OR ALL noise waveform
 			if absCount > 0 && relCount == 0 {
 				drumInst[i] = true
 			}
 			if totalWave > 0 && noiseCount == totalWave {
 				drumInst[i] = true
 			}
-			// Also classify as drum if absolute notes span > 2 octaves (24 semitones)
 			if absCount > 0 && maxAbsNote-minAbsNote > 24 {
 				drumInst[i] = true
 			}
 		}
+		return drumInst
+	}
 
-		songs = append(songs, songData{data, inst, wave, arp, drumInst})
+	var songs []songData
+	if tableDatas != nil {
+		// Use provided table data
+		for _, td := range tableDatas {
+			inst := make([]byte, 32*INST_SIZE)
+			copy(inst, td.InstData)
+			wave := make([]byte, 256)
+			copy(wave, td.WaveTable)
+			arp := make([]byte, 256)
+			copy(arp, td.ArpTable)
+			filter := make([]byte, FILTERTABLE_SZ)
+			copy(filter, td.FilterTable)
+			drumInst := classifyDrums(inst, wave, arp)
+			songs = append(songs, songData{nil, inst, wave, arp, filter, drumInst})
+		}
+	} else {
+		// Load from files
+		for song := 1; song <= 9; song++ {
+			data, err := os.ReadFile(filepath.Join("generated", "parts", fmt.Sprintf("part%d.bin", song)))
+			if err != nil {
+				songs = append(songs, songData{})
+				continue
+			}
+			inst := make([]byte, 32*INST_SIZE)
+			if len(data) >= 32*INST_SIZE {
+				copy(inst, data[:32*INST_SIZE])
+			}
+			wave := make([]byte, 256)
+			if len(data) > WAVETABLE_OFF+256 {
+				copy(wave, data[WAVETABLE_OFF:WAVETABLE_OFF+256])
+			}
+			arp := make([]byte, 256)
+			if len(data) > ARPTABLE_OFF+256 {
+				copy(arp, data[ARPTABLE_OFF:ARPTABLE_OFF+256])
+			}
+			filter := make([]byte, FILTERTABLE_SZ)
+			if len(data) > FILTERTABLE_OFF+FILTERTABLE_SZ {
+				copy(filter, data[FILTERTABLE_OFF:FILTERTABLE_OFF+FILTERTABLE_SZ])
+			}
+			drumInst := classifyDrums(inst, wave, arp)
+			songs = append(songs, songData{data, inst, wave, arp, filter, drumInst})
+		}
 	}
 
 	const playerBase = uint16(0xF000)
 
 	var vmFreqs [3][]uint16
+	var vmPWs [3][]uint16
+	var vmControls [3][]byte
+	var vmADs [3][]byte
+	var vmSRs [3][]byte
+	var vmFilterLos []byte
+	var vmFilterHis []byte
+	var vmFilterRess []byte
+	var vmFilterVols []byte
 	var simFreqs [3][]uint16
+	var simControls [3][]byte
+	var simADs [3][]byte
+	var simSRs [3][]byte
 	var noteFreqs [3][]uint16 // Base note frequencies without vibrato (for clean MIDI)
 	var isDrum [3][]bool      // True when frame uses absolute arp note, sync, ring mod, or noise (drum-like)
 
@@ -752,6 +970,7 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 	// Simulation state
 	type chanState struct {
 		freq        uint16
+		finFreq     uint16 // final frequency with vibrato applied (like player's chn_finfreq)
 		noteFreq    uint16
 		note        int
 		inst        int
@@ -777,13 +996,31 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 		waveform    byte   // current waveform register (set by effect 7 or wave table)
 		gateOn      byte   // gate mask: $FF=gate on, $FE=gate off (like player's chn_gateon)
 		hardRestart int    // hard restart offset (frames to look ahead, typically 2)
+		// Pulse width
+		plsWidthLo  byte
+		plsWidthHi  byte
+		plsSpeed    byte
+		plsDir      byte // 0=up, $80=down
+		plsLimitUp  byte
+		plsLimitDn  byte
 	}
+	// Filter state (global, not per-channel)
+	filterIdx := 0
+	filterEnd := 0
+	filterLoop := 0
+	filterCutoff := byte(0)
+	filterResonance := byte(0)
+	filterMode := byte(0)
+	globalVolume := byte(0x0F) // Default volume
 
 	totalMismatches := 0
 	totalFreqMismatches := 0
 	totalControlMismatches := 0
 	totalADMismatches := 0
 	totalSRMismatches := 0
+	totalPWMismatches := 0
+	totalFilterMismatches := 0
+	globalFrameOffset := 0
 
 	for songIdx := 0; songIdx < 9; songIdx++ {
 		if songIdx >= len(songs) || len(songs[songIdx].data) == 0 {
@@ -814,6 +1051,10 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 		vmControl := [3]byte{}
 		vmAD := [3]byte{}
 		vmSR := [3]byte{}
+		vmFilterLo := byte(0)
+		vmFilterHi := byte(0)
+		vmFilterRes := byte(0)
+		vmFilterMode := byte(0)
 
 		// Initialize simulation state (pure simulation - no VM reads)
 		// Player init clears ALL player variables to 0 (@clear loop), then:
@@ -826,6 +1067,14 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 			// All other fields start at 0 (gateOn=0, waveform=0, ad=0, sr=0, etc.)
 			// This matches the player's @clear loop which sets everything to 0
 		}
+		// Reset global filter state for new song (player's @clear loop sets these to 0)
+		filterIdx = 0
+		filterEnd = 0
+		filterLoop = 0
+		filterCutoff = 0
+		filterResonance = 0
+		filterMode = 0
+		globalVolume = 0x0F // Player doesn't reset volume in @clear, but we use default
 		speed := 6
 		speedCounter := 5
 		mod3Counter := 0
@@ -839,6 +1088,9 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 
 		songMismatches := 0
 		songFirstMismatch := false
+
+		// Record song start as pattern start
+		patternStartFrames = append(patternStartFrames, globalFrameOffset)
 
 		for frame := 0; frame < numFrames; frame++ {
 
@@ -896,6 +1148,15 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					vmAD[2] = w.Value
 				case 0xD414:
 					vmSR[2] = w.Value
+				// Filter
+				case 0xD415:
+					vmFilterLo = w.Value
+				case 0xD416:
+					vmFilterHi = w.Value
+				case 0xD417:
+					vmFilterRes = w.Value
+				case 0xD418:
+					vmFilterMode = w.Value
 				}
 			}
 
@@ -903,7 +1164,15 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 			for ch := 0; ch < 3; ch++ {
 				vmFreq[ch] = uint16(vmFreqLo[ch]) | uint16(vmFreqHi[ch])<<8
 				vmFreqs[ch] = append(vmFreqs[ch], vmFreq[ch])
+				vmPWs[ch] = append(vmPWs[ch], uint16(vmPwLo[ch])|uint16(vmPwHi[ch])<<8)
+				vmControls[ch] = append(vmControls[ch], vmControl[ch])
+				vmADs[ch] = append(vmADs[ch], vmAD[ch])
+				vmSRs[ch] = append(vmSRs[ch], vmSR[ch])
 			}
+			vmFilterLos = append(vmFilterLos, vmFilterLo)
+			vmFilterHis = append(vmFilterHis, vmFilterHi)
+			vmFilterRess = append(vmFilterRess, vmFilterRes)
+			vmFilterVols = append(vmFilterVols, vmFilterMode)
 
 			// === Run simulation frame ===
 			// Player order: 1) inc speedcounter/fetch row 2) process channels 3) HR check 4) SID dump
@@ -917,8 +1186,8 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 			speedCounter++
 			if speedCounter >= speed && row < endRow {
 				speedCounter = 0
-
 				// Handle pattern boundary
+				prevTrackRow := trackRow
 				if forcenewpattern {
 					ordernumber = nextordernumber
 					nextordernumber++
@@ -934,6 +1203,11 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					}
 				}
 
+				// Record pattern start frames (when trackRow becomes 0, excluding first row of song)
+				if trackRow == 0 && prevTrackRow != 0 && frame > 0 {
+					patternStartFrames = append(patternStartFrames, globalFrameOffset+frame)
+				}
+
 				// Compute global row
 				row = songBoundaries[songIdx] + ordernumber*64 + trackRow
 
@@ -944,40 +1218,39 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					inst := int(instEff & 0x1F)
 					effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
 
-					// Use song-local ordernumber for transpose lookup
+				// Use song-local ordernumber for transpose lookup
 					transIdx := orderBoundaries[songIdx] + ordernumber
 					trans := int8(0)
 					if transIdx < len(transpose[ch]) {
 						trans = transpose[ch][transIdx]
 					}
 
-					// Player stores effect BEFORE processing note (see lines 600-616)
-					// So note handling checks the NEW effect, not old
-					if effect > 0 {
-						simState[ch].effect = effect
-						simState[ch].param = param
-					} else if param == 0 {
-						simState[ch].effect = 0
-						simState[ch].param = 0
-					}
+					// Player ALWAYS stores effect (even if 0) - see lines 600-616
+					simState[ch].effect = effect
+					simState[ch].param = param
 
-					// Effect 7 = set waveform register directly (player effect09)
-					if effect == 7 {
-						simState[ch].waveform = param
-					}
-
-				// Player processes inst BEFORE note (see fetch_channel_row)
+					// Player processes inst BEFORE note (see fetch_channel_row)
 					// vibpos is only reset when inst changes, not for every note
 					if inst > 0 {
 						simState[ch].inst = inst
-						// Reset waveIdx, arpIdx, vibDelay, vibPos when inst changes
+						// Reset waveIdx, arpIdx, vibDelay, vibPos, pulse, filter when inst changes
 						sd := songs[songIdx]
-						if len(sd.instData) > inst*INST_SIZE+INST_VIBDEPSP {
+						if len(sd.instData) > inst*INST_SIZE+INST_FILTLOOP {
 							simState[ch].waveIdx = int(sd.instData[inst*INST_SIZE+INST_WAVESTART])
 							simState[ch].arpIdx = int(sd.instData[inst*INST_SIZE+INST_ARPSTART])
 							simState[ch].vibDelay = int(sd.instData[inst*INST_SIZE+INST_VIBDELAY])
 							simState[ch].ad = sd.instData[inst*INST_SIZE+INST_AD]
 							simState[ch].sr = sd.instData[inst*INST_SIZE+INST_SR]
+							// Pulse width params - unpack like player does
+							pw := sd.instData[inst*INST_SIZE+INST_PULSEWIDTH]
+							simState[ch].plsWidthLo = pw << 4       // low nibble to high nibble of lo byte
+							simState[ch].plsWidthHi = pw >> 4       // high nibble to low nibble of hi byte
+							simState[ch].plsSpeed = sd.instData[inst*INST_SIZE+INST_PULSESPEED]
+							limits := sd.instData[inst*INST_SIZE+INST_PULSELIMITS]
+							simState[ch].plsLimitDn = limits >> 4   // high nibble is down limit
+							simState[ch].plsLimitUp = limits & 0x0F // low nibble is up limit
+							simState[ch].plsDir = 0                 // Start going up
+							// Note: Filter params are NOT loaded from inst - only via FEx effect
 						}
 						simState[ch].vibratoPos = 0
 					}
@@ -992,7 +1265,14 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 								simState[ch].noteFreq = uint16(freqTableLo[idx]) | uint16(freqTableHi[idx])<<8
 							}
 						}
-						// Reset slide when note is triggered (player does this in @notporta)
+						// Reset waveIdx, arpIdx, slide when note is triggered (player does this in @notporta)
+						// Player resets these on EVERY note, not just when inst changes
+						sd := songs[songIdx]
+						currentInst := simState[ch].inst
+						if currentInst > 0 && len(sd.instData) > currentInst*INST_SIZE+INST_ARPSTART {
+							simState[ch].waveIdx = int(sd.instData[currentInst*INST_SIZE+INST_WAVESTART])
+							simState[ch].arpIdx = int(sd.instData[currentInst*INST_SIZE+INST_ARPSTART])
+						}
 						simState[ch].slideDelta = 0
 						simState[ch].slideEnable = false
 						// Trigger envelope attack
@@ -1127,6 +1407,39 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					}
 				}
 
+				// Process pulse width (like player's pi_pulse)
+				if s.plsSpeed != 0 {
+					if s.plsDir != 0 {
+						// Going down
+						newLo := int(s.plsWidthLo) - int(s.plsSpeed)
+						if newLo < 0 {
+							s.plsWidthLo = byte(newLo + 256)
+							s.plsWidthHi--
+						} else {
+							s.plsWidthLo = byte(newLo)
+						}
+						if int8(s.plsWidthHi) < int8(s.plsLimitDn) {
+							s.plsDir = 0
+							s.plsWidthLo = 0
+							s.plsWidthHi = s.plsLimitDn
+						}
+					} else {
+						// Going up
+						newLo := int(s.plsWidthLo) + int(s.plsSpeed)
+						if newLo > 255 {
+							s.plsWidthLo = byte(newLo - 256)
+							s.plsWidthHi++
+						} else {
+							s.plsWidthLo = byte(newLo)
+						}
+						if int8(s.plsWidthHi) > int8(s.plsLimitUp) {
+							s.plsDir = 0x80
+							s.plsWidthLo = 0xFF
+							s.plsWidthHi = s.plsLimitUp
+						}
+					}
+				}
+
 				// Apply effects
 				switch s.effect {
 				case 1: // Slide - modifies slideDelta by ±$20
@@ -1138,6 +1451,9 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 						// Slide down
 						s.slideDelta -= 0x20
 					}
+				case 2: // Set pulse width from parameter
+					s.plsWidthLo = s.param << 4
+					s.plsWidthHi = s.param >> 4
 				case 3: // Portamento - slides freq toward noteFreq (like player's effect03)
 					// Player uses chn_notefreq as target, which is set by:
 					// - set_notefreq_only when new note with effect=3
@@ -1165,6 +1481,12 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 				case 4: // Vibrato effect - sets depth and speed
 					s.vibDepth = int(s.param & 0xF0) // high nibble as-is
 					s.vibSpeed = int(s.param & 0x0F)
+				case 5: // Set AD register directly
+					s.ad = s.param
+				case 6: // Set SR register directly
+					s.sr = s.param
+				case 7: // Set waveform register directly (runs every frame, overrides wave table)
+					s.waveform = s.param
 				case 8:
 					arpX := int(s.param >> 4)
 					arpY := int(s.param & 0x0F)
@@ -1182,14 +1504,33 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 						s.freq = uint16(freqTableLo[idx]) | uint16(freqTableHi[idx])<<8
 						s.noteFreq = s.freq
 					}
+				case 11: // Effect B = set filter resonance
+					filterResonance = s.param
 				case 12: // Effect C = old effect F (extended effects) - only on first frame of row
 					if speedCounter == 0 && s.param >= 0x80 {
 						highNibble := s.param & 0xF0
 						lowNibble := s.param & 0x0F
+						if highNibble == 0x80 {
+							// F8x: Set global volume
+							globalVolume = byte(lowNibble)
+						}
+						if highNibble == 0x90 {
+							// F9x: Set filter mode (lowNibble << 4)
+							filterMode = byte(lowNibble << 4)
+						}
 						if highNibble == 0xB0 {
 							// FBx: Slide - add lowNibble*4 to slideDelta, enable slide
 							s.slideDelta += int16(lowNibble) * 4
 							s.slideEnable = true
+						}
+						if highNibble == 0xE0 && lowNibble != 0 {
+							// FEx: Load filter settings from instrument x
+							inst := int(lowNibble)
+							if inst > 0 && inst*INST_SIZE+INST_FILTLOOP < len(sd.instData) {
+								filterIdx = int(sd.instData[inst*INST_SIZE+INST_FILTSTART])
+								filterEnd = int(sd.instData[inst*INST_SIZE+INST_FILTEND])
+								filterLoop = int(sd.instData[inst*INST_SIZE+INST_FILTLOOP])
+							}
 						}
 						if highNibble == 0xF0 {
 							// FFx: Set hard restart offset
@@ -1211,7 +1552,7 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 
 				// Compute final frequency (vibrato applied to base freq, like player's calcvibrato)
 				// Player stores result in chn_finfreq, not chn_freq - vibrato is applied fresh each frame
-				finFreq := s.freq
+				s.finFreq = s.freq
 				if s.vibDepth > 0 {
 					// Calculate table position (0-15, mirrored for 16-31)
 					pos := s.vibratoPos & 0x1F
@@ -1225,9 +1566,9 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 						offset := int(vibratoTable[tableIdx]) * 2
 						// Phase 0-31: subtract, 32-63: add
 						if s.vibratoPos&0x20 != 0 {
-							finFreq = uint16(int(s.freq) + offset)
+							s.finFreq = uint16(int(s.freq) + offset)
 						} else {
-							finFreq = uint16(int(s.freq) - offset)
+							s.finFreq = uint16(int(s.freq) - offset)
 						}
 					}
 					// Advance vibrato position (byte wraps at 256, like player)
@@ -1274,12 +1615,13 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					}
 				}
 
-				// For MIDI output: portamento as two notes (start/end), split at midpoint
+				// For MIDI output: portamento as two notes (start/end), switch to target after 25%
 				outputFreq := s.noteFreq
 				if s.effect == 3 && s.portaStart > 0 && s.noteFreq > 0 {
-					midFreq := (s.portaStart + s.noteFreq) / 2
-					if (s.portaStart < s.noteFreq && s.freq < midFreq) ||
-						(s.portaStart > s.noteFreq && s.freq > midFreq) {
+					// Switch point at 25% of the way from start to target
+					switchFreq := int(s.portaStart) + (int(s.noteFreq)-int(s.portaStart))/4
+					if (s.portaStart < s.noteFreq && int(s.freq) < switchFreq) ||
+						(s.portaStart > s.noteFreq && int(s.freq) > switchFreq) {
 						outputFreq = s.portaStart
 					} else {
 						outputFreq = s.noteFreq
@@ -1289,10 +1631,20 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 					outputFreq = 0
 				}
 
-				// Store finFreq for dump
-				s.freq = finFreq
 				noteFreqs[ch] = append(noteFreqs[ch], outputFreq) // Base note for MIDI (0 when silent)
 				isDrum[ch] = append(isDrum[ch], drumFrame[ch])
+			}
+
+			// Process filter table (like player's filter processing after @chnloop)
+			if filterIdx != 0 {
+				sd := songs[songIdx]
+				if filterIdx < len(sd.filterTable) {
+					filterCutoff = sd.filterTable[filterIdx]
+				}
+				filterIdx++
+				if filterIdx > filterEnd {
+					filterIdx = filterLoop
+				}
 			}
 
 			// 3) Hard restart check (runs AFTER processing, BEFORE dump)
@@ -1302,12 +1654,15 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 				// Check if we should look ahead for hard restart
 				// Uses current speedCounter (after increment, reset if row processed)
 				if speedCounter+s.hardRestart >= speed {
-					// Calculate look-ahead row
-					hrTrackRow := trackRow + 1
-					hrOrder := ordernumber
-					if hrTrackRow >= 64 {
-						hrTrackRow = 0
+					// Calculate look-ahead row (must match player's logic exactly)
+					// Player: if forcenewpattern OR (trackrow+1)&0x3F==0, use firsttrackrow/nextordernumber
+					var hrTrackRow, hrOrder int
+					if forcenewpattern || (trackRow+1)&0x3F == 0 {
+						hrTrackRow = firsttrackrow
 						hrOrder = nextordernumber
+					} else {
+						hrTrackRow = trackRow + 1
+						hrOrder = ordernumber
 					}
 					hrRow := songBoundaries[songIdx] + hrOrder*64 + hrTrackRow
 					if hrRow >= songBoundaries[songIdx] && hrRow < endRow {
@@ -1345,7 +1700,7 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 			for ch := 0; ch < 3; ch++ {
 				s := &simState[ch]
 				simControl := s.waveform & s.gateOn
-				simF := s.freq
+				simF := s.finFreq
 
 				// Frequency comparison
 				if simF != vmFreq[ch] {
@@ -1358,71 +1713,1135 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 						if diff < 0 {
 							diff = -diff
 						}
-						isClose := vmFreq[ch] > 0 && diff < int(vmFreq[ch])/20
-						fmt.Printf("\n  Song %d first FREQ mismatch at frame %d ch %d", song, frame, ch)
-						if isClose {
-							fmt.Printf(" [VIBRATO]")
-						} else {
-							fmt.Printf(" [BUG diff=%d]", diff)
-						}
-						fmt.Println()
-						fmt.Printf("    VM:  $%04X (MIDI %d)\n", vmFreq[ch], sidFreqToMIDI(vmFreq[ch]))
-						fmt.Printf("    Sim: $%04X (MIDI %d)\n", simF, sidFreqToMIDI(simF))
+						_ = diff
 					}
 				}
 
-				// Control register comparison
+				// Register comparisons (count only, no verbose output)
 				if simControl != vmControl[ch] {
 					totalControlMismatches++
-					if totalControlMismatches <= 5 {
-						fmt.Printf("\n  Song %d CONTROL mismatch at frame %d ch %d: VM=$%02X Sim=$%02X (wave=$%02X gate=$%02X)\n",
-							song, frame, ch, vmControl[ch], simControl, s.waveform, s.gateOn)
-					}
 				}
-
-				// AD register comparison
 				if s.ad != vmAD[ch] {
 					totalADMismatches++
-					if totalADMismatches <= 5 {
-						fmt.Printf("\n  Song %d AD mismatch at frame %d ch %d: VM=$%02X Sim=$%02X\n",
-							song, frame, ch, vmAD[ch], s.ad)
-					}
 				}
-
-				// SR register comparison
 				if s.sr != vmSR[ch] {
 					totalSRMismatches++
-					if totalSRMismatches <= 5 {
-						fmt.Printf("\n  Song %d SR mismatch at frame %d ch %d: VM=$%02X Sim=$%02X\n",
-							song, frame, ch, vmSR[ch], s.sr)
-					}
+				}
+				simPW := uint16(s.plsWidthLo) | uint16(s.plsWidthHi)<<8
+				vmPW := uint16(vmPwLo[ch]) | uint16(vmPwHi[ch])<<8
+				if simPW != vmPW {
+					totalPWMismatches++
 				}
 
 				// Store for output arrays
 				simFreqs[ch] = append(simFreqs[ch], simF)
+				simControls[ch] = append(simControls[ch], simControl)
+				simADs[ch] = append(simADs[ch], s.ad)
+				simSRs[ch] = append(simSRs[ch], s.sr)
+			}
+
+			// Filter register comparison (global, not per-channel)
+			// D415 = filter cutoff low (bits 0-2 only)
+			// D416 = filter cutoff high
+			// D417 = filter resonance | routing
+			// D418 = volume | filter mode
+			simFilterCutoffLo := byte(0) // We don't track low 3 bits
+			simFilterCutoffHi := filterCutoff
+			simFilterRes := filterResonance
+			simFilterVol := globalVolume | filterMode
+
+			// Filter register comparisons (count only)
+			if simFilterCutoffLo != vmFilterLo {
+				totalFilterMismatches++
+			}
+			if simFilterCutoffHi != vmFilterHi {
+				totalFilterMismatches++
+			}
+			if simFilterRes != vmFilterRes {
+				totalFilterMismatches++
+			}
+			if simFilterVol != vmFilterMode {
+				totalFilterMismatches++
 			}
 		}
 
-		matchPct := float64(numFrames*3-songMismatches) / float64(numFrames*3) * 100
-		fmt.Printf("  Song %d: %d frames, %d freq mismatches (%.1f%% match)\n", song, numFrames, songMismatches, matchPct)
+		globalFrameOffset += numFrames
 	}
 
-	totalFrames := len(vmFreqs[0])
-	matchPct := float64(totalFrames*3-totalMismatches) / float64(totalFrames*3) * 100
-	fmt.Printf("\n  Total: %d frames\n", totalFrames)
-	fmt.Printf("  Frequency mismatches: %d (%.1f%% match)\n", totalFreqMismatches, matchPct)
-	fmt.Printf("  Control reg mismatches: %d\n", totalControlMismatches)
-	fmt.Printf("  AD reg mismatches: %d\n", totalADMismatches)
-	fmt.Printf("  SR reg mismatches: %d\n", totalSRMismatches)
+	// Summarize validation (removed verbose per-song output)
 
-	return vmFreqs, simFreqs, noteFreqs, isDrum
+	vmRegs := SIDRegisters{
+		Freq:      vmFreqs,
+		PW:        vmPWs,
+		Control:   vmControls,
+		AD:        vmADs,
+		SR:        vmSRs,
+		FilterLo:  vmFilterLos,
+		FilterHi:  vmFilterHis,
+		FilterRes: vmFilterRess,
+		FilterVol: vmFilterVols,
+	}
+	simRegs := SIDRegisters{
+		Freq:    simFreqs,
+		Control: simControls,
+		AD:      simADs,
+		SR:      simSRs,
+	}
+	return vmRegs, simRegs, noteFreqs, isDrum, patternStartFrames
+}
+
+// SIDRegisters holds all SID register values per frame
+type SIDRegisters struct {
+	Freq        [3][]uint16
+	PW          [3][]uint16 // Pulse Width per channel
+	Control     [3][]byte
+	AD          [3][]byte
+	SR          [3][]byte
+	FilterLo    []byte // Filter cutoff low (D415)
+	FilterHi    []byte // Filter cutoff high (D416)
+	FilterRes   []byte // Filter resonance/routing (D417)
+	FilterVol   []byte // Volume/filter mode (D418)
+}
+
+// runStreamOnlySimulation runs simulation using ONLY the 14 int streams
+// Returns SID registers for all frames across all songs
+func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBoundaries []int) SIDRegisters {
+	var result SIDRegisters
+
+	// Extract data from streams
+	// streams[0-8]: Ch0-2 Note/Inst/Fx (int arrays)
+	// streams[9-11]: Trans0, Trans1, Trans2 (per pattern per channel)
+	// streams[12]: InstTbl
+	// streams[13]: FilterTbl (not used)
+	// streams[14]: WaveTbl
+	// streams[15]: ArpTbl
+
+	numRows := len(streams[0].data)
+
+	// Convert int streams to byte arrays for pattern data
+	var patternData [3][]byte
+	for ch := 0; ch < 3; ch++ {
+		noteStream := streams[ch*3].data
+		instStream := streams[ch*3+1].data
+		fxStream := streams[ch*3+2].data
+		patternData[ch] = make([]byte, numRows*3)
+		for row := 0; row < numRows; row++ {
+			note := noteStream[row]
+			inst := instStream[row]
+			fxParam := fxStream[row]
+			effect := (fxParam >> 8) & 0xF
+			param := fxParam & 0xFF
+			patternData[ch][row*3] = byte(note&0x7F) | byte((effect&0x8)<<4)
+			patternData[ch][row*3+1] = byte(inst&0x1F) | byte((effect&0x7)<<5)
+			patternData[ch][row*3+2] = byte(param)
+		}
+	}
+
+	// Per-channel transpose (one value per pattern per channel)
+	var transposeStream [3][]int
+	for ch := 0; ch < 3; ch++ {
+		transposeStream[ch] = streams[9+ch].data
+	}
+	numPatterns := (numRows + 63) / 64
+
+	// Per-song table sizes
+	const instPerSong = 512
+	const wavePerSong = 256
+	const arpPerSong = 256
+
+	instStream := streams[12].data
+	waveStream := streams[14].data
+	arpStream := streams[15].data
+
+	numSongs := len(songBoundaries) - 1
+
+	// Build per-song table data
+	type songTables struct {
+		instData    []byte
+		waveTable   []byte
+		arpTable    []byte
+		filterTable []byte
+	}
+
+	filterStream := streams[13].data
+	const filterPerSong = 234 // Must match FILTERTABLE_SZ
+
+	var songs []songTables
+	for song := 0; song < numSongs; song++ {
+		var st songTables
+		st.instData = make([]byte, instPerSong)
+		st.waveTable = make([]byte, 256)
+		st.arpTable = make([]byte, 256)
+		st.filterTable = make([]byte, 256)
+
+		instStart := song * instPerSong
+		for i := 0; i < instPerSong && instStart+i < len(instStream); i++ {
+			st.instData[i] = byte(instStream[instStart+i])
+		}
+		waveStart := song * wavePerSong
+		for i := 0; i < wavePerSong && waveStart+i < len(waveStream); i++ {
+			st.waveTable[i] = byte(waveStream[waveStart+i])
+		}
+		arpStart := song * arpPerSong
+		for i := 0; i < arpPerSong && arpStart+i < len(arpStream); i++ {
+			st.arpTable[i] = byte(arpStream[arpStart+i])
+		}
+		filterStart := song * filterPerSong
+		for i := 0; i < filterPerSong && filterStart+i < len(filterStream); i++ {
+			st.filterTable[i] = byte(filterStream[filterStart+i])
+		}
+		songs = append(songs, st)
+	}
+
+	// Simulation state (same as in runSideBySideValidation)
+	type chanState struct {
+		freq        uint16
+		noteFreq    uint16
+		note        int
+		inst        int
+		effect      int
+		param       byte
+		waveIdx     int
+		arpIdx      int
+		vibratoPos  int
+		vibSpeed    int
+		vibDepth    int
+		vibDelay    int
+		slideEnable bool
+		slideDelta  int16
+		gate        bool
+		gateOn      byte
+		ad          byte
+		sr          byte
+		waveform    byte
+		hardRestart int
+		// Pulse width
+		plsWidthLo  byte
+		plsWidthHi  byte
+		plsSpeed    byte
+		plsDir      byte
+		plsLimitUp  byte
+		plsLimitDn  byte
+	}
+
+	// Filter state (global, not per-channel)
+	filterIdx := 0
+	filterEnd := 0
+	filterLoop := 0
+	filterCutoff := byte(0)
+	filterResonance := byte(0)
+	filterMode := byte(0)
+	globalVolume := byte(0x0F)
+
+	// Run simulation for all songs consecutively
+	globalFrameOffset := 0
+	for songIdx := 0; songIdx < numSongs; songIdx++ {
+		if songIdx >= len(songs) {
+			continue
+		}
+
+		numFrames := int(partTimes[songIdx])
+		sd := songs[songIdx]
+
+		var simState [3]chanState
+		for ch := 0; ch < 3; ch++ {
+			simState[ch].hardRestart = 2
+		}
+		// Reset filter state for new song
+		filterIdx = 0
+		filterEnd = 0
+		filterLoop = 0
+		filterCutoff = 0
+		filterResonance = 0
+		filterMode = 0
+		globalVolume = 0x0F
+		speed := 6
+		speedCounter := 5
+		mod3Counter := 0
+		row := songBoundaries[songIdx]
+		endRow := songBoundaries[songIdx+1]
+		ordernumber := 0
+		nextordernumber := 0
+		trackRow := -1
+		forcenewpattern := true
+		firsttrackrow := 0
+
+		for frame := 0; frame < numFrames; frame++ {
+			// Increment speedCounter and process row if needed
+			mod3Counter--
+			if mod3Counter < 0 {
+				mod3Counter = 2
+			}
+
+			speedCounter++
+			if speedCounter >= speed && row < endRow {
+				speedCounter = 0
+
+				if forcenewpattern {
+					ordernumber = nextordernumber
+					nextordernumber++
+					trackRow = firsttrackrow
+					firsttrackrow = 0
+					forcenewpattern = false
+				} else {
+					trackRow++
+					if trackRow >= 64 {
+						ordernumber = nextordernumber
+						nextordernumber++
+						trackRow = 0
+					}
+				}
+
+				row = songBoundaries[songIdx] + ordernumber*64 + trackRow
+
+				for ch := 0; ch < 3; ch++ {
+					off := row * 3
+					if off+2 >= len(patternData[ch]) {
+						continue
+					}
+					noteByte, instEff, param := patternData[ch][off], patternData[ch][off+1], patternData[ch][off+2]
+					note := int(noteByte & 0x7F)
+					inst := int(instEff & 0x1F)
+					effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
+
+					// Get per-channel transpose from stream
+					patIdx := row / 64
+					if patIdx >= numPatterns {
+						patIdx = numPatterns - 1
+					}
+					trans := int8(0)
+					if patIdx < len(transposeStream[ch]) {
+						trans = int8(transposeStream[ch][patIdx])
+					}
+
+					// Player ALWAYS stores effect (even if 0) - see lines 600-616
+					simState[ch].effect = effect
+					simState[ch].param = param
+
+					if inst > 0 {
+						simState[ch].inst = inst
+						if len(sd.instData) > inst*INST_SIZE+INST_PULSELIMITS {
+							simState[ch].waveIdx = int(sd.instData[inst*INST_SIZE+INST_WAVESTART])
+							simState[ch].arpIdx = int(sd.instData[inst*INST_SIZE+INST_ARPSTART])
+							simState[ch].vibDelay = int(sd.instData[inst*INST_SIZE+INST_VIBDELAY])
+							simState[ch].ad = sd.instData[inst*INST_SIZE+INST_AD]
+							simState[ch].sr = sd.instData[inst*INST_SIZE+INST_SR]
+							// Pulse width params
+							pw := sd.instData[inst*INST_SIZE+INST_PULSEWIDTH]
+							simState[ch].plsWidthLo = pw << 4
+							simState[ch].plsWidthHi = pw >> 4
+							simState[ch].plsSpeed = sd.instData[inst*INST_SIZE+INST_PULSESPEED]
+							limits := sd.instData[inst*INST_SIZE+INST_PULSELIMITS]
+							simState[ch].plsLimitDn = limits >> 4
+							simState[ch].plsLimitUp = limits & 0x0F
+							simState[ch].plsDir = 0
+						}
+						simState[ch].vibratoPos = 0
+					}
+
+					if note > 0 && note < 0x61 {
+						simState[ch].note = note - 1
+						if simState[ch].effect == 3 {
+							idx := simState[ch].note + int(trans)
+							if idx >= 0 && idx < len(freqTableLo) {
+								simState[ch].noteFreq = uint16(freqTableLo[idx]) | uint16(freqTableHi[idx])<<8
+							}
+						}
+						// Reset waveIdx, arpIdx on EVERY note (player does this in @notporta)
+						currentInst := simState[ch].inst
+						if currentInst > 0 && len(sd.instData) > currentInst*INST_SIZE+INST_ARPSTART {
+							simState[ch].waveIdx = int(sd.instData[currentInst*INST_SIZE+INST_WAVESTART])
+							simState[ch].arpIdx = int(sd.instData[currentInst*INST_SIZE+INST_ARPSTART])
+						}
+						simState[ch].slideDelta = 0
+						simState[ch].slideEnable = false
+						simState[ch].gate = true
+						simState[ch].gateOn = 0xFF
+					}
+					if note == 0x61 {
+						simState[ch].gate = false
+						simState[ch].gateOn = 0xFE
+					}
+
+					if effect == 0x0C && param < 0x80 && param > 0 {
+						speed = int(param)
+					}
+					if effect == 0x0A {
+						firsttrackrow = int(param)
+						forcenewpattern = true
+					}
+					if effect == 0x09 {
+						nextordernumber = int(param)
+						forcenewpattern = true
+					}
+				}
+			}
+
+			// Process channel effects
+			for ch := 0; ch < 3; ch++ {
+				s := &simState[ch]
+				s.vibDepth = 0
+
+				// Wave table
+				if s.effect != 7 && s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_WAVELOOP && len(sd.waveTable) > s.waveIdx {
+					s.waveform = sd.waveTable[s.waveIdx]
+					s.waveIdx++
+					waveEnd := int(sd.instData[s.inst*INST_SIZE+INST_WAVEEND])
+					if s.waveIdx > waveEnd {
+						s.waveIdx = int(sd.instData[s.inst*INST_SIZE+INST_WAVELOOP])
+					}
+				}
+
+				// Pulse width modulation
+				if s.plsSpeed != 0 {
+					if s.plsDir != 0 {
+						// Going down
+						newLo := int(s.plsWidthLo) - int(s.plsSpeed)
+						if newLo < 0 {
+							s.plsWidthLo = byte(newLo + 256)
+							s.plsWidthHi--
+						} else {
+							s.plsWidthLo = byte(newLo)
+						}
+						if int8(s.plsWidthHi) < int8(s.plsLimitDn) {
+							s.plsDir = 0
+							s.plsWidthLo = 0
+							s.plsWidthHi = s.plsLimitDn
+						}
+					} else {
+						// Going up
+						newLo := int(s.plsWidthLo) + int(s.plsSpeed)
+						if newLo > 255 {
+							s.plsWidthLo = byte(newLo - 256)
+							s.plsWidthHi++
+						} else {
+							s.plsWidthLo = byte(newLo)
+						}
+						if int8(s.plsWidthHi) > int8(s.plsLimitUp) {
+							s.plsDir = 0x80
+							s.plsWidthLo = 0xFF
+							s.plsWidthHi = s.plsLimitUp
+						}
+					}
+				}
+
+				// Arp table - apply per-channel transpose
+				patIdx := row / 64
+				if patIdx >= numPatterns {
+					patIdx = numPatterns - 1
+				}
+				trans := int8(0)
+				if patIdx < len(transposeStream[ch]) {
+					trans = int8(transposeStream[ch][patIdx])
+				}
+
+				if s.effect != 3 {
+					if s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_ARPLOOP && len(sd.arpTable) > s.arpIdx {
+						arpVal := int(sd.arpTable[s.arpIdx])
+						if arpVal >= 0x80 {
+							arpVal = arpVal & 0x7F
+						} else {
+							arpVal = s.note + int(trans) + arpVal
+						}
+						if arpVal >= 0 && arpVal < len(freqTableLo) {
+							s.freq = uint16(freqTableLo[arpVal]) | uint16(freqTableHi[arpVal])<<8
+							s.noteFreq = s.freq
+						}
+						s.arpIdx++
+						arpEnd := int(sd.instData[s.inst*INST_SIZE+INST_ARPEND])
+						if s.arpIdx > arpEnd {
+							s.arpIdx = int(sd.instData[s.inst*INST_SIZE+INST_ARPLOOP])
+						}
+					}
+				}
+
+				// Vibrato from instrument
+				if s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_VIBDEPSP {
+					if s.vibDelay > 0 {
+						s.vibDelay--
+					} else {
+						vibDepSp := sd.instData[s.inst*INST_SIZE+INST_VIBDEPSP]
+						s.vibDepth = int(vibDepSp & 0xF0)
+						if s.vibDepth != 0 {
+							s.vibSpeed = int(vibDepSp & 0x0F)
+						}
+					}
+				}
+
+				// Effects
+				switch s.effect {
+				case 1:
+					s.slideEnable = true
+					if s.param&0x80 != 0 {
+						s.slideDelta += 0x20
+					} else {
+						s.slideDelta -= 0x20
+					}
+				case 2: // Set pulse width from parameter
+					s.plsWidthLo = s.param << 4
+					s.plsWidthHi = s.param >> 4
+				case 3:
+					deltaLo := (s.param << 4) & 0xFF
+					deltaHi := s.param >> 4
+					delta := uint16(deltaHi)<<8 | uint16(deltaLo)
+					if s.noteFreq > s.freq {
+						newFreq := s.freq + delta
+						if newFreq > s.noteFreq {
+							newFreq = s.noteFreq
+						}
+						s.freq = newFreq
+					} else if s.noteFreq < s.freq {
+						if delta > s.freq {
+							s.freq = s.noteFreq
+						} else {
+							newFreq := s.freq - delta
+							if newFreq < s.noteFreq {
+								newFreq = s.noteFreq
+							}
+							s.freq = newFreq
+						}
+					}
+				case 4:
+					s.vibDepth = int(s.param & 0xF0)
+					s.vibSpeed = int(s.param & 0x0F)
+				case 5: // Set AD register directly
+					s.ad = s.param
+				case 6: // Set SR register directly
+					s.sr = s.param
+				case 7: // Set waveform register directly (runs every frame)
+					s.waveform = s.param
+				case 8:
+					arpX := int(s.param >> 4)
+					arpY := int(s.param & 0x0F)
+					var arpOffset int
+					switch mod3Counter {
+					case 0:
+						arpOffset = arpY
+					case 1:
+						arpOffset = arpX
+					case 2:
+						arpOffset = 0
+					}
+					idx := s.note + int(trans) + arpOffset
+					if idx >= 0 && idx < len(freqTableLo) {
+						s.freq = uint16(freqTableLo[idx]) | uint16(freqTableHi[idx])<<8
+						s.noteFreq = s.freq
+					}
+				case 11: // Effect B = set filter resonance
+					filterResonance = s.param
+				case 12: // Effect C = old effect F (extended effects) - only on first frame of row
+					if speedCounter == 0 && s.param >= 0x80 {
+						highNibble := int(s.param & 0xF0)
+						lowNibble := int(s.param & 0x0F)
+						if highNibble == 0x80 {
+							// F8x: Set global volume
+							globalVolume = byte(lowNibble)
+						}
+						if highNibble == 0x90 {
+							// F9x: Set filter mode
+							filterMode = byte(lowNibble << 4)
+						}
+						if highNibble == 0xB0 {
+							// FBx: Slide - add lowNibble*4 to slideDelta, enable slide
+							s.slideDelta += int16(lowNibble) * 4
+							s.slideEnable = true
+						}
+						if highNibble == 0xE0 && lowNibble != 0 {
+							// FEx: Load filter settings from instrument x
+							inst := int(lowNibble)
+							if inst > 0 && inst*INST_SIZE+INST_FILTLOOP < len(sd.instData) {
+								filterIdx = int(sd.instData[inst*INST_SIZE+INST_FILTSTART])
+								filterEnd = int(sd.instData[inst*INST_SIZE+INST_FILTEND])
+								filterLoop = int(sd.instData[inst*INST_SIZE+INST_FILTLOOP])
+							}
+						}
+						if highNibble == 0xF0 {
+							// FFx: Set hard restart offset
+							s.hardRestart = lowNibble
+						}
+					}
+				}
+
+				// Apply slide
+				if s.slideEnable {
+					newFreq := int(s.freq) + int(s.slideDelta)
+					if newFreq < 0 {
+						newFreq = 0
+					}
+					if newFreq > 0xFFFF {
+						newFreq = 0xFFFF
+					}
+					s.freq = uint16(newFreq)
+				}
+
+				// Apply vibrato (same as original validation)
+				simF := s.freq
+				if s.vibDepth > 0 {
+					// Calculate table position (0-15, mirrored for 16-31)
+					pos := s.vibratoPos & 0x1F
+					if pos >= 0x10 {
+						pos = 0x1F ^ pos // mirror: 31-pos
+					}
+					// Table index = pos | depth (depth is already in high nibble)
+					tableIdx := pos | s.vibDepth
+					if tableIdx < len(vibratoTable) {
+						// Offset is table value * 2 (16-bit)
+						offset := int(vibratoTable[tableIdx]) * 2
+						// Phase 0-31: subtract, 32-63: add
+						if s.vibratoPos&0x20 != 0 {
+							simF = uint16(int(s.freq) + offset)
+						} else {
+							simF = uint16(int(s.freq) - offset)
+						}
+					}
+					// Advance vibrato position (byte wraps at 256, like player)
+					s.vibratoPos = (s.vibratoPos + s.vibSpeed) & 0xFF
+				}
+
+				// Hard restart check - look ahead to see if we need to pre-release
+				if speedCounter+s.hardRestart >= speed {
+					var hrTrackRow, hrOrder int
+					if forcenewpattern || (trackRow+1)&0x3F == 0 {
+						hrTrackRow = firsttrackrow
+						hrOrder = nextordernumber
+					} else {
+						hrTrackRow = trackRow + 1
+						hrOrder = ordernumber
+					}
+					hrRow := songBoundaries[songIdx] + hrOrder*64 + hrTrackRow
+					if hrRow >= songBoundaries[songIdx] && hrRow < endRow {
+						off := hrRow * 3
+						if off+2 < len(patternData[ch]) {
+							noteByte := patternData[ch][off]
+							instEff := patternData[ch][off+1]
+							note := noteByte & 0x7F
+							effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
+							if note > 0 && note != 0x61 {
+								doHR := false
+								if noteByte&0x80 != 0 {
+									doHR = true
+								} else if effect != 3 {
+									instEffByte := instEff & 0xE0
+									if instEffByte != 0x60 {
+										doHR = true
+									}
+								}
+								if doHR {
+									s.waveform = 0
+									s.ad = 0
+									s.sr = 0
+								}
+							}
+						}
+					}
+				}
+
+				// Compute control register
+				simControl := s.waveform & s.gateOn
+
+				// Store results
+				result.Freq[ch] = append(result.Freq[ch], simF)
+				result.PW[ch] = append(result.PW[ch], uint16(s.plsWidthLo)|uint16(s.plsWidthHi)<<8)
+				result.Control[ch] = append(result.Control[ch], simControl)
+				result.AD[ch] = append(result.AD[ch], s.ad)
+				result.SR[ch] = append(result.SR[ch], s.sr)
+			}
+
+			// Process filter table (after channel processing)
+			if filterIdx != 0 {
+				if filterIdx < len(sd.filterTable) {
+					filterCutoff = sd.filterTable[filterIdx]
+				}
+				filterIdx++
+				if filterIdx > filterEnd {
+					filterIdx = filterLoop
+				}
+			}
+
+			// Store filter/volume results (global, not per-channel)
+			result.FilterLo = append(result.FilterLo, 0) // Low 3 bits not tracked
+			result.FilterHi = append(result.FilterHi, filterCutoff)
+			result.FilterRes = append(result.FilterRes, filterResonance)
+			result.FilterVol = append(result.FilterVol, globalVolume|filterMode)
+		}
+		globalFrameOffset += numFrames
+	}
+
+	return result
+}
+
+// Krumhansl-Schmuckler key profiles (normalized correlation weights)
+// These represent how strongly each pitch class correlates with a given key
+var majorProfile = [12]float64{6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88}
+var minorProfile = [12]float64{6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17}
+
+// KeyResult holds the detected key for a window
+type KeyResult struct {
+	Root      int     // 0-11 (C=0, C#=1, ... B=11)
+	IsMinor   bool    // true if minor key
+	Score     float64 // correlation score
+	StartTick int     // MIDI tick where this key starts
+}
+
+// detectKeys analyzes note frequencies and detects musical keys
+// patternFrames: frame numbers where each pattern starts (from simulation)
+// Returns key detections with their start ticks aligned to patterns
+func detectKeys(noteFreqs [3][]uint16, isDrum [3][]bool, patternFrames []int) []KeyResult {
+	totalFrames := len(noteFreqs[0])
+	if totalFrames == 0 || len(patternFrames) == 0 {
+		return nil
+	}
+
+	var results []KeyResult
+	var prevKey KeyResult
+	prevKey.Root = -1
+
+	for i := 0; i < len(patternFrames); i++ {
+		windowStart := patternFrames[i]
+		windowEnd := totalFrames
+		if i+1 < len(patternFrames) {
+			windowEnd = patternFrames[i+1]
+		}
+
+		// Build weighted pitch class profile for this window
+		var pitchProfile [12]float64
+		windowSize := windowEnd - windowStart
+
+		for frame := windowStart; frame < windowEnd; frame++ {
+			frameInWindow := frame - windowStart
+
+			// Position weight: emphasize pattern boundaries
+			// Now aligned to actual pattern boundaries from simulation
+			posWeight := 1.0
+			if windowSize > 0 {
+				windowPos := float64(frameInWindow) / float64(windowSize)
+				if windowPos < 0.02 || windowPos > 0.98 { // near start/end
+					posWeight = 1.5
+				} else if math.Abs(windowPos-0.5) < 0.02 { // near middle
+					posWeight = 1.25
+				} else if math.Abs(windowPos-0.25) < 0.02 || math.Abs(windowPos-0.75) < 0.02 { // quarter points
+					posWeight = 1.1
+				}
+			}
+
+			// Collect notes from all channels at this frame
+			var activeNotes []int
+			var activeChannels []int
+			for ch := 0; ch < 3; ch++ {
+				if frame >= len(isDrum[ch]) || isDrum[ch][frame] {
+					continue // skip drum sounds
+				}
+				freq := noteFreqs[ch][frame]
+				midiNote := sidFreqToMIDI(freq)
+				if midiNote >= 0 && midiNote < 128 {
+					activeNotes = append(activeNotes, midiNote)
+					activeChannels = append(activeChannels, ch)
+				}
+			}
+
+			// Multi-channel weight: same pitch class on multiple channels gets bonus
+			pitchClassCount := make(map[int]int)
+			for _, note := range activeNotes {
+				pc := note % 12
+				pitchClassCount[pc]++
+			}
+
+			for i, note := range activeNotes {
+				pc := note % 12
+				octave := note / 12
+
+				// Bass weight: lower octaves get higher weight
+				// MIDI octave 2 (notes 24-35) = bass, octave 3-4 = mid, 5+ = treble
+				bassWeight := 1.0
+				if octave <= 2 {
+					bassWeight = 2.0
+				} else if octave <= 3 {
+					bassWeight = 1.5
+				} else if octave <= 4 {
+					bassWeight = 1.2
+				}
+
+				// Channel weight: channel 0 (bass) gets slight priority
+				chanWeight := 1.0
+				if activeChannels[i] == 0 {
+					chanWeight = 1.1
+				}
+
+				// Multi-channel bonus
+				multiChanWeight := 1.0
+				if pitchClassCount[pc] > 1 {
+					multiChanWeight = 1.0 + 0.3*float64(pitchClassCount[pc]-1)
+				}
+
+				// Duration weight is implicit: each frame adds to the profile
+				// Arpeggiated notes contribute less per pitch class since they spread across frames
+
+				totalWeight := posWeight * bassWeight * chanWeight * multiChanWeight
+				pitchProfile[pc] += totalWeight
+			}
+		}
+
+		// Find best matching key using correlation with key profiles
+		bestKey := KeyResult{Root: 0, IsMinor: false, Score: -math.MaxFloat64, StartTick: windowStart}
+
+		for root := 0; root < 12; root++ {
+			// Rotate profile to test this root
+			var rotated [12]float64
+			for pc := 0; pc < 12; pc++ {
+				rotated[pc] = pitchProfile[(pc+root)%12]
+			}
+
+			// Correlate with major profile
+			majorScore := correlate(rotated, majorProfile)
+			if majorScore > bestKey.Score {
+				bestKey.Score = majorScore
+				bestKey.Root = root
+				bestKey.IsMinor = false
+			}
+
+			// Correlate with minor profile
+			minorScore := correlate(rotated, minorProfile)
+			if minorScore > bestKey.Score {
+				bestKey.Score = minorScore
+				bestKey.Root = root
+				bestKey.IsMinor = true
+			}
+		}
+
+		// Consistency check: prefer previous key if scores are close
+		if prevKey.Root >= 0 && len(results) > 0 {
+			prevScore := results[len(results)-1].Score
+			scoreDiff := bestKey.Score - prevScore
+			if scoreDiff < 0.1*math.Abs(prevScore) { // within 10%
+				if bestKey.Root != prevKey.Root || bestKey.IsMinor != prevKey.IsMinor {
+					// Check if staying with previous key is reasonable
+					var rotated [12]float64
+					for pc := 0; pc < 12; pc++ {
+						rotated[pc] = pitchProfile[(pc+prevKey.Root)%12]
+					}
+					var keepScore float64
+					if prevKey.IsMinor {
+						keepScore = correlate(rotated, minorProfile)
+					} else {
+						keepScore = correlate(rotated, majorProfile)
+					}
+					// Keep previous key if it's still a good fit (within 15% of best)
+					if keepScore > bestKey.Score*0.85 {
+						bestKey = prevKey
+						bestKey.StartTick = windowStart
+						bestKey.Score = keepScore
+					}
+				}
+			}
+		}
+
+		// Only add if key changed or first result
+		if len(results) == 0 || results[len(results)-1].Root != bestKey.Root || results[len(results)-1].IsMinor != bestKey.IsMinor {
+			results = append(results, bestKey)
+		}
+		prevKey = bestKey
+	}
+
+	return results
+}
+
+// Major scale intervals from root (semitones): 0, 2, 4, 5, 7, 9, 11
+var majorIntervals = []int{0, 2, 4, 5, 7, 9, 11}
+
+// Minor scale intervals from root (semitones): 0, 2, 3, 5, 7, 8, 10 (natural minor)
+var minorIntervals = []int{0, 2, 3, 5, 7, 8, 10}
+
+// chromaticToDiatonic converts a chromatic pitch class (0-11) to diatonic encoding
+// Returns (scaleDegree, isHarmonic) where:
+// - If isHarmonic: scaleDegree is 0-6 (diatonic scale degree)
+// - If !isHarmonic: scaleDegree is 0-4 (non-harmonic accidental index)
+func chromaticToDiatonic(pitchClass int, keyRoot int, isMinor bool) (int, bool) {
+	// Get pitch class relative to key root
+	relPC := (pitchClass - keyRoot + 12) % 12
+
+	intervals := majorIntervals
+	if isMinor {
+		intervals = minorIntervals
+	}
+
+	// Check if it's a scale tone
+	for degree, interval := range intervals {
+		if relPC == interval {
+			return degree, true
+		}
+	}
+
+	// Non-harmonic: find which accidental it is
+	// For major: non-scale tones are 1, 3, 6, 8, 10 (5 values)
+	// For minor: non-scale tones are 1, 4, 6, 9, 11 (5 values)
+	accidentalIdx := 0
+	for pc := 0; pc < relPC; pc++ {
+		isScale := false
+		for _, interval := range intervals {
+			if pc == interval {
+				isScale = true
+				break
+			}
+		}
+		if !isScale {
+			accidentalIdx++
+		}
+	}
+	return accidentalIdx, false
+}
+
+// diatonicToChromatic converts back from diatonic encoding to chromatic pitch class
+func diatonicToChromatic(scaleDegree int, isHarmonic bool, keyRoot int, isMinor bool) int {
+	intervals := majorIntervals
+	if isMinor {
+		intervals = minorIntervals
+	}
+
+	if isHarmonic {
+		if scaleDegree >= 0 && scaleDegree < 7 {
+			return (keyRoot + intervals[scaleDegree]) % 12
+		}
+		return keyRoot // fallback
+	}
+
+	// Non-harmonic: find the nth non-scale pitch class
+	accidentalIdx := 0
+	for pc := 0; pc < 12; pc++ {
+		isScale := false
+		for _, interval := range intervals {
+			if pc == interval {
+				isScale = true
+				break
+			}
+		}
+		if !isScale {
+			if accidentalIdx == scaleDegree {
+				return (keyRoot + pc) % 12
+			}
+			accidentalIdx++
+		}
+	}
+	return keyRoot // fallback
+}
+
+// encodeNoteDiatonic encodes a MIDI note using diatonic encoding relative to key
+// Returns: encoded value where:
+// - Bits 0-2: scale degree (0-6) or accidental index (0-4)
+// - Bit 3: 0=harmonic, 1=non-harmonic
+// - Bits 4-7: octave (0-15)
+// Total: 8 bits per note
+func encodeNoteDiatonic(midiNote int, keyRoot int, isMinor bool) int {
+	if midiNote < 0 || midiNote >= 128 {
+		return 0 // rest/invalid
+	}
+	octave := midiNote / 12
+	pitchClass := midiNote % 12
+
+	degree, isHarmonic := chromaticToDiatonic(pitchClass, keyRoot, isMinor)
+
+	encoded := degree // bits 0-2 (or 0-2 for accidentals)
+	if !isHarmonic {
+		encoded |= 0x08 // bit 3 = non-harmonic flag
+	}
+	encoded |= (octave << 4) // bits 4-7 = octave
+
+	return encoded
+}
+
+// decodeNoteDiatonic decodes a diatonic-encoded note back to MIDI note
+func decodeNoteDiatonic(encoded int, keyRoot int, isMinor bool) int {
+	if encoded == 0 {
+		return -1 // rest
+	}
+	degree := encoded & 0x07
+	isHarmonic := (encoded & 0x08) == 0
+	octave := (encoded >> 4) & 0x0F
+
+	pitchClass := diatonicToChromatic(degree, isHarmonic, keyRoot, isMinor)
+	return octave*12 + pitchClass
+}
+
+// detectKeysPerRow returns key assignment for each row based on pattern-level detection
+// Propagates pattern-level keys to all rows within each pattern
+func detectKeysPerRow(noteFreqs [3][]uint16, isDrum [3][]bool, patternFrames []int, numRows int, rowsPerPattern int) []KeyResult {
+	patternKeys := detectKeys(noteFreqs, isDrum, patternFrames)
+	if len(patternKeys) == 0 {
+		return nil
+	}
+
+	rowKeys := make([]KeyResult, numRows)
+	keyIdx := 0
+
+	for row := 0; row < numRows; row++ {
+		// Check if we've moved to a new key's region
+		// Key regions are based on StartTick which corresponds to frame numbers
+		// Convert row to approximate frame (assuming speed=6)
+		approxFrame := row * 6
+
+		// Advance key index if we've passed the next key's start
+		for keyIdx < len(patternKeys)-1 && approxFrame >= patternKeys[keyIdx+1].StartTick {
+			keyIdx++
+		}
+
+		rowKeys[row] = patternKeys[keyIdx]
+	}
+
+	return rowKeys
+}
+
+// detectKeysMaxInScale finds keys that maximize the number of in-scale notes
+// This optimizes for compression rather than perceptual correctness
+func detectKeysMaxInScale(transposedNotes [3][]int, numRows int, windowSize int) []KeyResult {
+	var results []KeyResult
+
+	for windowStart := 0; windowStart < numRows; windowStart += windowSize {
+		windowEnd := windowStart + windowSize
+		if windowEnd > numRows {
+			windowEnd = numRows
+		}
+
+		// Count pitch classes in this window
+		var pitchCounts [12]int
+		for ch := 0; ch < 3; ch++ {
+			for row := windowStart; row < windowEnd; row++ {
+				note := transposedNotes[ch][row]
+				if note > 0 && note != 0x61 {
+					midiNote := note + 12
+					pc := midiNote % 12
+					pitchCounts[pc]++
+				}
+			}
+		}
+
+		// Try all 24 keys and find the one with most in-scale notes
+		bestRoot := 0
+		bestMinor := false
+		bestInScale := 0
+
+		for root := 0; root < 12; root++ {
+			for _, isMinor := range []bool{false, true} {
+				intervals := majorIntervals
+				if isMinor {
+					intervals = minorIntervals
+				}
+
+				inScale := 0
+				for _, interval := range intervals {
+					pc := (root + interval) % 12
+					inScale += pitchCounts[pc]
+				}
+
+				if inScale > bestInScale {
+					bestInScale = inScale
+					bestRoot = root
+					bestMinor = isMinor
+				}
+			}
+		}
+
+		// Calculate score as percentage in-scale
+		totalNotes := 0
+		for _, c := range pitchCounts {
+			totalNotes += c
+		}
+		score := 0.0
+		if totalNotes > 0 {
+			score = float64(bestInScale) / float64(totalNotes)
+		}
+
+		results = append(results, KeyResult{
+			Root:      bestRoot,
+			IsMinor:   bestMinor,
+			Score:     score,
+			StartTick: windowStart,
+		})
+	}
+
+	return results
+}
+
+// detectKeyMaxInScaleGlobal finds a single key that maximizes in-scale notes across all data
+func detectKeyMaxInScaleGlobal(transposedNotes [3][]int, numRows int) (int, bool, float64) {
+	// Count all pitch classes
+	var pitchCounts [12]int
+	for ch := 0; ch < 3; ch++ {
+		for row := 0; row < numRows; row++ {
+			note := transposedNotes[ch][row]
+			if note > 0 && note != 0x61 {
+				midiNote := note + 12
+				pc := midiNote % 12
+				pitchCounts[pc]++
+			}
+		}
+	}
+
+	totalNotes := 0
+	for _, c := range pitchCounts {
+		totalNotes += c
+	}
+
+	bestRoot := 0
+	bestMinor := false
+	bestInScale := 0
+
+	for root := 0; root < 12; root++ {
+		for _, isMinor := range []bool{false, true} {
+			intervals := majorIntervals
+			if isMinor {
+				intervals = minorIntervals
+			}
+
+			inScale := 0
+			for _, interval := range intervals {
+				pc := (root + interval) % 12
+				inScale += pitchCounts[pc]
+			}
+
+			if inScale > bestInScale {
+				bestInScale = inScale
+				bestRoot = root
+				bestMinor = isMinor
+			}
+		}
+	}
+
+	return bestRoot, bestMinor, float64(bestInScale) / float64(totalNotes)
+}
+
+// correlate computes Pearson correlation between two 12-element arrays
+func correlate(a, b [12]float64) float64 {
+	var sumA, sumB, sumAB, sumA2, sumB2 float64
+	n := 12.0
+	for i := 0; i < 12; i++ {
+		sumA += a[i]
+		sumB += b[i]
+		sumAB += a[i] * b[i]
+		sumA2 += a[i] * a[i]
+		sumB2 += b[i] * b[i]
+	}
+	num := n*sumAB - sumA*sumB
+	den := math.Sqrt((n*sumA2 - sumA*sumA) * (n*sumB2 - sumB*sumB))
+	if den == 0 {
+		return 0
+	}
+	return num / den
+}
+
+// keyName returns the name of a key (e.g., "C", "F#m")
+func keyName(root int, isMinor bool) string {
+	names := []string{"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"}
+	suffix := ""
+	if isMinor {
+		suffix = "m"
+	}
+	return names[root] + suffix
 }
 
 // writeMIDI outputs a MIDI file with detected notes
 // noteFreqs contains base note frequencies (without vibrato - for clean MIDI)
 // sidFreqs contains actual SID frequencies per frame (from VM emulation with vibrato)
 // isDrum indicates which frames use absolute arp notes, sync, ring mod, or noise (drum-like sounds)
-func writeMIDI(noteFreqs [3][]uint16, sidFreqs [3][]uint16, isDrum [3][]bool, outDir string) {
+func writeMIDI(noteFreqs [3][]uint16, sidFreqs [3][]uint16, isDrum [3][]bool, patternFrames []int, outDir string) {
 	// MIDI helper functions
 	writeVarLen := func(out *[]byte, val int) {
 		if val == 0 {
@@ -1452,9 +2871,13 @@ func writeMIDI(noteFreqs [3][]uint16, sidFreqs [3][]uint16, isDrum [3][]bool, ou
 	// Track 0: tempo track
 	// Track 1: melodic notes (non-drum frames, channels 0-2)
 	// Track 2: drum notes (absolute arp, sync, ring mod, noise - channel 9)
-	// Track 3: VM frequencies (channels 10-12)
+	// Track 3: detected keys (channel 3)
+	// Track 4: VM frequencies (channels 10-12)
 
 	totalFrames := len(sidFreqs[0])
+
+	// Detect keys using actual pattern boundaries from simulation
+	_ = detectKeys(noteFreqs, isDrum, patternFrames)
 
 	// Use frame-based timing: 1 tick = 1 frame
 	// MIDI ppq (ticks per quarter note) = 6 (so quarter note = 6 frames at default speed)
@@ -1482,13 +2905,13 @@ func writeMIDI(noteFreqs [3][]uint16, sidFreqs [3][]uint16, isDrum [3][]bool, ou
 	var melodicEvents []midiEvent
 	var drumEvents []midiEvent
 	noteTotalFrames := len(noteFreqs[0])
+
 	for ch := 0; ch < 3; ch++ {
 		lastMelodicNote := -1
 		lastDrumNote := -1
 		for frame := 0; frame < noteTotalFrames && frame < totalFrames; frame++ {
 			freq := noteFreqs[ch][frame]
 			midiNote := sidFreqToMIDI(freq)
-
 			isDrumFrame := frame < len(isDrum[ch]) && isDrum[ch][frame]
 
 			if isDrumFrame {
@@ -1609,7 +3032,6 @@ func writeMIDI(noteFreqs [3][]uint16, sidFreqs [3][]uint16, isDrum [3][]bool, ou
 	// Write file
 	midiPath := filepath.Join(outDir, "song.mid")
 	os.WriteFile(midiPath, midi, 0644)
-	fmt.Printf("Wrote MIDI file: %s (4 tracks: tempo, melodic, drums, VM)\n", midiPath)
 }
 
 func main() {
@@ -1617,12 +3039,22 @@ func main() {
 	outDir := "generated/stream_compress"
 	os.MkdirAll(outDir, 0755)
 
-	// Extract streams and transpose from partX.bin files (pattern-based extraction)
-	extractStart := time.Now()
+	// Extract streams and transpose from partX.bin files
 	var allStreams [3][]byte
 	var allTranspose [3][]int8
+	var allOrders [3][]byte
 	var songBoundaries []int
 	var orderBoundaries []int // cumulative order count per song
+
+	// Collect all tables for analysis
+	type songTables struct {
+		instruments []byte
+		filter      []byte
+		wave        []byte
+		arp         []byte
+	}
+	var allSongTables []songTables
+
 	for song := 1; song <= 9; song++ {
 		data, err := os.ReadFile(filepath.Join("generated", "parts", fmt.Sprintf("part%d.bin", song)))
 		if err != nil {
@@ -1633,89 +3065,50 @@ func main() {
 		maxFrames := int(partTimes[song-1])
 		streams := extractSongStreams(data, maxFrames)
 		transpose := extractTranspose(data, maxFrames)
+		orders := extractOrderTable(data, maxFrames)
 		for ch := 0; ch < 3; ch++ {
 			allStreams[ch] = append(allStreams[ch], streams[ch]...)
 			allTranspose[ch] = append(allTranspose[ch], transpose[ch]...)
+			allOrders[ch] = append(allOrders[ch], orders[ch]...)
 		}
+
+		// Extract tables
+		allSongTables = append(allSongTables, songTables{
+			instruments: extractInstruments(data),
+			filter:      extractFilterTable(data),
+			wave:        extractWaveTable(data),
+			arp:         extractArpTable(data),
+		})
 	}
 	songBoundaries = append(songBoundaries, len(allStreams[0])/3)
 	orderBoundaries = append(orderBoundaries, len(allTranspose[0]))
 
-	fmt.Printf("Extraction: %.2fs\n", time.Since(extractStart).Seconds())
+	totalRows := len(allStreams[0]) / 3
 
-	// Debug: show order boundaries
-	fmt.Printf("Order boundaries per song: %v\n", orderBoundaries)
-	fmt.Printf("Row boundaries per song: %v\n", songBoundaries)
-
-	// Run VM and simulation side-by-side, comparing each frame
-	validationStart := time.Now()
-	// noteFreqs = clean base notes (for MIDI), sidFreqs/simFreqs = with vibrato (for validation)
-	sidFreqs, _, noteFreqs, isDrum := runSideBySideValidation(allStreams, allTranspose, songBoundaries, orderBoundaries)
-	fmt.Printf("Validation: %.2fs\n", time.Since(validationStart).Seconds())
-	fmt.Printf("Total: %d frames, %d rows, %d songs\n", len(sidFreqs[0]), len(allStreams[0])/3, len(songBoundaries)-1)
-
-	// Count drum frames for debugging
-	drumCount := 0
-	for ch := 0; ch < 3; ch++ {
-		for i := range isDrum[ch] {
-			if isDrum[ch][i] {
-				drumCount++
-			}
-		}
-	}
-	fmt.Printf("Frame counts: drum=%d (total frames=%d)\n", drumCount, len(isDrum[0])*3)
-
-	// Output MIDI file early (before compression)
-	midiStart := time.Now()
-	writeMIDI(noteFreqs, sidFreqs, isDrum, outDir)
-	fmt.Printf("MIDI write: %.2fs\n", time.Since(midiStart).Seconds())
-
-	// Compute usage statistics
-	statsStart := time.Now()
-	usedRows := make(map[[3]byte]bool)
-	usedInst := make(map[byte]bool)
-	usedNote := make(map[byte]bool)
-	usedEffect := make(map[byte]bool)
-	usedParamPerEffect := make(map[byte]map[byte]bool)
-	for i := 0; i < 16; i++ {
-		usedParamPerEffect[byte(i)] = make(map[byte]bool)
+	// Calculate table sizes
+	totalInstBytes := 0
+	totalFilterBytes := 0
+	totalWaveBytes := 0
+	totalArpBytes := 0
+	for _, st := range allSongTables {
+		totalInstBytes += countUsedBytes(st.instruments)
+		totalFilterBytes += countUsedBytes(st.filter)
+		totalWaveBytes += countUsedBytes(st.wave)
+		totalArpBytes += countUsedBytes(st.arp)
 	}
 
-	for ch := 0; ch < 3; ch++ {
-		stream := allStreams[ch]
-		numRows := len(stream) / 3
-		for row := 0; row < numRows; row++ {
-			off := row * 3
-			noteByte, instEff, param := stream[off], stream[off+1], stream[off+2]
-			inst := instEff & 0x1F
-			note := noteByte & 0x7F
-			effect := (instEff >> 5) | ((noteByte >> 4) & 0x08)
+	// Calculate raw data sizes for summary
+	rawPatternData := totalRows * 9
+	rawTableData := totalInstBytes + totalFilterBytes + totalWaveBytes + totalArpBytes
+	rawTotal := rawPatternData + rawTableData
+	_ = rawTotal // used later in summary
 
-			usedRows[[3]byte{noteByte, instEff, param}] = true
-			usedInst[inst] = true
-			usedNote[note] = true
-			usedEffect[effect] = true
-			if effect > 0 {
-				usedParamPerEffect[effect][param] = true
-			}
-		}
-	}
 
-	fmt.Printf("Stats: %.2fs\n", time.Since(statsStart).Seconds())
-	fmt.Println("Usage Statistics")
-	fmt.Println("================")
-	fmt.Printf("Rows:        %6d / 16777216 used (%.4f%%)\n", len(usedRows), float64(len(usedRows))/16777216*100)
-	fmt.Printf("Instruments: %6d / 32 used\n", len(usedInst))
-	fmt.Printf("Notes:       %6d / 128 used\n", len(usedNote))
-	fmt.Printf("Effects:     %6d / 16 used\n", len(usedEffect))
-	fmt.Println()
-	fmt.Println("Params per effect:")
-	for fx := byte(0); fx < 16; fx++ {
-		if usedEffect[fx] && fx > 0 {
-			fmt.Printf("  Effect %X: %3d / 256 params used\n", fx, len(usedParamPerEffect[fx]))
-		}
-	}
-	fmt.Println()
+	// Run VM and simulation side-by-side
+	vmRegs, origSimRegs, noteFreqs, isDrum, patternFrames := runSideBySideValidation(allStreams, allTranspose, songBoundaries, orderBoundaries, nil)
+
+	// Output MIDI file
+	writeMIDI(noteFreqs, vmRegs.Freq, isDrum, patternFrames, outDir)
 
 	// Write each channel to a tab-separated file with decoded fields
 	noteNames := []string{"C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"}
@@ -1765,22 +3158,135 @@ func main() {
 			fmt.Fprintf(f, "%s\t%s\t%s\t%s\t%s\n", hexOrSpace(inst), hexOrSpace(note), hexOrSpace(effect), hexOrSpace(param), human)
 		}
 		f.Close()
-		fmt.Printf("Wrote %s (%d rows)\n", filepath.Join(outDir, fmt.Sprintf("channel_%d.csv", ch)), numRows)
 	}
 
 	// 9 streams with native bit widths: note(7), inst(5), fx+param(12)
 	// Encoding: 0+literal(N bits), 1+dist+len (exp-golomb)
 	const windowElements = 1024 // 1K elements per stream
-	fmt.Println()
-	fmt.Printf("Bit-level Compression (9 streams, %d element window)\n", windowElements)
-	fmt.Println("=====================================================")
-	fmt.Println()
 
 	numRows := len(allStreams[0]) / 3
+	numPatterns := (numRows + 63) / 64
 
-	// Extract 9 streams as integer arrays
+	// Extract 10 streams: 9 pattern streams + 1 transpose stream
+	// Single transpose per pattern applied to ALL 3 channels
+	// Find optimal transpose that gives best compression
 
-	// Build base 9 streams
+	// Helper to get transpose for a row
+	getTranspose := func(ch, row int) int8 {
+		songIdx := 0
+		for i := 0; i < len(songBoundaries)-1; i++ {
+			if row >= songBoundaries[i] && row < songBoundaries[i+1] {
+				songIdx = i
+				break
+			}
+		}
+		songStartRow := songBoundaries[songIdx]
+		orderInSong := (row - songStartRow) / 64
+		transIdx := orderBoundaries[songIdx] + orderInSong
+		if transIdx < len(allTranspose[ch]) {
+			return allTranspose[ch][transIdx]
+		}
+		return 0
+	}
+
+	// First pass: find optimal transpose per pattern
+	// Use the most common transpose among the 3 channels, constrained to avoid clamping
+	optimalTranspose := make([]int, numPatterns)
+
+	for patIdx := 0; patIdx < numPatterns; patIdx++ {
+		startRow := patIdx * 64
+		endRow := startRow + 64
+		if endRow > numRows {
+			endRow = numRows
+		}
+
+		// Find valid transpose range that won't cause clamping
+		// adjusted = note + origTrans - optTrans must be in [1, 96]
+		// So: optTrans >= note + origTrans - 96 AND optTrans <= note + origTrans - 1
+		minAllowed := -128
+		maxAllowed := 127
+		for ch := 0; ch < 3; ch++ {
+			src := allStreams[ch]
+			for row := startRow; row < endRow; row++ {
+				note := int(src[row*3] & 0x7F)
+				if note == 0 || note == 0x61 {
+					continue
+				}
+				t := int(getTranspose(ch, row))
+				// optTrans <= note + t - 1 (to keep adjusted >= 1)
+				upper := note + t - 1
+				if upper < maxAllowed {
+					maxAllowed = upper
+				}
+				// optTrans >= note + t - 96 (to keep adjusted <= 96)
+				lower := note + t - 96
+				if lower > minAllowed {
+					minAllowed = lower
+				}
+			}
+		}
+
+		// Count transpose values within valid range
+		transposeCounts := make(map[int]int)
+		for ch := 0; ch < 3; ch++ {
+			src := allStreams[ch]
+			for row := startRow; row < endRow; row++ {
+				note := int(src[row*3] & 0x7F)
+				if note == 0 || note == 0x61 {
+					continue
+				}
+				t := int(getTranspose(ch, row))
+				if t >= minAllowed && t <= maxAllowed {
+					transposeCounts[t]++
+				}
+			}
+		}
+
+		// Pick most common transpose within valid range
+		bestTrans := 0
+		bestCount := -1
+		for t, count := range transposeCounts {
+			if count > bestCount {
+				bestCount = count
+				bestTrans = t
+			}
+		}
+		// If no valid transpose found, use midpoint of allowed range
+		if bestCount < 0 {
+			bestTrans = (minAllowed + maxAllowed) / 2
+		}
+		optimalTranspose[patIdx] = bestTrans
+	}
+
+	// Count how many notes need adjustment
+	adjustedCount := 0
+	unadjustedCount := 0
+	for patIdx := 0; patIdx < numPatterns; patIdx++ {
+		startRow := patIdx * 64
+		endRow := startRow + 64
+		if endRow > numRows {
+			endRow = numRows
+		}
+		optTrans := optimalTranspose[patIdx]
+		for ch := 0; ch < 3; ch++ {
+			src := allStreams[ch]
+			for row := startRow; row < endRow; row++ {
+				note := int(src[row*3] & 0x7F)
+				if note == 0 || note == 0x61 {
+					continue
+				}
+				origTrans := int(getTranspose(ch, row))
+				if origTrans != optTrans {
+					adjustedCount++
+				} else {
+					unadjustedCount++
+				}
+			}
+		}
+	}
+
+	// Second pass: build streams with raw notes (no transpose adjustment)
+	// Per-channel transpose is stored separately and applied at playback
 	var streams []intStream
 	for ch := 0; ch < 3; ch++ {
 		src := allStreams[ch]
@@ -1796,6 +3302,7 @@ func main() {
 			effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
 			fxParam := (effect << 8) | int(param)
 
+			// Store raw notes - transpose is applied at playback using per-channel transpose
 			noteData = append(noteData, note)
 			instData = append(instData, inst)
 			fxData = append(fxData, fxParam)
@@ -1804,6 +3311,282 @@ func main() {
 		streams = append(streams, intStream{noteData, 7, fmt.Sprintf("Ch%d Note", ch), false, -1, ch})
 		streams = append(streams, intStream{instData, 5, fmt.Sprintf("Ch%d Inst", ch), false, -1, -1})
 		streams = append(streams, intStream{fxData, 12, fmt.Sprintf("Ch%d Fx+P", ch), false, -1, -1})
+	}
+
+	// Add per-channel transpose streams (one value per pattern per channel)
+	// This fixes held-note frequency mismatches by preserving per-channel transpose
+	var transposeData [3][]int
+	for ch := 0; ch < 3; ch++ {
+		transposeData[ch] = make([]int, numPatterns)
+		for patIdx := 0; patIdx < numPatterns; patIdx++ {
+			// Use the transpose value from the first row of this pattern for this channel
+			row := patIdx * 64
+			if row < numRows {
+				transposeData[ch][patIdx] = int(getTranspose(ch, row))
+			}
+		}
+		streams = append(streams, intStream{transposeData[ch], 8, fmt.Sprintf("Trans%d", ch), false, -1, -1})
+	}
+
+	// Add table streams (concatenated per song)
+	var instData, filterData, waveData, arpData []int
+	for _, st := range allSongTables {
+		for _, b := range st.instruments {
+			instData = append(instData, int(b))
+		}
+		for _, b := range st.filter {
+			filterData = append(filterData, int(b))
+		}
+		for _, b := range st.wave {
+			waveData = append(waveData, int(b))
+		}
+		for _, b := range st.arp {
+			arpData = append(arpData, int(b))
+		}
+	}
+	streams = append(streams, intStream{instData, 8, "InstTbl", false, -1, -1})
+	streams = append(streams, intStream{filterData, 8, "FilterTbl", false, -1, -1})
+	streams = append(streams, intStream{waveData, 8, "WaveTbl", false, -1, -1})
+	streams = append(streams, intStream{arpData, 8, "ArpTbl", false, -1, -1})
+
+	fmt.Printf("\nTable streams: inst=%d, filter=%d, wave=%d, arp=%d bytes\n",
+		len(instData), len(filterData), len(waveData), len(arpData))
+
+	// Validate stream encoding: decode using stream data and verify against original
+	verifyErrors := 0
+	for ch := 0; ch < 3; ch++ {
+		noteStream := streams[ch*3].data
+		for row := 0; row < numRows; row++ {
+			origNote := int(allStreams[ch][row*3] & 0x7F)
+			if origNote == 0 || origNote == 0x61 {
+				continue
+			}
+			patIdx := row / 64
+			if patIdx >= numPatterns {
+				patIdx = numPatterns - 1
+			}
+			streamNote := noteStream[row]
+			streamTrans := transposeData[ch][patIdx]
+			origTrans := int(getTranspose(ch, row))
+			decoded := streamNote + streamTrans
+			expected := origNote + origTrans
+			if decoded != expected {
+				verifyErrors++
+			}
+		}
+	}
+	if verifyErrors > 0 {
+		fmt.Printf("  Stream validation: FAIL (%d errors)\n", verifyErrors)
+	}
+
+	// Run VM validation using reconstructed stream data
+	var streamByteData [3][]byte
+	for ch := 0; ch < 3; ch++ {
+		noteStream := streams[ch*3].data
+		instStream := streams[ch*3+1].data
+		fxStream := streams[ch*3+2].data
+		streamByteData[ch] = make([]byte, numRows*3)
+		for row := 0; row < numRows; row++ {
+			note := noteStream[row]
+			inst := instStream[row]
+			fxParam := fxStream[row]
+			effect := (fxParam >> 8) & 0xF
+			param := fxParam & 0xFF
+			// Reconstruct bytes: note | (effect_high_bit << 4), inst | (effect_low_3 << 5), param
+			streamByteData[ch][row*3] = byte(note&0x7F) | byte((effect&0x8)<<4)
+			streamByteData[ch][row*3+1] = byte(inst&0x1F) | byte((effect&0x7)<<5)
+			streamByteData[ch][row*3+2] = byte(param)
+		}
+	}
+
+	// Reconstruct transpose: one per order, same for all 3 channels
+	var streamTranspose [3][]int8
+	for ch := 0; ch < 3; ch++ {
+		streamTranspose[ch] = make([]int8, len(allTranspose[0]))
+	}
+	// Map pattern indices back to order indices (per-channel transpose)
+	orderIdx := 0
+	for patIdx := 0; patIdx < numPatterns && orderIdx < len(streamTranspose[0]); patIdx++ {
+		// Each pattern is 64 rows = 1 order
+		if orderIdx < len(streamTranspose[0]) {
+			for ch := 0; ch < 3; ch++ {
+				streamTranspose[ch][orderIdx] = int8(transposeData[ch][patIdx])
+			}
+			orderIdx++
+		}
+	}
+	// Fill remaining orders if any
+	for orderIdx < len(streamTranspose[0]) {
+		for ch := 0; ch < 3; ch++ {
+			lastTrans := int8(0)
+			if numPatterns > 0 {
+				lastTrans = int8(transposeData[ch][numPatterns-1])
+			}
+			streamTranspose[ch][orderIdx] = lastTrans
+		}
+		orderIdx++
+	}
+
+	// Reconstruct table data from streams for each song
+	// Stream indices: 12=InstTbl, 13=FilterTbl, 14=WaveTbl, 15=ArpTbl
+	instStream := streams[12].data
+	waveStream := streams[14].data
+	arpStream := streams[15].data
+
+	// Per-song sizes (from extract functions)
+	const instPerSong = 512  // 32 instruments × 16 bytes
+	const wavePerSong = 256   // from extractWaveTable
+	const arpPerSong = 256   // from extractArpTable
+
+	var streamTableDatas []SongTableData
+	numSongs := len(songBoundaries) - 1
+	for song := 0; song < numSongs; song++ {
+		var td SongTableData
+
+		// Extract inst data for this song
+		instStart := song * instPerSong
+		instEnd := instStart + instPerSong
+		if instEnd <= len(instStream) {
+			td.InstData = make([]byte, instPerSong)
+			for i := 0; i < instPerSong && instStart+i < len(instStream); i++ {
+				td.InstData[i] = byte(instStream[instStart+i])
+			}
+		}
+
+		// Extract wave data for this song
+		waveStart := song * wavePerSong
+		waveEnd := waveStart + wavePerSong
+		if waveEnd <= len(waveStream) {
+			td.WaveTable = make([]byte, wavePerSong)
+			for i := 0; i < wavePerSong && waveStart+i < len(waveStream); i++ {
+				td.WaveTable[i] = byte(waveStream[waveStart+i])
+			}
+		}
+
+		// Extract arp data for this song
+		arpStart := song * arpPerSong
+		arpEnd := arpStart + arpPerSong
+		if arpEnd <= len(arpStream) {
+			td.ArpTable = make([]byte, arpPerSong)
+			for i := 0; i < arpPerSong && arpStart+i < len(arpStream); i++ {
+				td.ArpTable[i] = byte(arpStream[arpStart+i])
+			}
+		}
+
+		streamTableDatas = append(streamTableDatas, td)
+	}
+
+	// Verify table data in streams matches original
+	tableErrors := 0
+	for song := 0; song < numSongs; song++ {
+		origTables := allSongTables[song]
+		streamTables := streamTableDatas[song]
+		for i := 0; i < len(streamTables.InstData) && i < len(origTables.instruments); i++ {
+			if streamTables.InstData[i] != origTables.instruments[i] {
+				tableErrors++
+			}
+		}
+		for i := 0; i < len(streamTables.WaveTable) && i < len(origTables.wave); i++ {
+			if streamTables.WaveTable[i] != origTables.wave[i] {
+				tableErrors++
+			}
+		}
+		for i := 0; i < len(streamTables.ArpTable) && i < len(origTables.arp); i++ {
+			if streamTables.ArpTable[i] != origTables.arp[i] {
+				tableErrors++
+			}
+		}
+	}
+	if tableErrors > 0 {
+		fmt.Printf("  Table validation: FAIL (%d mismatches)\n", tableErrors)
+	}
+
+	// Run stream-only simulation and compare against VM output
+	streamRegs := runStreamOnlySimulation(streams, songBoundaries, orderBoundaries)
+
+	// Compare all SID registers: Freq, PW, Control, AD, SR, Filter, Volume
+	freqMismatches := 0
+	pwMismatches := 0
+	controlMismatches := 0
+	adMismatches := 0
+	srMismatches := 0
+	filterLoMismatches := 0
+	filterHiMismatches := 0
+	filterResMismatches := 0
+	filterVolMismatches := 0
+	totalFrames := len(vmRegs.Freq[0])
+	streamFrames := len(streamRegs.Freq[0])
+
+	if totalFrames != streamFrames {
+		fmt.Printf("  WARNING: Frame count mismatch: VM=%d, Stream=%d\n", totalFrames, streamFrames)
+	}
+
+	compareFrames := totalFrames
+	if streamFrames < compareFrames {
+		compareFrames = streamFrames
+	}
+
+	for ch := 0; ch < 3; ch++ {
+		for i := 0; i < compareFrames; i++ {
+			if vmRegs.Freq[ch][i] != streamRegs.Freq[ch][i] {
+				freqMismatches++
+			}
+			if vmRegs.PW[ch][i] != streamRegs.PW[ch][i] {
+				pwMismatches++
+			}
+			if vmRegs.Control[ch][i] != streamRegs.Control[ch][i] {
+				controlMismatches++
+			}
+			if vmRegs.AD[ch][i] != streamRegs.AD[ch][i] {
+				adMismatches++
+			}
+			if vmRegs.SR[ch][i] != streamRegs.SR[ch][i] {
+				srMismatches++
+			}
+		}
+	}
+
+	// Compare filter/volume registers (global, not per-channel)
+	for i := 0; i < compareFrames; i++ {
+		if vmRegs.FilterLo[i] != streamRegs.FilterLo[i] {
+			filterLoMismatches++
+		}
+		if vmRegs.FilterHi[i] != streamRegs.FilterHi[i] {
+			filterHiMismatches++
+		}
+		if vmRegs.FilterRes[i] != streamRegs.FilterRes[i] {
+			filterResMismatches++
+		}
+		if vmRegs.FilterVol[i] != streamRegs.FilterVol[i] {
+			filterVolMismatches++
+		}
+	}
+
+	totalMismatches := freqMismatches + pwMismatches + controlMismatches + adMismatches + srMismatches +
+		filterLoMismatches + filterHiMismatches + filterResMismatches + filterVolMismatches
+	if totalMismatches == 0 {
+		fmt.Println("  Stream vs VM comparison: PASS (all SID registers D400-D418 match)")
+	} else {
+		fmt.Printf("  Stream vs VM comparison: %d total mismatches\n", totalMismatches)
+		fmt.Printf("    Freq: %d, PW: %d, Control: %d, AD: %d, SR: %d\n",
+			freqMismatches, pwMismatches, controlMismatches, adMismatches, srMismatches)
+		fmt.Printf("    FilterLo: %d, FilterHi: %d, FilterRes: %d, FilterVol: %d\n",
+			filterLoMismatches, filterHiMismatches, filterResMismatches, filterVolMismatches)
+	}
+
+	// Verify stream encoding matches original simulation
+	simMismatch := 0
+	for ch := 0; ch < 3; ch++ {
+		for i := 0; i < compareFrames; i++ {
+			if origSimRegs.Freq[ch][i] != streamRegs.Freq[ch][i] {
+				simMismatch++
+			}
+		}
+	}
+	if simMismatch == 0 {
+		fmt.Println("  Stream encoding: PASS")
+	} else {
+		fmt.Printf("  Stream encoding: FAIL (%d mismatches)\n", simMismatch)
 	}
 
 	// Bit-level DP for integer stream chunks
@@ -1951,9 +3734,6 @@ func main() {
 	done := make(chan struct{})
 
 	numWorkers := runtime.NumCPU()
-	fmt.Printf("  Starting compression: %d streams × %d chunks = %d tasks, %d workers\n", numStreams, numChunks, numStreams*numChunks, numWorkers)
-	fmt.Printf("  Raw bits (base only): %d (%d bytes)\n", totalRawBits, totalRawBits/8)
-	fmt.Printf("  GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
 
 	startTime := time.Now()
 	go func() {
@@ -2062,9 +3842,6 @@ func main() {
 	}
 	wg.Wait()
 	close(done)
-	elapsed := time.Since(startTime)
-
-	fmt.Printf("\n  Compression complete in %.1fs (%d workers)\n", elapsed.Seconds(), numWorkers)
 
 	// Compute total bits per stream
 	streamTotalBits := make([]int, numStreams)
@@ -2144,33 +3921,8 @@ func main() {
 	fmt.Println()
 	fmt.Printf("Original:   %d bytes (%d bits)\n", (totalCompBits+7)/8, totalCompBits)
 	fmt.Printf("With best:  %d bytes (%d bits) [%+d]\n", (totalBestBits+7)/8, totalBestBits, totalBestBits-totalCompBits)
-	fmt.Printf("Current system: 26,596 bytes\n")
-	fmt.Printf("Improvement:    %+d bytes\n", (totalBestBits+7)/8-26596)
-
-	// Show experiment comparison for notes
-	fmt.Println()
-	fmt.Println("Note Stream Variants")
-	fmt.Println("====================")
-	for ch := 0; ch < 3; ch++ {
-		baseIdx := ch * 3
-		baseBits := streamTotalBits[baseIdx]
-		rawBits := len(streams[baseIdx].data) * 7
-
-		fmt.Printf("\nCh%d Notes (%d raw bits):\n", ch, rawBits)
-
-		// Find all variants for this channel
-		for sIdx := 0; sIdx < numStreams; sIdx++ {
-			if streams[sIdx].expGroup == ch {
-				bits := streamTotalBits[sIdx]
-				diff := bits - baseBits
-				marker := "  "
-				if best, ok := bestForGroup[ch]; ok && best.sIdx == sIdx {
-					marker = "* "
-				}
-				fmt.Printf("  %s%-10s: %6d bits (%.1f%%) %+6d\n", marker, streams[sIdx].name, bits, float64(bits)/float64(rawBits)*100, diff)
-			}
-		}
-	}
+	fmt.Printf("Current system: 26,270 bytes\n")
+	fmt.Printf("Improvement:    %+d bytes\n", (totalBestBits+7)/8-26270)
 
 	// By chunk position with best variants
 	fmt.Println()
@@ -2243,6 +3995,6 @@ func main() {
 		ratio := float64(c.bits) / float64(c.raw) * 100
 		fmt.Printf("  %s c%02d: %5d bits (%.1f%% of raw)\n", c.stream, c.chunk, c.bits, ratio)
 	}
-
-	fmt.Printf("\nTotal time: %.2fs\n", time.Since(mainStart).Seconds())
+	fmt.Printf("\nCompressed size: %d bytes\n", (totalCompBits+7)/8)
+	fmt.Printf("Total time: %.2fs\n", time.Since(mainStart).Seconds())
 }

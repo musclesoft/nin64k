@@ -1,7 +1,7 @@
 06	3D	0C	81	C-5 i06 Fxx81
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
+  	  	  	05	---
+  	  	  	05	---
+  	  	  	05	---
   	  	0C	82	--- Fxx82
   	  	  	  	---
   	  	  	  	---
@@ -127,9 +127,9 @@
   	  	  	  	---
   	  	  	  	---
 06	3D	0C	81	C-5 i06 Fxx81
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
+  	  	  	05	---
+  	  	  	05	---
+  	  	  	05	---
   	  	0C	82	--- Fxx82
   	  	  	  	---
   	  	  	  	---
@@ -1919,9 +1919,9 @@
   	  	08	47	--- arp47
   	  	08	47	--- arp47
 06	3D	0C	81	C-5 i06 Fxx81
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
+  	  	  	05	---
+  	  	  	05	---
+  	  	  	05	---
   	  	0C	82	--- Fxx82
   	  	  	  	---
   	  	  	  	---
@@ -3262,31 +3262,23 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-0D	3D	  	  	C-5 i13
+08	3D	07	FF	C-5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	40	07	FF	D#5 i08 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	42	07	FF	F-5 i08 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	  	  	---
+08	45	07	FF	G#5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	47	07	FF	A#5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	  	  	---
+08	49	07	FF	C-6 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -3294,7 +3286,15 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	31	07	FF	C-4 i08 wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+06	3D	0C	  	C-5 i06 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -11798,7 +11798,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+06	3D	0C	  	C-5 i06 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -17790,11 +17790,11 @@
   	  	  	  	---
 06	33	  	  	D-4 i06
 06	33	  	  	D-4 i06
-05	2E	07	FF	A-3 i05 wavFF
+05	35	07	FF	E-4 i05 wavFF
   	  	07	FF	--- wavFF
 05	31	07	FF	C-4 i05 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	33	07	FF	D-4 i05 wavFF
   	  	07	FF	--- wavFF
 05	30	07	FF	B-3 i05 wavFF
   	  	07	FF	--- wavFF
@@ -17804,8 +17804,8 @@
   	  	07	FF	--- wavFF
 05	30	07	FF	B-3 i05 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	  	  	---
+05	2C	07	FF	G-3 i05 wavFF
+05	2D	07	FF	G#3 i05 wavFF
 05	2E	07	FF	A-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -17814,7 +17814,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	3A	07	FF	A-4 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -17822,7 +17822,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+02	31	0C	  	C-4 i02 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -34206,7 +34206,7 @@
   	  	07	FF	--- wavFF
 09	47	07	FF	A#5 i09 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+09	3D	0C	  	C-5 i09 Fxx00
   	  	  	  	---
 09	40	  	  	D#5 i09
   	  	  	  	---
@@ -40733,7 +40733,7 @@
   	  	08	04	--- arp04
   	  	08	02	--- arp02
   	  	08	01	--- arp01
-  	  	  	  	---
+  	  	08	  	--- arp00
 1B	2B	08	  	F#3 i27 arp00
   	  	08	02	--- arp02
   	  	08	04	--- arp04
@@ -41373,7 +41373,7 @@
   	  	08	04	--- arp04
   	  	08	02	--- arp02
   	  	08	01	--- arp01
-  	  	  	  	---
+  	  	08	  	--- arp00
 1B	2B	08	  	F#3 i27 arp00
   	  	08	02	--- arp02
   	  	08	04	--- arp04
@@ -41990,7 +41990,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	2C	07	FF	G-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -41998,7 +41998,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	2A	07	FF	F-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -42014,7 +42014,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+1A	25	0C	  	C-3 i26 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -51598,7 +51598,7 @@
   	  	  	  	---
 0F	3E	05	48	C#5 i15 AD48
 0F	3D	05	48	C-5 i15 AD48
-0F	3B	0C	08	A#4 i15 Fxx08
+0F	3B	0C	F2	A#4 i15 FxxF2
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -51662,7 +51662,7 @@
   	  	  	  	---
 0F	3E	05	48	C#5 i15 AD48
 0F	3D	05	48	C-5 i15 AD48
-0F	3B	0C	08	A#4 i15 Fxx08
+0F	3B	0C	F2	A#4 i15 FxxF2
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -51775,21 +51775,21 @@
   	  	03	01	--- por01
   	  	03	01	--- por01
   	61	06	0F	OFF SR0F
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
-  	  	  	  	---
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
+  	  	06	0F	--- SR0F
   	  	06	0E	--- SR0E
   	  	06	0E	--- SR0E
   	  	06	0E	--- SR0E
@@ -51838,7 +51838,7 @@
   	  	06	0D	--- SR0D
   	  	06	0D	--- SR0D
   	  	06	0D	--- SR0D
-13	32	0C	F1	C#4 i19 FxxF1
+13	32	0C	08	C#4 i19 Fxx08
   	  	0C	F6	--- FxxF6
   	  	  	  	---
 13	32	  	  	C#4 i19
@@ -52286,7 +52286,7 @@
   	  	  	  	---
   	  	  	  	---
 18	19	  	  	C-2 i24
-13	32	0C	F1	C#4 i19 FxxF1
+13	32	0C	08	C#4 i19 Fxx08
   	  	0C	F6	--- FxxF6
   	  	  	  	---
 13	32	  	  	C#4 i19
@@ -52926,7 +52926,7 @@
   	  	03	03	--- por03
   	  	03	03	--- por03
   	  	03	03	--- por03
-  	61	0C	E4	OFF FxxE4
+  	61	0C	08	OFF Fxx08
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -52990,7 +52990,7 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-13	32	0C	F1	C#4 i19 FxxF1
+13	32	0C	08	C#4 i19 Fxx08
   	  	0C	F6	--- FxxF6
   	  	  	  	---
 13	32	  	  	C#4 i19
@@ -53504,7 +53504,7 @@
 1D	3F	  	  	D-5 i29
 1D	2F	0C	08	A#3 i29 Fxx08
 1D	3B	0C	93	A#4 i29 Fxx93
-1D	34	0C	08	D#4 i29 Fxx08
+1D	34	0B	F1	D#4 i29 resF1
 1D	36	  	  	F-4 i29
 1D	32	  	  	C#4 i29
 1D	34	  	  	D#4 i29
@@ -54062,7 +54062,7 @@
 08	2D	0C	06	G#3 i08 Fxx06
 08	21	0C	07	G#2 i08 Fxx07
 08	25	0C	06	C-3 i08 Fxx06
-  	  	  	  	---
+  	  	0C	07	--- Fxx07
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -54126,7 +54126,7 @@
 08	2D	0C	06	G#3 i08 Fxx06
 08	21	0C	07	G#2 i08 Fxx07
 08	25	0C	06	C-3 i08 Fxx06
-  	  	  	  	---
+  	  	0C	07	--- Fxx07
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -55102,15 +55102,11 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-17	3D	  	  	C-5 i23
+1D	3D	07	FF	C-5 i29 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
+1D	3A	07	FF	A-4 i29 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -55118,7 +55114,11 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	0C	  	--- Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -55744,7 +55744,7 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-  	  	  	  	---
+  	  	  	50	---
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -56205,7 +56205,7 @@
 0B	4A	0C	06	C#6 i11 Fxx06
   	  	  	  	---
 08	49	  	  	C-6 i08
-08	4A	03	2A	C#6 i08 por2A
+08	4A	03	F0	C#6 i08 porF0
 0B	49	03	F0	C-6 i11 porF0
   	  	  	  	---
 08	45	  	  	G#5 i08
@@ -56525,7 +56525,7 @@
 0B	4A	0C	06	C#6 i11 Fxx06
   	  	  	  	---
 08	49	  	  	C-6 i08
-08	4A	03	2A	C#6 i08 por2A
+08	4A	03	F0	C#6 i08 porF0
 0B	49	03	F0	C-6 i11 porF0
   	  	  	  	---
 08	45	  	  	G#5 i08
@@ -56704,7 +56704,7 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-  	  	  	  	---
+  	  	  	50	---
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---

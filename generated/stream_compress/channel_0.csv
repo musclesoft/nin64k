@@ -3026,8 +3026,8 @@
   	  	  	  	---
 0B	3D	  	  	C-5 i11
 0B	38	03	0F	G-4 i11 por0F
-  	  	  	  	---
-  	  	  	  	---
+  	  	03	0F	--- por0F
+  	  	03	0F	--- por0F
 0B	36	  	  	F-4 i11
 0B	31	03	15	C-4 i11 por15
   	  	03	15	--- por15
@@ -3262,31 +3262,23 @@
 01	3D	  	  	C-5 i01
 01	3E	  	  	C#5 i01
 01	3D	0C	F2	C-5 i01 FxxF2
-0D	3D	  	  	C-5 i13
+08	3D	07	FF	C-5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	40	07	FF	D#5 i08 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	42	07	FF	F-5 i08 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	  	  	---
+08	45	07	FF	G#5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	47	07	FF	A#5 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	  	  	---
+08	49	07	FF	C-6 i08 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -3294,7 +3286,15 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+08	31	07	FF	C-4 i08 wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+06	3D	0C	  	C-5 i06 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -11798,7 +11798,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+06	3D	0C	  	C-5 i06 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -15316,7 +15316,7 @@
   	  	  	  	---
 0A	1D	08	03	E-2 i10 arp03
   	  	08	03	--- arp03
-0A	11	  	  	E-1 i10
+0A	11	  	03	E-1 i10
   	  	  	  	---
 0A	11	  	  	E-1 i10
   	  	  	  	---
@@ -17428,7 +17428,7 @@
   	  	  	  	---
 0A	1D	08	03	E-2 i10 arp03
   	  	08	03	--- arp03
-0A	11	  	  	E-1 i10
+0A	11	  	03	E-1 i10
   	  	  	  	---
 0A	11	  	  	E-1 i10
   	  	  	  	---
@@ -17748,7 +17748,7 @@
   	  	  	  	---
 0A	1D	08	03	E-2 i10 arp03
   	  	08	03	--- arp03
-0A	11	  	  	E-1 i10
+0A	11	  	03	E-1 i10
   	  	  	  	---
 0A	11	  	  	E-1 i10
   	  	  	  	---
@@ -17790,11 +17790,11 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-05	2E	07	FF	A-3 i05 wavFF
+05	35	07	FF	E-4 i05 wavFF
   	  	07	FF	--- wavFF
 05	31	07	FF	C-4 i05 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	33	07	FF	D-4 i05 wavFF
   	  	07	FF	--- wavFF
 05	30	07	FF	B-3 i05 wavFF
   	  	07	FF	--- wavFF
@@ -17804,8 +17804,8 @@
   	  	07	FF	--- wavFF
 05	30	07	FF	B-3 i05 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	  	  	---
+05	2C	07	FF	G-3 i05 wavFF
+05	2D	07	FF	G#3 i05 wavFF
 05	2E	07	FF	A-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -17814,7 +17814,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	3A	07	FF	A-4 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -17822,7 +17822,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+02	31	0C	  	C-4 i02 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -34206,7 +34206,7 @@
   	  	07	FF	--- wavFF
 09	47	07	FF	A#5 i09 wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+09	3D	0C	  	C-5 i09 Fxx00
   	  	  	  	---
 09	40	  	  	D#5 i09
   	  	  	  	---
@@ -37226,7 +37226,7 @@
 18	30	08	03	B-3 i24 arp03
 18	3C	08	02	B-4 i24 arp02
 18	30	08	01	B-3 i24 arp01
-18	30	  	  	B-3 i24
+18	30	08	  	B-3 i24 arp00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -41990,7 +41990,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	2C	07	FF	G-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -41998,7 +41998,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+05	2A	07	FF	F-3 i05 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -42014,7 +42014,7 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+1A	25	0C	  	C-3 i26 Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -53610,7 +53610,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -53626,7 +53626,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -53674,7 +53674,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -53690,7 +53690,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54442,7 +54442,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54458,7 +54458,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54506,7 +54506,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54522,7 +54522,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54570,7 +54570,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54586,7 +54586,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54634,7 +54634,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54650,7 +54650,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54712,11 +54712,11 @@
   	  	08	39	--- arp39
 17	3D	  	  	C-5 i23
   	  	  	  	---
-13	3D	08	38	C-5 i19 arp38
+16	3D	08	38	C-5 i22 arp38
   	  	08	38	--- arp38
 17	3D	  	  	C-5 i23
   	  	  	  	---
-13	3D	08	37	C-5 i19 arp37
+16	3D	08	37	C-5 i22 arp37
   	  	08	37	--- arp37
 17	3D	  	  	C-5 i23
   	  	  	  	---
@@ -54776,11 +54776,11 @@
   	  	08	39	--- arp39
 17	3D	  	  	C-5 i23
   	  	  	  	---
-13	3D	08	38	C-5 i19 arp38
+16	3D	08	38	C-5 i22 arp38
   	  	08	38	--- arp38
 17	3D	  	  	C-5 i23
   	  	  	  	---
-13	3D	08	37	C-5 i19 arp37
+16	3D	08	37	C-5 i22 arp37
   	  	08	37	--- arp37
 08	17	05	0A	A#1 i08 AD0A
 08	17	05	0A	A#1 i08 AD0A
@@ -54826,7 +54826,7 @@
   	  	  	  	---
 08	13	05	0A	F#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	15	  	  	G#1 i24
   	  	  	  	---
 08	12	05	0A	F-1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -54842,7 +54842,7 @@
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
-18	3D	  	  	C-5 i24
+18	1E	  	  	F-2 i24
   	  	  	  	---
 08	15	05	0A	G#1 i08 AD0A
   	  	05	0A	--- AD0A
@@ -55102,15 +55102,11 @@
   	  	06	0D	--- SR0D
   	  	06	0D	--- SR0D
   	  	06	0D	--- SR0D
-17	3D	  	  	C-5 i23
+1D	3D	07	FF	C-5 i29 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
-  	  	07	FF	--- wavFF
+1D	3A	07	FF	A-4 i29 wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
@@ -55118,7 +55114,11 @@
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
   	  	07	FF	--- wavFF
-  	  	  	  	---
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	07	FF	--- wavFF
+  	  	0C	  	--- Fxx00
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
@@ -59389,7 +59389,7 @@
   	  	  	  	---
   	  	  	  	---
   	  	  	  	---
-  	  	  	  	---
+  	61	0C	F2	OFF FxxF2
 01	3A	0B	F4	A-4 i01 resF4
   	  	  	  	---
   	  	  	  	---

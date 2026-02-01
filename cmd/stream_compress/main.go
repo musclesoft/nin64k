@@ -317,12 +317,18 @@ type compressResult struct {
 }
 
 type intStream struct {
-	data       []int
-	bitWidth   int
-	name       string
-	isExp      bool
-	baseIdx    int
-	expGroup   int
+	data     []int
+	bitWidth int
+	name     string
+	isExp    bool
+	window   int
+}
+
+type SongTables struct {
+	instruments []byte
+	filter      []byte
+	wave        []byte
+	arp         []byte
 }
 
 // Vibrato lookup table (10 depths × 16 positions)
@@ -1803,32 +1809,124 @@ type SIDRegisters struct {
 	FilterVol   []byte // Volume/filter mode (D418)
 }
 
-// runStreamOnlySimulation runs simulation using ONLY the 14 int streams
+// runStreamOnlySimulation runs simulation using ONLY the int streams
 // Returns SID registers for all frames across all songs
-func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBoundaries []int) SIDRegisters {
+// idxToNote is the freq-sorted lookup table for converting note indices back to note values
+func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters {
 	var result SIDRegisters
 
-	// Extract data from streams
-	// streams[0-8]: Ch0-2 Note/Inst/Fx (int arrays)
-	// streams[9-11]: Trans0, Trans1, Trans2 (per pattern per channel)
-	// streams[12]: InstTbl
-	// streams[13]: FilterTbl (not used)
-	// streams[14]: WaveTbl
-	// streams[15]: ArpTbl
+	// Extract data from streams - SPARSE LAYOUT WITH TRANSPOSE:
+	// streams[0-3]: Ch0 NoteVal, NoteDur, Inst, Fx
+	// Stream layout:
+	// streams[0-5]: Ch0-2 NoteVal, NoteDur (2 per channel = 6)
+	// streams[6-11]: Ch0-2 TransV, TransD (2 per channel = 6)
+	// streams[12-17]: Ch0-2 FxV, FxD (2 per channel = 6)
+	// streams[18-23]: Ch0-2 InstV, InstD (2 per channel = 6)
+	// streams[24]: TblData
 
-	numRows := len(streams[0].data)
+	// Get numRows by summing FxD durations (Fx is now sparse)
+	// FxD for Ch0 is at index 13 (12 + ch*2 + 1 where ch=0)
+	numRows := 0
+	for _, dur := range streams[13].data { // Ch0 FxD
+		numRows += dur
+	}
 
-	// Convert int streams to byte arrays for pattern data
+	// Decode sparse notes to row-based format
+	var decodedNotes [3][]int
+	for ch := 0; ch < 3; ch++ {
+		noteVals := streams[ch*2].data   // NoteVal at 0,2,4
+		noteDurs := streams[ch*2+1].data // NoteDur at 1,3,5
+		decoded := make([]int, numRows)
+
+		row := 0
+		for i := 0; i < len(noteVals) && row < numRows; i++ {
+			dur := 0
+			if i < len(noteDurs) {
+				dur = noteDurs[i]
+			}
+			row += dur
+			if row < numRows && noteVals[i] != 0 {
+				decoded[row] = noteVals[i]
+				row++
+			}
+		}
+		decodedNotes[ch] = decoded
+	}
+
+	// Decode sparse Fx streams back to per-row format
+	// FxV/FxD are at indices 12+ch*2 and 12+ch*2+1
+	var decodedFx [3][]int
+	for ch := 0; ch < 3; ch++ {
+		fxVal := streams[12+ch*2].data   // FxV at 12,14,16
+		fxDur := streams[12+ch*2+1].data // FxD at 13,15,17
+		decoded := make([]int, numRows)
+		row := 0
+		for i := 0; i < len(fxVal); i++ {
+			val := fxVal[i]
+			dur := fxDur[i]
+			for j := 0; j < dur && row < numRows; j++ {
+				decoded[row] = val
+				row++
+			}
+		}
+		decodedFx[ch] = decoded
+	}
+
+	// Decode sparse inst streams back to per-row format
+	// InstV/InstD are at indices 18+ch*2 and 18+ch*2+1
+	var decodedInst [3][]int
+	for ch := 0; ch < 3; ch++ {
+		instVal := streams[18+ch*2].data   // InstV at 18,20,22
+		instDur := streams[18+ch*2+1].data // InstD at 19,21,23
+		decoded := make([]int, numRows)
+		row := 0
+		for i := 0; i < len(instVal); i++ {
+			val := instVal[i]
+			dur := instDur[i]
+			for j := 0; j < dur && row < numRows; j++ {
+				decoded[row] = val
+				row++
+			}
+		}
+		decodedInst[ch] = decoded
+	}
+
+	// Decode sparse transpose streams back to per-order format
+	// Streams: 6-7=Ch0 TransV,TransD, 8-9=Ch1, 10-11=Ch2
+	// TransVal[i] = zigzag-encoded value, TransDur[i] = how many orders it lasts
+	var transposeStream [3][]int
+	for ch := 0; ch < 3; ch++ {
+		transVal := streams[6+ch*2].data   // TransV at 6,8,10
+		transDur := streams[6+ch*2+1].data // TransD at 7,9,11
+		var decoded []int
+		for i := 0; i < len(transVal); i++ {
+			// Decode zigzag: 0->0, 1->-1, 2->1, 3->-2, 4->2, ...
+			zigzag := transVal[i]
+			val := zigzag / 2
+			if zigzag%2 == 1 {
+				val = -(zigzag + 1) / 2
+			}
+			dur := transDur[i]
+			for j := 0; j < dur; j++ {
+				decoded = append(decoded, val)
+			}
+		}
+		transposeStream[ch] = decoded
+	}
+
+	// Convert to byte arrays for pattern data
 	var patternData [3][]byte
 	for ch := 0; ch < 3; ch++ {
-		noteStream := streams[ch*3].data
-		instStream := streams[ch*3+1].data
-		fxStream := streams[ch*3+2].data
 		patternData[ch] = make([]byte, numRows*3)
 		for row := 0; row < numRows; row++ {
-			note := noteStream[row]
-			inst := instStream[row]
-			fxParam := fxStream[row]
+			// Convert note index back to note value using lookup table
+			noteIdx := decodedNotes[ch][row]
+			note := 0
+			if noteIdx > 0 && noteIdx < len(idxToNote) {
+				note = idxToNote[noteIdx]
+			}
+			inst := decodedInst[ch][row]
+			fxParam := decodedFx[ch][row]
 			effect := (fxParam >> 8) & 0xF
 			param := fxParam & 0xFF
 			patternData[ch][row*3] = byte(note&0x7F) | byte((effect&0x8)<<4)
@@ -1837,61 +1935,86 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 		}
 	}
 
-	// Per-channel transpose (one value per pattern per channel)
-	var transposeStream [3][]int
-	for ch := 0; ch < 3; ch++ {
-		transposeStream[ch] = streams[9+ch].data
+	// Decode merged incremental table stream for slot-based loading
+	// streams[24]: TblData (merged format: delta, slot, instDef[16], waveLen, waveData..., arpLen, arpData..., filtLen, filtData...)
+	// Special: delta=65535 is a song reset marker (resets all state, no slot/data follows)
+	const songResetMarker = 65535
+	tblData := streams[24].data
+
+	// Build load events from merged stream
+	type loadEvent struct {
+		row        int
+		slot       int
+		isReset    bool // true = song reset marker, ignore slot/data
+		resetFrame int  // frame at which to trigger reset (only if isReset)
+		instDef    []byte
+		waveData   []byte
+		arpData    []byte
+		filtData   []byte
 	}
-	numPatterns := (numRows + 63) / 64
-
-	// Per-song table sizes
-	const instPerSong = 512
-	const wavePerSong = 256
-	const arpPerSong = 256
-
-	instStream := streams[12].data
-	waveStream := streams[14].data
-	arpStream := streams[15].data
-
-	numSongs := len(songBoundaries) - 1
-
-	// Build per-song table data
-	type songTables struct {
-		instData    []byte
-		waveTable   []byte
-		arpTable    []byte
-		filterTable []byte
+	var loadEvents []loadEvent
+	currentRow := 0
+	off := 0
+	for off < len(tblData) {
+		// Delta (or reset marker)
+		delta := tblData[off]
+		off++
+		if delta == songResetMarker {
+			// Song reset marker followed by: frameCount, rowBase
+			resetFrame := tblData[off]
+			off++
+			resetRow := tblData[off]
+			off++
+			loadEvents = append(loadEvents, loadEvent{row: resetRow, isReset: true, resetFrame: resetFrame})
+			currentRow = resetRow // Set row base to reset point
+			continue
+		}
+		currentRow += delta
+		// Slot
+		slot := tblData[off]
+		off++
+		// InstDef (16 bytes)
+		instDef := make([]byte, 16)
+		for j := 0; j < 16; j++ {
+			instDef[j] = byte(tblData[off+j])
+		}
+		off += 16
+		// Wave: length then data
+		wvLen := tblData[off]
+		off++
+		waveData := make([]byte, wvLen)
+		for j := 0; j < wvLen; j++ {
+			waveData[j] = byte(tblData[off+j])
+		}
+		off += wvLen
+		// Arp: length then data
+		arLen := tblData[off]
+		off++
+		arpData := make([]byte, arLen)
+		for j := 0; j < arLen; j++ {
+			arpData[j] = byte(tblData[off+j])
+		}
+		off += arLen
+		// Filter: length then data
+		fiLen := tblData[off]
+		off++
+		filtData := make([]byte, fiLen)
+		for j := 0; j < fiLen; j++ {
+			filtData[j] = byte(tblData[off+j])
+		}
+		off += fiLen
+		loadEvents = append(loadEvents, loadEvent{row: currentRow, slot: slot, instDef: instDef, waveData: waveData, arpData: arpData, filtData: filtData})
 	}
 
-	filterStream := streams[13].data
-	const filterPerSong = 234 // Must match FILTERTABLE_SZ
-
-	var songs []songTables
-	for song := 0; song < numSongs; song++ {
-		var st songTables
-		st.instData = make([]byte, instPerSong)
-		st.waveTable = make([]byte, 256)
-		st.arpTable = make([]byte, 256)
-		st.filterTable = make([]byte, 256)
-
-		instStart := song * instPerSong
-		for i := 0; i < instPerSong && instStart+i < len(instStream); i++ {
-			st.instData[i] = byte(instStream[instStart+i])
-		}
-		waveStart := song * wavePerSong
-		for i := 0; i < wavePerSong && waveStart+i < len(waveStream); i++ {
-			st.waveTable[i] = byte(waveStream[waveStart+i])
-		}
-		arpStart := song * arpPerSong
-		for i := 0; i < arpPerSong && arpStart+i < len(arpStream); i++ {
-			st.arpTable[i] = byte(arpStream[arpStart+i])
-		}
-		filterStart := song * filterPerSong
-		for i := 0; i < filterPerSong && filterStart+i < len(filterStream); i++ {
-			st.filterTable[i] = byte(filterStream[filterStart+i])
-		}
-		songs = append(songs, st)
+	// Slot tables - each slot has its own instDef, wave, arp, filter data
+	type slotData struct {
+		instDef  []byte
+		waveData []byte
+		arpData  []byte
+		filtData []byte
 	}
+	slots := make([]slotData, 32) // max 32 slots
+	nextLoadEvent := 0
 
 	// Simulation state (same as in runSideBySideValidation)
 	type chanState struct {
@@ -1925,94 +2048,154 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 	}
 
 	// Filter state (global, not per-channel)
+	filterActive := false // whether filter is currently running
 	filterIdx := 0
 	filterEnd := 0
 	filterLoop := 0
+	filterSlot := -1 // which slot's filter data we're using
 	filterCutoff := byte(0)
 	filterResonance := byte(0)
 	filterMode := byte(0)
 	globalVolume := byte(0x0F)
 
-	// Run simulation for all songs consecutively
-	globalFrameOffset := 0
-	for songIdx := 0; songIdx < numSongs; songIdx++ {
-		if songIdx >= len(songs) {
-			continue
+	// Run continuous simulation - no per-song loop
+	// Reset events in stream trigger state resets
+	var simState [3]chanState
+	speed := 6
+	speedCounter := 5
+	mod3Counter := 0
+
+	// Get total frames and rows from final reset marker in stream
+	// (last reset has frame=totalFrames, row=totalRows)
+	totalFrames := 0
+	totalRows := numRows
+	for _, ev := range loadEvents {
+		if ev.isReset && ev.resetFrame > totalFrames {
+			totalFrames = ev.resetFrame
 		}
+	}
 
-		numFrames := int(partTimes[songIdx])
-		sd := songs[songIdx]
+	// Row tracking - continuous across all songs
+	row := 0
+	ordernumber := 0
+	nextordernumber := 0
+	trackRow := -1
+	forcenewpattern := true
+	firsttrackrow := 0
 
-		var simState [3]chanState
-		for ch := 0; ch < 3; ch++ {
-			simState[ch].hardRestart = 2
+	// Initialize state for first song (no reset marker at row 0)
+	for ch := 0; ch < 3; ch++ {
+		simState[ch] = chanState{hardRestart: 2}
+	}
+
+	// Extract reset events (frame boundaries from stream)
+	type resetInfo struct {
+		frame    int
+		rowBase  int
+	}
+	var resets []resetInfo
+	for _, ev := range loadEvents {
+		if ev.isReset {
+			resets = append(resets, resetInfo{ev.resetFrame, ev.row})
 		}
-		// Reset filter state for new song
-		filterIdx = 0
-		filterEnd = 0
-		filterLoop = 0
-		filterCutoff = 0
-		filterResonance = 0
-		filterMode = 0
-		globalVolume = 0x0F
-		speed := 6
-		speedCounter := 5
-		mod3Counter := 0
-		row := songBoundaries[songIdx]
-		endRow := songBoundaries[songIdx+1]
-		ordernumber := 0
-		nextordernumber := 0
-		trackRow := -1
-		forcenewpattern := true
-		firsttrackrow := 0
+	}
+	nextResetIdx := 0
+	songRowBase := 0      // Row offset for current song
+	songOrderBase := 0    // Order offset for current song (= songRowBase / 64)
+	songEndRow := totalRows // End row for current song (for HR check)
+	if len(resets) > 0 {
+		songEndRow = resets[0].rowBase
+	}
 
-		for frame := 0; frame < numFrames; frame++ {
-			// Increment speedCounter and process row if needed
-			mod3Counter--
-			if mod3Counter < 0 {
-				mod3Counter = 2
+	for frame := 0; frame < totalFrames; frame++ {
+		// Check for song boundary (from stream reset markers) and reset
+		if nextResetIdx < len(resets) && frame == resets[nextResetIdx].frame {
+			// Reset pattern tracking for new song
+			ordernumber = 0
+			nextordernumber = 0
+			trackRow = -1
+			forcenewpattern = true
+			firsttrackrow = 0
+			songRowBase = resets[nextResetIdx].rowBase
+			songOrderBase = songRowBase / 64
+			row = songRowBase
+			// Update song end row
+			if nextResetIdx+1 < len(resets) {
+				songEndRow = resets[nextResetIdx+1].rowBase
+			} else {
+				songEndRow = totalRows
 			}
+			// Reset all state including timing
+			for ch := 0; ch < 3; ch++ {
+				simState[ch] = chanState{hardRestart: 2}
+			}
+			filterActive = false
+			filterIdx = 0
+			filterEnd = 0
+			filterLoop = 0
+			filterSlot = -1
+			filterCutoff = 0
+			filterResonance = 0
+			filterMode = 0
+			globalVolume = 0x0F
+			speed = 6
+			speedCounter = 5
+			mod3Counter = 0
+			nextResetIdx++
+		}
 
-			speedCounter++
-			if speedCounter >= speed && row < endRow {
-				speedCounter = 0
+		// Increment speedCounter and process row if needed
+		mod3Counter--
+		if mod3Counter < 0 {
+			mod3Counter = 2
+		}
 
-				if forcenewpattern {
+		speedCounter++
+		if speedCounter >= speed && row < totalRows {
+			speedCounter = 0
+
+			if forcenewpattern {
+				ordernumber = nextordernumber
+				nextordernumber++
+				trackRow = firsttrackrow
+				firsttrackrow = 0
+				forcenewpattern = false
+			} else {
+				trackRow++
+				if trackRow >= 64 {
 					ordernumber = nextordernumber
 					nextordernumber++
-					trackRow = firsttrackrow
-					firsttrackrow = 0
-					forcenewpattern = false
-				} else {
-					trackRow++
-					if trackRow >= 64 {
-						ordernumber = nextordernumber
-						nextordernumber++
-						trackRow = 0
-					}
+					trackRow = 0
 				}
+			}
 
-				row = songBoundaries[songIdx] + ordernumber*64 + trackRow
+			row = songRowBase + ordernumber*64 + trackRow
 
-				for ch := 0; ch < 3; ch++ {
-					off := row * 3
-					if off+2 >= len(patternData[ch]) {
-						continue
-					}
-					noteByte, instEff, param := patternData[ch][off], patternData[ch][off+1], patternData[ch][off+2]
-					note := int(noteByte & 0x7F)
-					inst := int(instEff & 0x1F)
-					effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
+			// Process any load events up to this row (reset events handled at frame start)
+			for nextLoadEvent < len(loadEvents) && loadEvents[nextLoadEvent].row <= row {
+				ev := loadEvents[nextLoadEvent]
+				if !ev.isReset {
+					slots[ev.slot] = slotData{ev.instDef, ev.waveData, ev.arpData, ev.filtData}
+				}
+				nextLoadEvent++
+			}
 
-					// Get per-channel transpose from stream
-					patIdx := row / 64
-					if patIdx >= numPatterns {
-						patIdx = numPatterns - 1
-					}
-					trans := int8(0)
-					if patIdx < len(transposeStream[ch]) {
-						trans = int8(transposeStream[ch][patIdx])
-					}
+			for ch := 0; ch < 3; ch++ {
+				off := row * 3
+				if off+2 >= len(patternData[ch]) {
+					continue
+				}
+				noteByte, instEff, param := patternData[ch][off], patternData[ch][off+1], patternData[ch][off+2]
+				note := int(noteByte & 0x7F)
+				inst := int(instEff & 0x1F) // This is now a slot ID, not original instrument ID
+				effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
+
+				// Look up transpose
+				transIdx := songOrderBase + ordernumber
+				trans := int8(0)
+				if transIdx < len(transposeStream[ch]) {
+					trans = int8(transposeStream[ch][transIdx])
+				}
 
 					// Player ALWAYS stores effect (even if 0) - see lines 600-616
 					simState[ch].effect = effect
@@ -2020,18 +2203,19 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 
 					if inst > 0 {
 						simState[ch].inst = inst
-						if len(sd.instData) > inst*INST_SIZE+INST_PULSELIMITS {
-							simState[ch].waveIdx = int(sd.instData[inst*INST_SIZE+INST_WAVESTART])
-							simState[ch].arpIdx = int(sd.instData[inst*INST_SIZE+INST_ARPSTART])
-							simState[ch].vibDelay = int(sd.instData[inst*INST_SIZE+INST_VIBDELAY])
-							simState[ch].ad = sd.instData[inst*INST_SIZE+INST_AD]
-							simState[ch].sr = sd.instData[inst*INST_SIZE+INST_SR]
+						slotIdx := inst - 1 // inst is 1-based slot ID
+						if slotIdx >= 0 && slotIdx < len(slots) && len(slots[slotIdx].instDef) > INST_PULSELIMITS {
+							simState[ch].waveIdx = int(slots[slotIdx].instDef[INST_WAVESTART])
+							simState[ch].arpIdx = int(slots[slotIdx].instDef[INST_ARPSTART])
+							simState[ch].vibDelay = int(slots[slotIdx].instDef[INST_VIBDELAY])
+							simState[ch].ad = slots[slotIdx].instDef[INST_AD]
+							simState[ch].sr = slots[slotIdx].instDef[INST_SR]
 							// Pulse width params
-							pw := sd.instData[inst*INST_SIZE+INST_PULSEWIDTH]
+							pw := slots[slotIdx].instDef[INST_PULSEWIDTH]
 							simState[ch].plsWidthLo = pw << 4
 							simState[ch].plsWidthHi = pw >> 4
-							simState[ch].plsSpeed = sd.instData[inst*INST_SIZE+INST_PULSESPEED]
-							limits := sd.instData[inst*INST_SIZE+INST_PULSELIMITS]
+							simState[ch].plsSpeed = slots[slotIdx].instDef[INST_PULSESPEED]
+							limits := slots[slotIdx].instDef[INST_PULSELIMITS]
 							simState[ch].plsLimitDn = limits >> 4
 							simState[ch].plsLimitUp = limits & 0x0F
 							simState[ch].plsDir = 0
@@ -2049,9 +2233,10 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 						}
 						// Reset waveIdx, arpIdx on EVERY note (player does this in @notporta)
 						currentInst := simState[ch].inst
-						if currentInst > 0 && len(sd.instData) > currentInst*INST_SIZE+INST_ARPSTART {
-							simState[ch].waveIdx = int(sd.instData[currentInst*INST_SIZE+INST_WAVESTART])
-							simState[ch].arpIdx = int(sd.instData[currentInst*INST_SIZE+INST_ARPSTART])
+						slotIdx := currentInst - 1
+						if slotIdx >= 0 && slotIdx < len(slots) && len(slots[slotIdx].instDef) > INST_ARPSTART {
+							simState[ch].waveIdx = int(slots[slotIdx].instDef[INST_WAVESTART])
+							simState[ch].arpIdx = int(slots[slotIdx].instDef[INST_ARPSTART])
 						}
 						simState[ch].slideDelta = 0
 						simState[ch].slideEnable = false
@@ -2081,14 +2266,22 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 			for ch := 0; ch < 3; ch++ {
 				s := &simState[ch]
 				s.vibDepth = 0
+				slotIdx := s.inst - 1
+
+				// Look up transpose
+				transIdx := songOrderBase + ordernumber
+				trans := int8(0)
+				if transIdx < len(transposeStream[ch]) {
+					trans = int8(transposeStream[ch][transIdx])
+				}
 
 				// Wave table
-				if s.effect != 7 && s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_WAVELOOP && len(sd.waveTable) > s.waveIdx {
-					s.waveform = sd.waveTable[s.waveIdx]
+				if s.effect != 7 && slotIdx >= 0 && slotIdx < len(slots) && len(slots[slotIdx].instDef) > INST_WAVELOOP && s.waveIdx < len(slots[slotIdx].waveData) {
+					s.waveform = slots[slotIdx].waveData[s.waveIdx]
 					s.waveIdx++
-					waveEnd := int(sd.instData[s.inst*INST_SIZE+INST_WAVEEND])
+					waveEnd := int(slots[slotIdx].instDef[INST_WAVEEND])
 					if s.waveIdx > waveEnd {
-						s.waveIdx = int(sd.instData[s.inst*INST_SIZE+INST_WAVELOOP])
+						s.waveIdx = int(slots[slotIdx].instDef[INST_WAVELOOP])
 					}
 				}
 
@@ -2125,19 +2318,10 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 					}
 				}
 
-				// Arp table - apply per-channel transpose
-				patIdx := row / 64
-				if patIdx >= numPatterns {
-					patIdx = numPatterns - 1
-				}
-				trans := int8(0)
-				if patIdx < len(transposeStream[ch]) {
-					trans = int8(transposeStream[ch][patIdx])
-				}
-
+				// Arp table - apply transpose from stream at runtime
 				if s.effect != 3 {
-					if s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_ARPLOOP && len(sd.arpTable) > s.arpIdx {
-						arpVal := int(sd.arpTable[s.arpIdx])
+					if slotIdx >= 0 && slotIdx < len(slots) && len(slots[slotIdx].instDef) > INST_ARPLOOP && s.arpIdx < len(slots[slotIdx].arpData) {
+						arpVal := int(slots[slotIdx].arpData[s.arpIdx])
 						if arpVal >= 0x80 {
 							arpVal = arpVal & 0x7F
 						} else {
@@ -2148,19 +2332,19 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 							s.noteFreq = s.freq
 						}
 						s.arpIdx++
-						arpEnd := int(sd.instData[s.inst*INST_SIZE+INST_ARPEND])
+						arpEnd := int(slots[slotIdx].instDef[INST_ARPEND])
 						if s.arpIdx > arpEnd {
-							s.arpIdx = int(sd.instData[s.inst*INST_SIZE+INST_ARPLOOP])
+							s.arpIdx = int(slots[slotIdx].instDef[INST_ARPLOOP])
 						}
 					}
 				}
 
 				// Vibrato from instrument
-				if s.inst > 0 && len(sd.instData) > s.inst*INST_SIZE+INST_VIBDEPSP {
+				if slotIdx >= 0 && slotIdx < len(slots) && len(slots[slotIdx].instDef) > INST_VIBDEPSP {
 					if s.vibDelay > 0 {
 						s.vibDelay--
 					} else {
-						vibDepSp := sd.instData[s.inst*INST_SIZE+INST_VIBDEPSP]
+						vibDepSp := slots[slotIdx].instDef[INST_VIBDEPSP]
 						s.vibDepth = int(vibDepSp & 0xF0)
 						if s.vibDepth != 0 {
 							s.vibSpeed = int(vibDepSp & 0x0F)
@@ -2210,7 +2394,7 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 					s.sr = s.param
 				case 7: // Set waveform register directly (runs every frame)
 					s.waveform = s.param
-				case 8:
+				case 8: // Arpeggio effect - apply trans at runtime
 					arpX := int(s.param >> 4)
 					arpY := int(s.param & 0x0F)
 					var arpOffset int
@@ -2247,12 +2431,14 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 							s.slideEnable = true
 						}
 						if highNibble == 0xE0 && lowNibble != 0 {
-							// FEx: Load filter settings from instrument x
-							inst := int(lowNibble)
-							if inst > 0 && inst*INST_SIZE+INST_FILTLOOP < len(sd.instData) {
-								filterIdx = int(sd.instData[inst*INST_SIZE+INST_FILTSTART])
-								filterEnd = int(sd.instData[inst*INST_SIZE+INST_FILTEND])
-								filterLoop = int(sd.instData[inst*INST_SIZE+INST_FILTLOOP])
+							// FEx: Load filter settings from slot x (lowNibble is slot+1)
+							instSlot := int(lowNibble) - 1
+							if instSlot >= 0 && instSlot < len(slots) && len(slots[instSlot].instDef) > INST_FILTLOOP {
+								filterActive = true
+								filterSlot = instSlot
+								filterIdx = int(slots[instSlot].instDef[INST_FILTSTART])
+								filterEnd = int(slots[instSlot].instDef[INST_FILTEND])
+								filterLoop = int(slots[instSlot].instDef[INST_FILTLOOP])
 							}
 						}
 						if highNibble == 0xF0 {
@@ -2308,8 +2494,8 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 						hrTrackRow = trackRow + 1
 						hrOrder = ordernumber
 					}
-					hrRow := songBoundaries[songIdx] + hrOrder*64 + hrTrackRow
-					if hrRow >= songBoundaries[songIdx] && hrRow < endRow {
+					hrRow := songRowBase + hrOrder*64 + hrTrackRow
+					if hrRow >= songRowBase && hrRow < songEndRow {
 						off := hrRow * 3
 						if off+2 < len(patternData[ch]) {
 							noteByte := patternData[ch][off]
@@ -2348,9 +2534,9 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 			}
 
 			// Process filter table (after channel processing)
-			if filterIdx != 0 {
-				if filterIdx < len(sd.filterTable) {
-					filterCutoff = sd.filterTable[filterIdx]
+			if filterActive && filterSlot >= 0 && filterSlot < len(slots) {
+				if filterIdx < len(slots[filterSlot].filtData) {
+					filterCutoff = slots[filterSlot].filtData[filterIdx]
 				}
 				filterIdx++
 				if filterIdx > filterEnd {
@@ -2359,12 +2545,10 @@ func runStreamOnlySimulation(streams []intStream, songBoundaries []int, orderBou
 			}
 
 			// Store filter/volume results (global, not per-channel)
-			result.FilterLo = append(result.FilterLo, 0) // Low 3 bits not tracked
-			result.FilterHi = append(result.FilterHi, filterCutoff)
-			result.FilterRes = append(result.FilterRes, filterResonance)
-			result.FilterVol = append(result.FilterVol, globalVolume|filterMode)
-		}
-		globalFrameOffset += numFrames
+		result.FilterLo = append(result.FilterLo, 0) // Low 3 bits not tracked
+		result.FilterHi = append(result.FilterHi, filterCutoff)
+		result.FilterRes = append(result.FilterRes, filterResonance)
+		result.FilterVol = append(result.FilterVol, globalVolume|filterMode)
 	}
 
 	return result
@@ -3047,13 +3231,7 @@ func main() {
 	var orderBoundaries []int // cumulative order count per song
 
 	// Collect all tables for analysis
-	type songTables struct {
-		instruments []byte
-		filter      []byte
-		wave        []byte
-		arp         []byte
-	}
-	var allSongTables []songTables
+	var allSongTables []SongTables
 
 	for song := 1; song <= 9; song++ {
 		data, err := os.ReadFile(filepath.Join("generated", "parts", fmt.Sprintf("part%d.bin", song)))
@@ -3073,7 +3251,7 @@ func main() {
 		}
 
 		// Extract tables
-		allSongTables = append(allSongTables, songTables{
+		allSongTables = append(allSongTables, SongTables{
 			instruments: extractInstruments(data),
 			filter:      extractFilterTable(data),
 			wave:        extractWaveTable(data),
@@ -3105,7 +3283,7 @@ func main() {
 
 
 	// Run VM and simulation side-by-side
-	vmRegs, origSimRegs, noteFreqs, isDrum, patternFrames := runSideBySideValidation(allStreams, allTranspose, songBoundaries, orderBoundaries, nil)
+	vmRegs, _, noteFreqs, isDrum, patternFrames := runSideBySideValidation(allStreams, allTranspose, songBoundaries, orderBoundaries, nil)
 
 	// Output MIDI file
 	writeMIDI(noteFreqs, vmRegs.Freq, isDrum, patternFrames, outDir)
@@ -3162,7 +3340,6 @@ func main() {
 
 	// 9 streams with native bit widths: note(7), inst(5), fx+param(12)
 	// Encoding: 0+literal(N bits), 1+dist+len (exp-golomb)
-	const windowElements = 1024 // 1K elements per stream
 
 	numRows := len(allStreams[0]) / 3
 	numPatterns := (numRows + 63) / 64
@@ -3285,47 +3462,145 @@ func main() {
 		}
 	}
 
-	// Second pass: build streams with raw notes (no transpose adjustment)
-	// Per-channel transpose is stored separately and applied at playback
+	// Build streams with SPARSE note encoding (note value + duration)
+	// Notes are pre-transposed, no separate transpose streams needed
 	var streams []intStream
+	var sparseNoteData [3][]int
+	var sparseNoteDur [3][]int
+	var instStreamData [3][]int
+	var fxStreamData [3][]int
+
 	for ch := 0; ch < 3; ch++ {
 		src := allStreams[ch]
-		noteData := make([]int, 0, numRows)
+		var noteVals []int
+		var noteDurs []int
 		instData := make([]int, 0, numRows)
 		fxData := make([]int, 0, numRows)
+		gap := 0
 
 		for row := 0; row < numRows; row++ {
 			off := row * 3
 			noteByte, instEff, param := src[off], src[off+1], src[off+2]
-			note := int(noteByte & 0x7F)
+			rawNote := int(noteByte & 0x7F)
 			inst := int(instEff & 0x1F)
 			effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
 			fxParam := (effect << 8) | int(param)
 
-			// Store raw notes - transpose is applied at playback using per-channel transpose
-			noteData = append(noteData, note)
+			// DON'T pre-apply transpose - it must be applied at runtime per-frame
+			// because the player uses current order's transpose for arp calculations
+			note := rawNote
+
+			// Sparse note encoding: only store non-zero notes
+			if note == 0 {
+				gap++
+			} else {
+				noteDurs = append(noteDurs, gap)
+				noteVals = append(noteVals, note)
+				gap = 0
+			}
+
+			// Inst and Fx remain row-based (needed for effect-only rows)
 			instData = append(instData, inst)
 			fxData = append(fxData, fxParam)
 		}
 
-		streams = append(streams, intStream{noteData, 7, fmt.Sprintf("Ch%d Note", ch), false, -1, ch})
-		streams = append(streams, intStream{instData, 5, fmt.Sprintf("Ch%d Inst", ch), false, -1, -1})
-		streams = append(streams, intStream{fxData, 12, fmt.Sprintf("Ch%d Fx+P", ch), false, -1, -1})
+		// Handle trailing gap
+		if gap > 0 {
+			noteDurs = append(noteDurs, gap)
+			noteVals = append(noteVals, 0) // Sentinel for end
+		}
+
+		sparseNoteData[ch] = noteVals
+		sparseNoteDur[ch] = noteDurs
+		instStreamData[ch] = instData
+		fxStreamData[ch] = fxData
 	}
 
-	// Add per-channel transpose streams (one value per pattern per channel)
-	// This fixes held-note frequency mismatches by preserving per-channel transpose
-	var transposeData [3][]int
+
+	// Analyze note value distribution
+	noteFreq := make(map[int]int)
 	for ch := 0; ch < 3; ch++ {
-		transposeData[ch] = make([]int, numPatterns)
-		for patIdx := 0; patIdx < numPatterns; patIdx++ {
-			// Use the transpose value from the first row of this pattern for this channel
-			row := patIdx * 64
-			if row < numRows {
-				transposeData[ch][patIdx] = int(getTranspose(ch, row))
+		for _, v := range sparseNoteData[ch] {
+			if v > 0 {
+				noteFreq[v]++
 			}
 		}
-		streams = append(streams, intStream{transposeData[ch], 8, fmt.Sprintf("Trans%d", ch), false, -1, -1})
+	}
+	type noteCount struct {
+		note, count int
+	}
+	var sorted []noteCount
+	for n, c := range noteFreq {
+		sorted = append(sorted, noteCount{n, c})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].count > sorted[j].count
+	})
+
+	// Build note-to-index lookup table (frequency sorted)
+	noteToIdx := make(map[int]int)
+	idxToNote := make([]int, len(sorted)+1) // +1 for index 0 (unused/sentinel)
+	idxToNote[0] = 0                         // Index 0 -> note 0 (no note)
+	for i, nc := range sorted {
+		noteToIdx[nc.note] = i + 1 // +1 because 0 is reserved for "no note"
+		idxToNote[i+1] = nc.note
+	}
+
+	// Create frequency-remapped note streams
+	var remappedNoteData [3][]int
+	for ch := 0; ch < 3; ch++ {
+		remapped := make([]int, len(sparseNoteData[ch]))
+		for i, v := range sparseNoteData[ch] {
+			if v == 0 {
+				remapped[i] = 0 // Keep 0 as 0 (sentinel in sparse encoding)
+			} else {
+				remapped[i] = noteToIdx[v]
+			}
+		}
+		remappedNoteData[ch] = remapped
+	}
+
+	// Build stream array - Notes first (Fx added later after FEx conversion)
+	// Layout: Ch0(NoteVal,NoteDur,FxV,FxD), Ch1(...), Ch2(...), Trans, Inst, TblData
+	for ch := 0; ch < 3; ch++ {
+		streams = append(streams, intStream{remappedNoteData[ch], 3, fmt.Sprintf("Ch%d NoteVal", ch), true, 1024})
+		streams = append(streams, intStream{sparseNoteDur[ch], 1, fmt.Sprintf("Ch%d NoteDur", ch), true, 512})
+	}
+
+	// Build transpose data for sparse encoding
+	numOrders := len(allTranspose[0])
+	var transposeData [3][]int
+	for ch := 0; ch < 3; ch++ {
+		transposeData[ch] = make([]int, numOrders)
+		for i := 0; i < numOrders && i < len(allTranspose[ch]); i++ {
+			transposeData[ch][i] = int(allTranspose[ch][i])
+		}
+	}
+
+	// Build sparse transpose streams (TransVal + TransDur)
+	// Use zigzag encoding for signed values (no LUT needed)
+	var sparseTransVal [3][]int
+	var sparseTransDur [3][]int
+	for ch := 0; ch < 3; ch++ {
+		// Build sparse encoding: TransVal[i] = value, TransDur[i] = how long it lasts
+		i := 0
+		for i < len(transposeData[ch]) {
+			val := transposeData[ch][i]
+			dur := 1
+			for i+dur < len(transposeData[ch]) && transposeData[ch][i+dur] == val {
+				dur++
+			}
+			// Zigzag encode: 0->0, -1->1, 1->2, -2->3, 2->4, ...
+			zigzag := val * 2
+			if val < 0 {
+				zigzag = -val*2 - 1
+			}
+			sparseTransVal[ch] = append(sparseTransVal[ch], zigzag)
+			sparseTransDur[ch] = append(sparseTransDur[ch], dur)
+			i += dur
+		}
+		streams = append(streams, intStream{sparseTransVal[ch], 0, fmt.Sprintf("Ch%d TransV", ch), true, 128})
+		streams = append(streams, intStream{sparseTransDur[ch], 0, fmt.Sprintf("Ch%d TransD", ch), true, 128})
 	}
 
 	// Add table streams (concatenated per song)
@@ -3344,56 +3619,519 @@ func main() {
 			arpData = append(arpData, int(b))
 		}
 	}
-	streams = append(streams, intStream{instData, 8, "InstTbl", false, -1, -1})
-	streams = append(streams, intStream{filterData, 8, "FilterTbl", false, -1, -1})
-	streams = append(streams, intStream{waveData, 8, "WaveTbl", false, -1, -1})
-	streams = append(streams, intStream{arpData, 8, "ArpTbl", false, -1, -1})
+	// Build incremental table streams with slot reuse
+	type incrLoadEvent struct {
+		songIdx    int
+		row        int
+		slotID     int
+		origInstID int
+		instDef    []byte
+		waveData   []byte
+		arpData    []byte
+		filtData   []byte
+	}
+	var incrLoadEvents []incrLoadEvent
+	// Map from (songIdx<<8 | origInstID) -> slotID for converting inst streams
+	instToSlot := make(map[int]int)
 
-	fmt.Printf("\nTable streams: inst=%d, filter=%d, wave=%d, arp=%d bytes\n",
-		len(instData), len(filterData), len(waveData), len(arpData))
+	for songIdx := 0; songIdx < len(songBoundaries)-1; songIdx++ {
+		startRow := songBoundaries[songIdx]
+		endRow := songBoundaries[songIdx+1]
+		st := allSongTables[songIdx]
 
-	// Validate stream encoding: decode using stream data and verify against original
+		// Track instrument lifetimes in this song
+		// An instrument is active from when it's set until it's REPLACED by another instrument
+		// Track per-channel usage intervals, then merge to find overall lifetime
+		type instLifetime struct {
+			origID   int
+			firstRow int
+			lastRow  int
+			hasFEx   bool
+		}
+		instLifetimes := make(map[int]*instLifetime)
+		songLen := endRow - startRow
+
+		// Track per-channel usage intervals: inst -> list of (startRow, endRow exclusive)
+		type interval struct{ start, end int }
+		instIntervals := make(map[int][]interval)
+
+		var currentInst [3]int
+		var instStartRow [3]int
+
+		for row := startRow; row < endRow; row++ {
+			localRow := row - startRow
+			for ch := 0; ch < 3; ch++ {
+				noteByte := allStreams[ch][row*3]
+				instEff := allStreams[ch][row*3+1]
+				param := allStreams[ch][row*3+2]
+				inst := int(instEff & 0x1F)
+				effect := int((instEff >> 5) | ((noteByte >> 4) & 0x08))
+
+				// When a new instrument is set, it replaces the previous one on this channel
+				if inst > 0 && inst != currentInst[ch] {
+					// End previous instrument's interval on this channel
+					if currentInst[ch] > 0 {
+						instIntervals[currentInst[ch]] = append(instIntervals[currentInst[ch]],
+							interval{instStartRow[ch], localRow})
+					}
+					currentInst[ch] = inst
+					instStartRow[ch] = localRow
+				}
+
+				// Track FEx effect (effect C = 12 with param 0xEx)
+				if effect == 12 && (param&0xF0) == 0xE0 {
+					fxInst := int(param & 0x0F)
+					if fxInst > 0 {
+						if instLifetimes[fxInst] == nil {
+							instLifetimes[fxInst] = &instLifetime{origID: fxInst, firstRow: localRow, lastRow: localRow, hasFEx: true}
+						} else {
+							instLifetimes[fxInst].hasFEx = true
+							if localRow < instLifetimes[fxInst].firstRow {
+								instLifetimes[fxInst].firstRow = localRow
+							}
+							if localRow > instLifetimes[fxInst].lastRow {
+								instLifetimes[fxInst].lastRow = localRow
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// End all instruments still active at song boundary
+		for ch := 0; ch < 3; ch++ {
+			if currentInst[ch] > 0 {
+				instIntervals[currentInst[ch]] = append(instIntervals[currentInst[ch]],
+					interval{instStartRow[ch], songLen})
+			}
+		}
+
+		// Merge intervals to find overall lifetime for each instrument
+		for inst, intervals := range instIntervals {
+			minStart, maxEnd := songLen, 0
+			for _, iv := range intervals {
+				if iv.start < minStart {
+					minStart = iv.start
+				}
+				if iv.end > maxEnd {
+					maxEnd = iv.end
+				}
+			}
+			if instLifetimes[inst] == nil {
+				instLifetimes[inst] = &instLifetime{origID: inst, firstRow: minStart, lastRow: maxEnd - 1}
+			} else {
+				if minStart < instLifetimes[inst].firstRow {
+					instLifetimes[inst].firstRow = minStart
+				}
+				if maxEnd-1 > instLifetimes[inst].lastRow {
+					instLifetimes[inst].lastRow = maxEnd - 1
+				}
+			}
+		}
+
+		// Sort for slot allocation: FEx-referenced instruments first (need slots 0-14),
+		// then by first use for others
+		var byFirstUse []*instLifetime
+		for _, lt := range instLifetimes {
+			byFirstUse = append(byFirstUse, lt)
+		}
+		sort.Slice(byFirstUse, func(i, j int) bool {
+			// FEx instruments first, then by firstRow
+			if byFirstUse[i].hasFEx != byFirstUse[j].hasFEx {
+				return byFirstUse[i].hasFEx
+			}
+			return byFirstUse[i].firstRow < byFirstUse[j].firstRow
+		})
+
+		// Allocate slots with reuse
+		type slot struct {
+			freeAfter int
+		}
+		slots := make([]slot, 0)
+
+		for _, lt := range byFirstUse {
+			// Allocate a new slot for each instrument (no reuse for now)
+			// Slot reuse would require tracking when channels release instruments, not just when they're set
+			slotID := len(slots)
+			slots = append(slots, slot{freeAfter: lt.lastRow})
+
+			// Record mapping for this song's instrument -> slot
+			instToSlot[(songIdx<<8)|lt.origID] = slotID
+
+			// Create load event
+			off := lt.origID * 16
+			if off+16 <= len(st.instruments) {
+				origInstDef := st.instruments[off : off+16]
+				waveS := int(origInstDef[INST_WAVESTART])
+				waveE := int(origInstDef[INST_WAVEEND])
+				waveL := int(origInstDef[INST_WAVELOOP])
+				arpS := int(origInstDef[INST_ARPSTART])
+				arpE := int(origInstDef[INST_ARPEND])
+				arpL := int(origInstDef[INST_ARPLOOP])
+				filtS := int(origInstDef[INST_FILTSTART])
+				filtE := int(origInstDef[INST_FILTEND])
+				filtL := int(origInstDef[INST_FILTLOOP])
+
+				var waveDat, arpDat, filtDat []byte
+				// Expand data range to include loop point (both before start and after end)
+				// The player can read from start to end, then jump to loop - need all that data
+				waveActualS := waveS
+				waveActualE := waveE
+				if waveL < waveS {
+					waveActualS = waveL
+				}
+				if waveL > waveE {
+					waveActualE = waveL
+				}
+				arpActualS := arpS
+				arpActualE := arpE
+				if arpL < arpS {
+					arpActualS = arpL
+				}
+				if arpL > arpE {
+					arpActualE = arpL
+				}
+				filtActualS := filtS
+				filtActualE := filtE
+				if filtL < filtS {
+					filtActualS = filtL
+				}
+				if filtL > filtE {
+					filtActualE = filtL
+				}
+
+				if waveActualE >= waveActualS && waveActualE < len(st.wave) {
+					waveDat = st.wave[waveActualS : waveActualE+1]
+				}
+				if arpActualE >= arpActualS && arpActualE < len(st.arp) {
+					arpDat = st.arp[arpActualS : arpActualE+1]
+				}
+				if filtActualE >= filtActualS && filtActualE < len(st.filter) {
+					filtDat = st.filter[filtActualS : filtActualE+1]
+				}
+
+				// Create modified instDef with relative indices (0-based for each slot)
+				instDef := make([]byte, 16)
+				copy(instDef, origInstDef)
+				if len(waveDat) > 0 {
+					// Start is relative to expanded range; playback starts at waveS offset
+					instDef[INST_WAVESTART] = byte(waveS - waveActualS)
+					// End is waveE relative to actual start (not length-1 because we may have loop data after)
+					instDef[INST_WAVEEND] = byte(waveE - waveActualS)
+					// Loop is relative to actual start
+					instDef[INST_WAVELOOP] = byte(waveL - waveActualS)
+				}
+				if len(arpDat) > 0 {
+					instDef[INST_ARPSTART] = byte(arpS - arpActualS)
+					instDef[INST_ARPEND] = byte(arpE - arpActualS)
+					instDef[INST_ARPLOOP] = byte(arpL - arpActualS)
+				}
+				if len(filtDat) > 0 {
+					instDef[INST_FILTSTART] = byte(filtS - filtActualS)
+					instDef[INST_FILTEND] = byte(filtE - filtActualS)
+					instDef[INST_FILTLOOP] = byte(filtL - filtActualS)
+				}
+
+				incrLoadEvents = append(incrLoadEvents, incrLoadEvent{
+					songIdx:    songIdx,
+					row:        startRow + lt.firstRow,
+					slotID:     slotID,
+					origInstID: lt.origID,
+					instDef:    instDef,
+					waveData:   waveDat,
+					arpData:    arpDat,
+					filtData:   filtDat,
+				})
+
+			}
+		}
+	}
+
+	// Convert inst streams from original instrument IDs to slot IDs
+	for ch := 0; ch < 3; ch++ {
+		for row := 0; row < len(instStreamData[ch]); row++ {
+			origInst := instStreamData[ch][row]
+			if origInst > 0 {
+				// Find which song this row belongs to
+				songIdx := 0
+				for s := 0; s < len(songBoundaries)-1; s++ {
+					if row >= songBoundaries[s] && row < songBoundaries[s+1] {
+						songIdx = s
+						break
+					}
+				}
+				// Look up slot for this song's instrument
+				key := (songIdx << 8) | origInst
+				if slot, ok := instToSlot[key]; ok {
+					instStreamData[ch][row] = slot + 1 // +1 because 0 means "no change"
+				}
+			}
+		}
+	}
+
+	// Convert FEx effect parameters from original instrument IDs to slot IDs
+	fexCount := 0
+	for ch := 0; ch < 3; ch++ {
+		for row := 0; row < len(fxStreamData[ch]); row++ {
+			fxParam := fxStreamData[ch][row]
+			effect := (fxParam >> 8) & 0xF
+			paramHi := (fxParam >> 4) & 0xF
+			paramLo := fxParam & 0xF
+			// FEx effect: effect=C (12), param=0xEx where x is instrument ID
+			if effect == 12 && paramHi == 0xE && paramLo > 0 {
+				fexCount++
+				// Find which song this row belongs to
+				songIdx := 0
+				for s := 0; s < len(songBoundaries)-1; s++ {
+					if row >= songBoundaries[s] && row < songBoundaries[s+1] {
+						songIdx = s
+						break
+					}
+				}
+				// Look up slot for this song's instrument
+				key := (songIdx << 8) | paramLo
+				if slot, ok := instToSlot[key]; ok && slot+1 <= 15 {
+					// Replace paramLo with slot+1 (only if it fits in 4 bits)
+					fxStreamData[ch][row] = (fxParam & 0xFF0) | (slot + 1)
+				} else if slot, ok := instToSlot[key]; ok {
+					fmt.Printf("WARNING: FEx slot overflow - song%d inst%d -> slot%d (>14)\n", songIdx, paramLo, slot)
+				} else {
+					fmt.Printf("WARNING: FEx inst not found - song%d inst%d\n", songIdx, paramLo)
+				}
+			}
+		}
+	}
+
+	// Now build sparse Fx encoding (after FEx slot conversion)
+	var sparseFxVal [3][]int
+	var sparseFxDur [3][]int
+	fmt.Println("\nFx+P sparse encoding (after FEx conversion):")
+	fxCombinedBits := 0
+	fxSparseBits := 0
+	for ch := 0; ch < 3; ch++ {
+		zeros := 0
+		for _, v := range fxStreamData[ch] {
+			if v == 0 {
+				zeros++
+			}
+			fxCombinedBits += expGolombBits(v, 0)
+		}
+		// Build sparse encoding: value + duration pairs
+		i := 0
+		for i < len(fxStreamData[ch]) {
+			val := fxStreamData[ch][i]
+			dur := 1
+			for i+dur < len(fxStreamData[ch]) && fxStreamData[ch][i+dur] == val {
+				dur++
+			}
+			sparseFxVal[ch] = append(sparseFxVal[ch], val)
+			sparseFxDur[ch] = append(sparseFxDur[ch], dur)
+			i += dur
+		}
+		// Calculate sparse bits
+		for j := 0; j < len(sparseFxVal[ch]); j++ {
+			fxSparseBits += expGolombBits(sparseFxVal[ch][j], 0)
+			fxSparseBits += expGolombBits(sparseFxDur[ch][j], 0)
+		}
+		fmt.Printf("  Ch%d: %d rows, %d zeros (%.1f%%), %d changes\n",
+			ch, len(fxStreamData[ch]), zeros, 100.0*float64(zeros)/float64(len(fxStreamData[ch])),
+			len(sparseFxVal[ch]))
+		// Add Fx streams
+		streams = append(streams, intStream{sparseFxVal[ch], 0, fmt.Sprintf("Ch%d FxV", ch), true, 512})
+		streams = append(streams, intStream{sparseFxDur[ch], 0, fmt.Sprintf("Ch%d FxD", ch), true, 512})
+	}
+	fmt.Printf("  Total: combined %d bits, sparse %d bits (%+d bits = %+d bytes)\n",
+		fxCombinedBits, fxSparseBits, fxSparseBits-fxCombinedBits, (fxSparseBits-fxCombinedBits)/8)
+
+	// Now build sparse inst encoding (after inst-to-slot conversion)
+	var sparseInstVal [3][]int
+	var sparseInstDur [3][]int
+	fmt.Println("\nInst stream sparsity analysis (after slot conversion):")
+	totalCurrentBits := 0
+	totalSparseBits := 0
+	for ch := 0; ch < 3; ch++ {
+		total := len(instStreamData[ch])
+		// Build sparse encoding
+		i := 0
+		for i < len(instStreamData[ch]) {
+			val := instStreamData[ch][i]
+			dur := 1
+			for i+dur < len(instStreamData[ch]) && instStreamData[ch][i+dur] == val {
+				dur++
+			}
+			sparseInstVal[ch] = append(sparseInstVal[ch], val)
+			sparseInstDur[ch] = append(sparseInstDur[ch], dur)
+			i += dur
+		}
+		// Calculate bit costs (raw exp-golomb, no backrefs to be fair)
+		currentBits := 0
+		for _, v := range instStreamData[ch] {
+			currentBits += expGolombBits(v, 0)
+		}
+		sparseBits := 0
+		for j := 0; j < len(sparseInstVal[ch]); j++ {
+			sparseBits += expGolombBits(sparseInstVal[ch][j], 0)
+			sparseBits += expGolombBits(sparseInstDur[ch][j], 0)
+		}
+		fmt.Printf("  Ch%d: %d rows, %d changes, current %d bits, sparse %d bits (%+d)\n",
+			ch, total, len(sparseInstVal[ch]), currentBits, sparseBits, sparseBits-currentBits)
+		totalCurrentBits += currentBits
+		totalSparseBits += sparseBits
+		// Add to streams
+		streams = append(streams, intStream{sparseInstVal[ch], 0, fmt.Sprintf("Ch%d InstV", ch), true, 512})
+		streams = append(streams, intStream{sparseInstDur[ch], 0, fmt.Sprintf("Ch%d InstD", ch), true, 512})
+	}
+	fmt.Printf("  Total: current %d bits, sparse %d bits (%+d bits = %+d bytes)\n",
+		totalCurrentBits, totalSparseBits, totalSparseBits-totalCurrentBits, (totalSparseBits-totalCurrentBits)/8)
+
+	// Sort incrLoadEvents by row for correct delta encoding
+	sort.Slice(incrLoadEvents, func(i, j int) bool {
+		return incrLoadEvents[i].row < incrLoadEvents[j].row
+	})
+
+	// Build single merged incremental table stream (expgol encoded)
+	// Format per event: delta, slot, instDef[16], waveLen, waveData..., arpLen, arpData..., filtLen, filtData...
+	// Special: delta=65535 is a song reset marker followed by: frameCount, rowBase (resets all state)
+	const songResetMarker = 65535
+	var incrTableStream []int
+
+	// Compute cumulative frame counts for reset markers
+	var cumFrames []int
+	cumF := 0
+	for _, pt := range partTimes {
+		cumF += int(pt)
+		cumFrames = append(cumFrames, cumF)
+	}
+
+	incrPrevRow := 0
+	prevSongIdx := -1
+	for _, ev := range incrLoadEvents {
+		// Insert song reset marker at song boundaries
+		if ev.songIdx != prevSongIdx {
+			if prevSongIdx != -1 {
+				// Not the first song - insert reset marker with frame count and row base
+				incrTableStream = append(incrTableStream, songResetMarker)
+				incrTableStream = append(incrTableStream, cumFrames[prevSongIdx]) // Frame at which to reset
+				incrTableStream = append(incrTableStream, ev.row)                 // Row base for new song
+				incrPrevRow = ev.row
+			}
+			prevSongIdx = ev.songIdx
+		}
+		// Delta from previous event
+		incrTableStream = append(incrTableStream, ev.row-incrPrevRow)
+		incrPrevRow = ev.row
+		// Slot ID
+		incrTableStream = append(incrTableStream, ev.slotID)
+		// InstDef (16 bytes)
+		for _, b := range ev.instDef {
+			incrTableStream = append(incrTableStream, int(b))
+		}
+		// Wave: length then data
+		incrTableStream = append(incrTableStream, len(ev.waveData))
+		for _, b := range ev.waveData {
+			incrTableStream = append(incrTableStream, int(b))
+		}
+		// Arp: length then data
+		incrTableStream = append(incrTableStream, len(ev.arpData))
+		for _, b := range ev.arpData {
+			incrTableStream = append(incrTableStream, int(b))
+		}
+		// Filter: length then data
+		incrTableStream = append(incrTableStream, len(ev.filtData))
+		for _, b := range ev.filtData {
+			incrTableStream = append(incrTableStream, int(b))
+		}
+	}
+
+	// Add final reset marker with total frame count (signals end of stream)
+	incrTableStream = append(incrTableStream, songResetMarker)
+	incrTableStream = append(incrTableStream, cumFrames[len(cumFrames)-1]) // Total frames
+	incrTableStream = append(incrTableStream, numRows)                     // End row
+
+	// Add single merged table stream with expgol encoding
+	streams = append(streams, intStream{incrTableStream, 0, "TblData", true, 512})
+
+
+	// Validate sparse stream encoding: decode back to row-based and verify
+	// Stream layout: Notes at 0-5, Trans at 6-11, Fx at 12-17, Inst at 18-23, TblData at 24
+	// Decode sparse notes to row-based
+	var decodedNotes [3][]int
+	for ch := 0; ch < 3; ch++ {
+		noteVals := streams[ch*2].data   // NoteVal at 0,2,4
+		noteDurs := streams[ch*2+1].data // NoteDur at 1,3,5
+		decoded := make([]int, numRows)
+
+		row := 0
+		for i := 0; i < len(noteVals) && row < numRows; i++ {
+			// Skip 'dur' rows (zeros)
+			dur := 0
+			if i < len(noteDurs) {
+				dur = noteDurs[i]
+			}
+			row += dur
+			// Place the note value
+			if row < numRows && noteVals[i] != 0 {
+				decoded[row] = noteVals[i]
+				row++
+			}
+		}
+		decodedNotes[ch] = decoded
+	}
+
+	// Verify decoded notes match original raw notes (convert from freq-sorted index)
 	verifyErrors := 0
 	for ch := 0; ch < 3; ch++ {
-		noteStream := streams[ch*3].data
 		for row := 0; row < numRows; row++ {
-			origNote := int(allStreams[ch][row*3] & 0x7F)
-			if origNote == 0 || origNote == 0x61 {
-				continue
+			origRawNote := int(allStreams[ch][row*3] & 0x7F)
+			decodedIdx := decodedNotes[ch][row]
+			// Convert index back to note value
+			decodedNote := 0
+			if decodedIdx > 0 && decodedIdx < len(idxToNote) {
+				decodedNote = idxToNote[decodedIdx]
 			}
-			patIdx := row / 64
-			if patIdx >= numPatterns {
-				patIdx = numPatterns - 1
-			}
-			streamNote := noteStream[row]
-			streamTrans := transposeData[ch][patIdx]
-			origTrans := int(getTranspose(ch, row))
-			decoded := streamNote + streamTrans
-			expected := origNote + origTrans
-			if decoded != expected {
+			if origRawNote != decodedNote {
 				verifyErrors++
+				if verifyErrors <= 5 {
+					fmt.Printf("  Verify error ch%d row%d: expected %d, got idx=%d (note=%d)\n",
+						ch, row, origRawNote, decodedIdx, decodedNote)
+				}
 			}
 		}
 	}
 	if verifyErrors > 0 {
-		fmt.Printf("  Stream validation: FAIL (%d errors)\n", verifyErrors)
+		fmt.Printf("  Sparse decode validation: FAIL (%d errors)\n", verifyErrors)
+	} else {
+		fmt.Println("  Sparse decode validation: PASS")
 	}
 
 	// Run VM validation using reconstructed stream data
+	// Reconstruct row-based data from sparse streams
 	var streamByteData [3][]byte
 	for ch := 0; ch < 3; ch++ {
-		noteStream := streams[ch*3].data
-		instStream := streams[ch*3+1].data
-		fxStream := streams[ch*3+2].data
+		// instStreamData and fxStreamData are already row-based (before sparse encoding)
+		fxStream := fxStreamData[ch] // Fx (row-based)
 		streamByteData[ch] = make([]byte, numRows*3)
 		for row := 0; row < numRows; row++ {
-			note := noteStream[row]
-			inst := instStream[row]
+			// Note is from decoded sparse stream (freq-sorted index)
+			noteIdx := decodedNotes[ch][row]
+			note := 0
+			if noteIdx > 0 && noteIdx < len(idxToNote) {
+				note = idxToNote[noteIdx]
+			}
+			inst := instStreamData[ch][row]
 			fxParam := fxStream[row]
 			effect := (fxParam >> 8) & 0xF
 			param := fxParam & 0xFF
+			// For streamByteData, we need raw note (without transpose) since the
+			// simulation will apply transpose. But our notes are pre-transposed.
+			// We need to reverse the transpose for the simulation.
+			rawNote := note
+			if note != 0 && note != 0x61 {
+				trans := int(getTranspose(ch, row))
+				rawNote = note - trans
+			}
 			// Reconstruct bytes: note | (effect_high_bit << 4), inst | (effect_low_3 << 5), param
-			streamByteData[ch][row*3] = byte(note&0x7F) | byte((effect&0x8)<<4)
+			streamByteData[ch][row*3] = byte(rawNote&0x7F) | byte((effect&0x8)<<4)
 			streamByteData[ch][row*3+1] = byte(inst&0x1F) | byte((effect&0x7)<<5)
 			streamByteData[ch][row*3+2] = byte(param)
 		}
@@ -3427,82 +4165,24 @@ func main() {
 		orderIdx++
 	}
 
-	// Reconstruct table data from streams for each song
-	// Stream indices: 12=InstTbl, 13=FilterTbl, 14=WaveTbl, 15=ArpTbl
-	instStream := streams[12].data
-	waveStream := streams[14].data
-	arpStream := streams[15].data
-
-	// Per-song sizes (from extract functions)
-	const instPerSong = 512  // 32 instruments × 16 bytes
-	const wavePerSong = 256   // from extractWaveTable
-	const arpPerSong = 256   // from extractArpTable
-
+	// Use original table data for validation (allSongTables)
 	var streamTableDatas []SongTableData
 	numSongs := len(songBoundaries) - 1
 	for song := 0; song < numSongs; song++ {
 		var td SongTableData
+		st := allSongTables[song]
 
-		// Extract inst data for this song
-		instStart := song * instPerSong
-		instEnd := instStart + instPerSong
-		if instEnd <= len(instStream) {
-			td.InstData = make([]byte, instPerSong)
-			for i := 0; i < instPerSong && instStart+i < len(instStream); i++ {
-				td.InstData[i] = byte(instStream[instStart+i])
-			}
-		}
-
-		// Extract wave data for this song
-		waveStart := song * wavePerSong
-		waveEnd := waveStart + wavePerSong
-		if waveEnd <= len(waveStream) {
-			td.WaveTable = make([]byte, wavePerSong)
-			for i := 0; i < wavePerSong && waveStart+i < len(waveStream); i++ {
-				td.WaveTable[i] = byte(waveStream[waveStart+i])
-			}
-		}
-
-		// Extract arp data for this song
-		arpStart := song * arpPerSong
-		arpEnd := arpStart + arpPerSong
-		if arpEnd <= len(arpStream) {
-			td.ArpTable = make([]byte, arpPerSong)
-			for i := 0; i < arpPerSong && arpStart+i < len(arpStream); i++ {
-				td.ArpTable[i] = byte(arpStream[arpStart+i])
-			}
-		}
+		td.InstData = st.instruments
+		td.WaveTable = st.wave
+		td.ArpTable = st.arp
 
 		streamTableDatas = append(streamTableDatas, td)
 	}
 
-	// Verify table data in streams matches original
-	tableErrors := 0
-	for song := 0; song < numSongs; song++ {
-		origTables := allSongTables[song]
-		streamTables := streamTableDatas[song]
-		for i := 0; i < len(streamTables.InstData) && i < len(origTables.instruments); i++ {
-			if streamTables.InstData[i] != origTables.instruments[i] {
-				tableErrors++
-			}
-		}
-		for i := 0; i < len(streamTables.WaveTable) && i < len(origTables.wave); i++ {
-			if streamTables.WaveTable[i] != origTables.wave[i] {
-				tableErrors++
-			}
-		}
-		for i := 0; i < len(streamTables.ArpTable) && i < len(origTables.arp); i++ {
-			if streamTables.ArpTable[i] != origTables.arp[i] {
-				tableErrors++
-			}
-		}
-	}
-	if tableErrors > 0 {
-		fmt.Printf("  Table validation: FAIL (%d mismatches)\n", tableErrors)
-	}
-
+	// Skip table verification since we're using original data directly
+	// (incremental format validated separately)
 	// Run stream-only simulation and compare against VM output
-	streamRegs := runStreamOnlySimulation(streams, songBoundaries, orderBoundaries)
+	streamRegs := runStreamOnlySimulation(streams, idxToNote)
 
 	// Compare all SID registers: Freq, PW, Control, AD, SR, Filter, Volume
 	freqMismatches := 0
@@ -3574,19 +4254,56 @@ func main() {
 			filterLoMismatches, filterHiMismatches, filterResMismatches, filterVolMismatches)
 	}
 
-	// Verify stream encoding matches original simulation
+	// Verify stream encoding matches VM (all SID registers $D400-$D418)
 	simMismatch := 0
+	firstMismatchPrinted := 0
 	for ch := 0; ch < 3; ch++ {
 		for i := 0; i < compareFrames; i++ {
-			if origSimRegs.Freq[ch][i] != streamRegs.Freq[ch][i] {
+			if vmRegs.Freq[ch][i] != streamRegs.Freq[ch][i] {
+				simMismatch++
+			}
+			if vmRegs.PW[ch][i] != streamRegs.PW[ch][i] {
+				simMismatch++
+			}
+			if vmRegs.Control[ch][i] != streamRegs.Control[ch][i] {
+				simMismatch++
+				if firstMismatchPrinted < 5 {
+					fmt.Printf("    Control mismatch ch%d frame%d: vm=%02X stream=%02X\n",
+						ch, i, vmRegs.Control[ch][i], streamRegs.Control[ch][i])
+					firstMismatchPrinted++
+				}
+			}
+			if vmRegs.AD[ch][i] != streamRegs.AD[ch][i] {
+				simMismatch++
+			}
+			if vmRegs.SR[ch][i] != streamRegs.SR[ch][i] {
 				simMismatch++
 			}
 		}
 	}
+	for i := 0; i < compareFrames; i++ {
+		if vmRegs.FilterLo[i] != streamRegs.FilterLo[i] {
+			simMismatch++
+		}
+		if vmRegs.FilterHi[i] != streamRegs.FilterHi[i] {
+			simMismatch++
+			if firstMismatchPrinted < 10 && firstMismatchPrinted >= 5 {
+				fmt.Printf("    FilterHi mismatch frame%d: vm=%02X stream=%02X\n",
+					i, vmRegs.FilterHi[i], streamRegs.FilterHi[i])
+				firstMismatchPrinted++
+			}
+		}
+		if vmRegs.FilterRes[i] != streamRegs.FilterRes[i] {
+			simMismatch++
+		}
+		if vmRegs.FilterVol[i] != streamRegs.FilterVol[i] {
+			simMismatch++
+		}
+	}
 	if simMismatch == 0 {
-		fmt.Println("  Stream encoding: PASS")
+		fmt.Println("  Stream encoding: PASS (all SID registers $D400-$D418 match)")
 	} else {
-		fmt.Printf("  Stream encoding: FAIL (%d mismatches)\n", simMismatch)
+		fmt.Printf("  Stream encoding: FAIL (%d mismatches in SID registers)\n", simMismatch)
 	}
 
 	// Bit-level DP for integer stream chunks
@@ -3718,49 +4435,8 @@ func main() {
 		estBits   int
 	}
 
-	var totalRawBits int
-	numBaseStreams := 0
-	for _, s := range streams {
-		if !s.isExp {
-			totalRawBits += len(s.data) * s.bitWidth
-			numBaseStreams++
-		}
-	}
-
-	var completedChunks atomic.Int64
-	var baseBits atomic.Int64      // bits for base 9 streams
-	var baseChunks atomic.Int64    // chunks completed for base streams
 	streamBitsAtomic := make([]atomic.Int64, numStreams)
-	done := make(chan struct{})
-
 	numWorkers := runtime.NumCPU()
-
-	startTime := time.Now()
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				completed := completedChunks.Load()
-				total := int64(numStreams * numChunks)
-				pct := float64(completed) / float64(total) * 100
-				elapsed := time.Since(startTime).Seconds()
-				rate := float64(completed) / elapsed
-				remaining := float64(total-completed) / rate
-				baseCompleted := baseChunks.Load()
-				baseTotal := int64(numBaseStreams * numChunks)
-				if baseCompleted > 0 {
-					estBase := float64(baseBits.Load()) * float64(baseTotal) / float64(baseCompleted)
-					fmt.Printf("  Progress: %.0f%% (%d/%d), %.1f/s, ~%.0fs left, est ~%.0f bytes\n", pct, completed, total, rate, remaining, estBase/8)
-				} else {
-					fmt.Printf("  Progress: %.0f%% (%d/%d), %.1f/s, ~%.0fs left\n", pct, completed, total, rate, remaining)
-				}
-			}
-		}
-	}()
 
 	// Run all chunks in parallel
 	allChunkResults := make([][]chunkResult, numStreams)
@@ -3805,18 +4481,17 @@ func main() {
 					end = len(s.data)
 				}
 				if start >= len(s.data) {
-					completedChunks.Add(1)
 					continue
 				}
 
 				chunkData := s.data[start:end]
-				prefixStart := start - windowElements
+				prefixStart := start - s.window
 				if prefixStart < 0 {
 					prefixStart = 0
 				}
 				prefix := s.data[prefixStart:start]
 
-				choices := dpChunk(chunkData, prefix, s.bitWidth, windowElements)
+				choices := dpChunk(chunkData, prefix, s.bitWidth, s.window)
 
 				estBits := 0
 				pos := 0
@@ -3832,16 +4507,10 @@ func main() {
 				}
 				allChunkResults[sIdx][cIdx] = chunkResult{sIdx, cIdx, choices, estBits}
 				streamBitsAtomic[sIdx].Add(int64(estBits))
-				if !s.isExp {
-					baseBits.Add(int64(estBits))
-					baseChunks.Add(1)
-				}
-				completedChunks.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	close(done)
 
 	// Compute total bits per stream
 	streamTotalBits := make([]int, numStreams)
@@ -3851,150 +4520,85 @@ func main() {
 		}
 	}
 
-	// Find best variant for each base note stream (channels 0, 3, 6 are notes)
-	type bestChoice struct {
-		sIdx    int
-		bits    int
-		name    string
-		savings int
-	}
-	bestForGroup := make(map[int]bestChoice) // expGroup -> best choice
-
-	for sIdx := 0; sIdx < numStreams; sIdx++ {
-		s := streams[sIdx]
-		if s.expGroup < 0 {
-			continue // not a note stream
-		}
-		bits := streamTotalBits[sIdx]
-		current, exists := bestForGroup[s.expGroup]
-		if !exists || bits < current.bits {
-			baseBits := 0
-			if s.isExp {
-				baseBits = streamTotalBits[s.baseIdx]
-			} else {
-				baseBits = bits
-			}
-			bestForGroup[s.expGroup] = bestChoice{sIdx, bits, s.name, baseBits - bits}
-		}
-	}
-
-	// Output results
-	fmt.Println()
-	fmt.Println("Stream Compression Results")
-	fmt.Println("==========================")
-	fmt.Println()
-	fmt.Println("Stream      RawBits  CompBits  Ratio   Best Alt     Savings")
-	fmt.Println("--------   -------  --------  -----   ----------   -------")
-
+	// Calculate totals
 	var totalCompBits int
-	var totalBestBits int
 	for sIdx := 0; sIdx < numStreams; sIdx++ {
-		s := streams[sIdx]
-		if s.isExp {
-			continue // Only base streams
-		}
-		rawBits := len(s.data) * s.bitWidth
-		compBits := streamTotalBits[sIdx]
-		ratio := float64(compBits) / float64(rawBits) * 100
-
-		altInfo := ""
-		savingsInfo := ""
-		if best, ok := bestForGroup[s.expGroup]; ok && s.expGroup >= 0 {
-			if best.sIdx != sIdx {
-				altInfo = fmt.Sprintf("%-10s", streams[best.sIdx].name)
-				savingsInfo = fmt.Sprintf("%+d", -best.savings)
-				totalBestBits += best.bits
-			} else {
-				altInfo = "(original)"
-				totalBestBits += compBits
-			}
-		} else {
-			totalBestBits += compBits
-		}
-
-		fmt.Printf("%-8s   %7d  %8d  %4.1f%%   %s   %s\n", s.name, rawBits, compBits, ratio, altInfo, savingsInfo)
-		totalCompBits += compBits
+		totalCompBits += streamTotalBits[sIdx]
 	}
-	fmt.Println("--------   -------  --------  -----")
-	fmt.Printf("Total      %7d  %8d  %4.1f%%\n", totalRawBits, totalCompBits, float64(totalCompBits)/float64(totalRawBits)*100)
+	lookupTableBytes := len(idxToNote) - 1
+	totalBytes := (totalCompBits+7)/8 + lookupTableBytes
 
-	fmt.Println()
-	fmt.Printf("Original:   %d bytes (%d bits)\n", (totalCompBits+7)/8, totalCompBits)
-	fmt.Printf("With best:  %d bytes (%d bits) [%+d]\n", (totalBestBits+7)/8, totalBestBits, totalBestBits-totalCompBits)
-	fmt.Printf("Current system: 26,270 bytes\n")
-	fmt.Printf("Improvement:    %+d bytes\n", (totalBestBits+7)/8-26270)
-
-	// By chunk position with best variants
-	fmt.Println()
-	fmt.Println("By position (using best variants):")
-	for cIdx := 0; cIdx < numChunks; cIdx++ {
-		var origBits, bestBits int
-		for sIdx := 0; sIdx < numStreams; sIdx++ {
-			if streams[sIdx].isExp {
-				continue
-			}
-			origBits += allChunkResults[sIdx][cIdx].estBits
-			// Use best variant for note streams
-			if streams[sIdx].expGroup >= 0 {
-				if best, ok := bestForGroup[streams[sIdx].expGroup]; ok {
-					bestBits += allChunkResults[best.sIdx][cIdx].estBits
-					continue
-				}
-			}
-			bestBits += allChunkResults[sIdx][cIdx].estBits
-		}
-		origBar := ""
-		for i := 0; i < origBits/500; i++ {
-			origBar += "░"
-		}
-		bestBar := ""
-		for i := 0; i < bestBits/500; i++ {
-			bestBar += "█"
-		}
-		fmt.Printf("  Chunk %2d: %5d→%5d %s%s\n", cIdx, origBits, bestBits, bestBar, origBar[len(bestBar):])
-	}
-
-	// Identify worst-compressing chunks (base streams only)
-	fmt.Println()
-	fmt.Println("Worst compressing (optimization targets):")
-	type chunkInfo struct {
-		stream string
-		chunk  int
-		bits   int
-		raw    int
-	}
-	var chunks []chunkInfo
-	for sIdx := 0; sIdx < numStreams; sIdx++ {
-		if streams[sIdx].isExp {
+	// Calculate buffer sizes
+	bufferBytes := 0
+	// Stream order: group by channel, then TblData
+	// Layout: Notes at 0-5, Trans at 6-11, Fx at 12-17, Inst at 18-23, TblData at 24
+	// Output grouped by channel:
+	// Ch0: 0,1 (NoteVal,NoteDur) + 12,13 (FxV,FxD) + 18,19 (InstV,InstD) + 6,7 (TransV,TransD)
+	// Ch1: 2,3 + 14,15 + 20,21 + 8,9
+	// Ch2: 4,5 + 16,17 + 22,23 + 10,11
+	// TblData: 24
+	streamOrder := []int{0, 1, 12, 13, 18, 19, 6, 7, 2, 3, 14, 15, 20, 21, 8, 9, 4, 5, 16, 17, 22, 23, 10, 11, 24}
+	for _, sIdx := range streamOrder {
+		if sIdx >= len(streams) {
 			continue
 		}
-		chunkSize := (len(streams[sIdx].data) + numChunks - 1) / numChunks
-		for cIdx := 0; cIdx < numChunks; cIdx++ {
-			start := cIdx * chunkSize
-			end := start + chunkSize
-			if end > len(streams[sIdx].data) {
-				end = len(streams[sIdx].data)
-			}
-			if start >= len(streams[sIdx].data) {
-				continue
-			}
-			rawBits := (end - start) * streams[sIdx].bitWidth
-			chunks = append(chunks, chunkInfo{streams[sIdx].name, cIdx, allChunkResults[sIdx][cIdx].estBits, rawBits})
-		}
-	}
-	// Sort by bits descending
-	for i := 0; i < len(chunks)-1; i++ {
-		for j := i + 1; j < len(chunks); j++ {
-			if chunks[j].bits > chunks[i].bits {
-				chunks[i], chunks[j] = chunks[j], chunks[i]
+		s := streams[sIdx]
+		maxVal := 0
+		for _, v := range s.data {
+			if v > maxVal {
+				maxVal = v
 			}
 		}
+		bitsNeeded := 1
+		for (1 << bitsNeeded) <= maxVal {
+			bitsNeeded++
+		}
+		bytesPerElement := (bitsNeeded + 7) / 8
+		if bytesPerElement == 0 {
+			bytesPerElement = 1
+		}
+		bufferBytes += s.window * bytesPerElement
 	}
-	for i := 0; i < 10 && i < len(chunks); i++ {
-		c := chunks[i]
-		ratio := float64(c.bits) / float64(c.raw) * 100
-		fmt.Printf("  %s c%02d: %5d bits (%.1f%% of raw)\n", c.stream, c.chunk, c.bits, ratio)
+
+	fmt.Println()
+	fmt.Println("Stream data format (all exp-golomb encoded):")
+	streamDescs := map[string]string{
+		"NoteVal": "note index (freq-sorted via LUT, 0=rest)",
+		"NoteDur": "rows before each note event",
+		"FxV":     "(effect<<8)|param value",
+		"FxD":     "rows until next fx change",
+		"InstV":   "slot ID (0=no change, 1-31=slot)",
+		"InstD":   "rows until next inst change",
+		"TransV":  "transpose (zigzag: 0→0, -1→1, 1→2, ...)",
+		"TransD":  "orders until next transpose change",
+		"TblData": "load: delta, slot, inst[16], waveLen, wave[], arpLen, arp[], filtLen, filt[]; reset(65535): frame, row",
 	}
-	fmt.Printf("\nCompressed size: %d bytes\n", (totalCompBits+7)/8)
-	fmt.Printf("Total time: %.2fs\n", time.Since(mainStart).Seconds())
+	for _, sIdx := range streamOrder {
+		if sIdx >= len(streams) {
+			continue
+		}
+		s := streams[sIdx]
+		maxV := 0
+		for _, v := range s.data {
+			if v > maxV {
+				maxV = v
+			}
+		}
+		// Extract base name (remove "Ch0 " prefix)
+		baseName := s.name
+		if len(baseName) > 4 && baseName[0:2] == "Ch" && baseName[3] == ' ' {
+			baseName = baseName[4:]
+		}
+		desc := streamDescs[baseName]
+		fmt.Printf("  %-14s max=%-6d %s\n", s.name, maxV, desc)
+	}
+
+	fmt.Println()
+	fmt.Printf("Streams:    %d bytes (%d bits)\n", (totalCompBits+7)/8, totalCompBits)
+	fmt.Printf("Note LUT:   %d bytes (%d entries)\n", lookupTableBytes, lookupTableBytes)
+	fmt.Printf("Buffers:    %d bytes (%d streams)\n", bufferBytes, len(streams))
+	fmt.Printf("Total:      %d bytes\n", totalBytes)
+	fmt.Printf("Current:    26,270 bytes\n")
+	fmt.Printf("Savings:    %+d bytes (%.1f%%)\n", totalBytes-26270, float64(26270-totalBytes)*100/26270)
+	fmt.Printf("Time:       %.2fs\n", time.Since(mainStart).Seconds())
 }

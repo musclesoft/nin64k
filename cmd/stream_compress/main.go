@@ -1539,24 +1539,16 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 				case 8: // Filter resonance (old effect E -> new 8)
 					filterResonance = unmapParam(s.param, resoUnmap)
 				case 3: // Extended Fxx (old effect F -> new 3)
+					// High nibbles frequency-sorted: $8=hardrestart, $9=filttrig, $A=globalvol, $B=filtmode, $C=fineslide
 					if speedCounter == 0 && s.param >= 0x80 {
 						highNibble := s.param & 0xF0
 						lowNibble := s.param & 0x0F
 						if highNibble == 0x80 {
-							// F8x: Set global volume
-							globalVolume = byte(lowNibble)
+							// $8x: Set hard restart offset (old $Fx)
+							s.hardRestart = int(lowNibble)
 						}
-						if highNibble == 0x90 {
-							// F9x: Set filter mode (lowNibble << 4)
-							filterMode = byte(lowNibble << 4)
-						}
-						if highNibble == 0xB0 {
-							// FBx: Slide - add lowNibble*4 to slideDelta, enable slide
-							s.slideDelta += int16(lowNibble) * 4
-							s.slideEnable = true
-						}
-						if highNibble == 0xE0 && lowNibble != 0 {
-							// FEx: Load filter settings from instrument x
+						if highNibble == 0x90 && lowNibble != 0 {
+							// $9x: Load filter settings from instrument x (old $Ex)
 							inst := int(lowNibble)
 							if inst > 0 && inst*INST_SIZE+INST_FILTLOOP < len(sd.instData) {
 								filterIdx = int(sd.instData[inst*INST_SIZE+INST_FILTSTART])
@@ -1564,9 +1556,18 @@ func runSideBySideValidation(streams [3][]byte, transpose [3][]int8, songBoundar
 								filterLoop = int(sd.instData[inst*INST_SIZE+INST_FILTLOOP])
 							}
 						}
-						if highNibble == 0xF0 {
-							// FFx: Set hard restart offset
-							s.hardRestart = int(lowNibble)
+						if highNibble == 0xA0 {
+							// $Ax: Set global volume (old $8x)
+							globalVolume = byte(lowNibble)
+						}
+						if highNibble == 0xB0 {
+							// $Bx: Set filter mode (old $9x)
+							filterMode = byte(lowNibble << 4)
+						}
+						if highNibble == 0xC0 {
+							// $Cx: Fine slide (old $Bx) - add lowNibble*4 to slideDelta, enable slide
+							s.slideDelta += int16(lowNibble) * 4
+							s.slideEnable = true
 						}
 					}
 				}
@@ -2444,24 +2445,16 @@ func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters 
 				case 8: // Filter resonance (old effect E -> new 8)
 					filterResonance = unmapParam(s.param, resoUnmap)
 				case 3: // Extended Fxx (old effect F -> new 3)
+					// High nibbles frequency-sorted: $8=hardrestart, $9=filttrig, $A=globalvol, $B=filtmode, $C=fineslide
 					if speedCounter == 0 && s.param >= 0x80 {
 						highNibble := int(s.param & 0xF0)
 						lowNibble := int(s.param & 0x0F)
 						if highNibble == 0x80 {
-							// F8x: Set global volume
-							globalVolume = byte(lowNibble)
+							// $8x: Set hard restart offset (old $Fx)
+							s.hardRestart = lowNibble
 						}
-						if highNibble == 0x90 {
-							// F9x: Set filter mode
-							filterMode = byte(lowNibble << 4)
-						}
-						if highNibble == 0xB0 {
-							// FBx: Slide - add lowNibble*4 to slideDelta, enable slide
-							s.slideDelta += int16(lowNibble) * 4
-							s.slideEnable = true
-						}
-						if highNibble == 0xE0 && lowNibble != 0 {
-							// FEx: Load filter settings from slot x (lowNibble is slot+1)
+						if highNibble == 0x90 && lowNibble != 0 {
+							// $9x: Load filter settings from slot x (old $Ex)
 							instSlot := int(lowNibble) - 1
 							if instSlot >= 0 && instSlot < len(slots) && len(slots[instSlot].instDef) > INST_FILTLOOP {
 								filterActive = true
@@ -2471,9 +2464,18 @@ func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters 
 								filterLoop = int(slots[instSlot].instDef[INST_FILTLOOP])
 							}
 						}
-						if highNibble == 0xF0 {
-							// FFx: Set hard restart offset
-							s.hardRestart = lowNibble
+						if highNibble == 0xA0 {
+							// $Ax: Set global volume (old $8x)
+							globalVolume = byte(lowNibble)
+						}
+						if highNibble == 0xB0 {
+							// $Bx: Set filter mode (old $9x)
+							filterMode = byte(lowNibble << 4)
+						}
+						if highNibble == 0xC0 {
+							// $Cx: Fine slide (old $Bx) - add lowNibble*4 to slideDelta, enable slide
+							s.slideDelta += int16(lowNibble) * 4
+							s.slideEnable = true
 						}
 					}
 				}
@@ -3708,8 +3710,8 @@ func main() {
 					instStartRow[ch] = localRow
 				}
 
-				// Track FEx effect (effect C = 12 with param 0xEx)
-				if effect == 3 && (param&0xF0) == 0xE0 { // Effect 3 = Fxx, FEx sub-effect
+				// Track filter trigger effect (effect 3 = Fxx, $9x sub-effect = old FEx)
+				if effect == 3 && (param&0xF0) == 0x90 { // Effect 3 = Fxx, $9x = filter trigger
 					fxInst := int(param & 0x0F)
 					if fxInst > 0 {
 						if instLifetimes[fxInst] == nil {
@@ -3907,8 +3909,8 @@ func main() {
 			effect := (fxParam >> 8) & 0xF
 			paramHi := (fxParam >> 4) & 0xF
 			paramLo := fxParam & 0xF
-			// FEx effect: effect=C (12), param=0xEx where x is instrument ID
-			if effect == 3 && paramHi == 0xE && paramLo > 0 { // Effect 3 = Fxx, FEx
+			// Filter trigger effect: effect=3 (Fxx), param=$9x where x is instrument ID (old FEx)
+			if effect == 3 && paramHi == 0x9 && paramLo > 0 { // Effect 3 = Fxx, $9x = filter trigger
 				fexCount++
 				// Find which song this row belongs to
 				songIdx := 0

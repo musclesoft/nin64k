@@ -1345,6 +1345,29 @@ func remapPatternEffects(pattern []byte, remap [16]byte) {
 				pattern[off+2] = v
 			}
 		}
+		// Old effect F (extended): remap high nibbles by frequency
+		// Old -> New: $Fx->$8x, $Ex->$9x, $8x->$Ax, $9x->$Bx, $Bx->$Cx
+		// Speed values ($00-$7F) stay unchanged
+		if oldEffect == 0xF && byte2 >= 0x80 {
+			hiNib := byte2 & 0xF0
+			loNib := byte2 & 0x0F
+			var newHiNib byte
+			switch hiNib {
+			case 0xF0:
+				newHiNib = 0x80 // hard restart (most frequent)
+			case 0xE0:
+				newHiNib = 0x90 // filter trigger
+			case 0x80:
+				newHiNib = 0xA0 // global volume
+			case 0x90:
+				newHiNib = 0xB0 // filter mode
+			case 0xB0:
+				newHiNib = 0xC0 // fine slide
+			default:
+				newHiNib = hiNib // keep unchanged (shouldn't happen)
+			}
+			pattern[off+2] = newHiNib | loNib
+		}
 	}
 }
 
@@ -2930,6 +2953,38 @@ func main() {
 			}
 			fmt.Println()
 		}
+	}
+
+	// Analyze Fxx sub-effect high nibbles for remapping
+	if len(allEffectParams[0xF]) > 0 {
+		highNibbleCounts := make(map[int]int)
+		for param, count := range allEffectParams[0xF] {
+			if param < 0x80 {
+				highNibbleCounts[0] += count // speed values (0-7F combined as "0")
+			} else {
+				highNibbleCounts[param>>4] += count
+			}
+		}
+		type hnc struct {
+			nibble int
+			count  int
+		}
+		var hncs []hnc
+		for n, c := range highNibbleCounts {
+			hncs = append(hncs, hnc{n, c})
+		}
+		sort.Slice(hncs, func(i, j int) bool {
+			return hncs[i].count > hncs[j].count
+		})
+		fmt.Printf("Fxx high nibble frequency:")
+		for _, h := range hncs {
+			if h.nibble == 0 {
+				fmt.Printf(" speed(%d)", h.count)
+			} else {
+				fmt.Printf(" $%X(%d)", h.nibble, h.count)
+			}
+		}
+		fmt.Println()
 	}
 	fmt.Println()
 

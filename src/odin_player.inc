@@ -889,6 +889,13 @@ effect0e:
         sta     filter_resonance
         rts
 
+; Fxx sub-effects (frequency-sorted high nibbles):
+; $0x-$7x: speed (1265 uses)
+; $8x: hard restart (old $Fx, 927 uses)
+; $9x: filter trigger (old $Ex, 722 uses)
+; $Ax: global volume (old $8x, 66 uses)
+; $Bx: filter mode (old $9x, 40 uses)
+; $Cx: fine slide (old $Bx, 16 uses)
 effect0f:
         lda     speedcounter
         bne     @done
@@ -899,32 +906,16 @@ effect0f:
         lda     chn_effectpar,x
         and     #$0f
         cpy     #$80
-        beq     @f8x
+        beq     @f8x_hardrestart
         cpy     #$90
-        beq     @f9x
+        beq     @f9x_filttrig
+        cpy     #$a0
+        beq     @fax_globalvol
         cpy     #$b0
-        beq     @fbx
-        cpy     #$e0
-        beq     @fex
-        cpy     #$f0
+        beq     @fbx_filtmode
+        cpy     #$c0
         bne     @done
-        sta     chn_hardrestart,x
-@done:
-        rts
-@speed:
-        sta     speed
-        rts
-@f8x:
-        sta     globalvolume
-        rts
-@f9x:
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     filter_mode
-        rts
-@fbx:
+@fcx_fineslide:
         asl     a
         asl     a
         adc     chn_slidedelta_lo,x
@@ -935,9 +926,26 @@ effect0f:
         lda     #$80
         sta     chn_slideenable,x
         rts
-@fex:
+@f8x_hardrestart:
+        sta     chn_hardrestart,x
+@done:
+        rts
+@speed:
+        sta     speed
+        rts
+@fax_globalvol:
+        sta     globalvolume
+        rts
+@fbx_filtmode:
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     filter_mode
+        rts
+@f9x_filttrig:
         cmp     #0              ; Set Z flag from A (inst number)
-        beq     @done           ; FE0 = no filter trigger
+        beq     @done           ; F90 = no filter trigger
         ; Setup zp_ptr = song_base + inst*16 (interleaved layout)
         asl
         asl

@@ -1845,25 +1845,27 @@ func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters 
 	// Extract data from streams - SPARSE LAYOUT WITH TRANSPOSE:
 	// Stream layout:
 	// streams[0-5]: Ch0-2 NoteVal, NoteDur (2 per channel = 6)
+	//   NoteVal: combined (note<<5)|inst - inst stored with notes
 	// streams[6-11]: Ch0-2 TransV, TransD (2 per channel = 6)
 	// streams[12-17]: Ch0-2 FxV, FxD (2 per channel = 6)
-	// streams[18-23]: Ch0-2 InstV, InstD (2 per channel = 6)
-	//   InstV: slot index (0-30), InstD: delta since last trigger
-	// streams[24]: TblData
+	//   FxV: non-zero effects only, FxD: interleaved [gap, dur, ...]
+	// streams[18]: TblData
 
-	// Get numRows by summing FxD durations (Fx is now sparse)
-	// FxD for Ch0 is at index 13 (12 + ch*2 + 1 where ch=0)
+	// Get numRows by summing FxD (interleaved gap+dur sums to total rows)
 	numRows := 0
-	for _, dur := range streams[13].data { // Ch0 FxD
-		numRows += dur
+	for _, d := range streams[13].data { // Ch0 FxD (gap+dur interleaved)
+		numRows += d
 	}
 
-	// Decode sparse notes to row-based format
+	// Decode sparse notes+inst to row-based format
+	// NoteVal now contains combined (note<<5)|inst
 	var decodedNotes [3][]int
+	var decodedInstFromNote [3][]int // Inst extracted from combined value
 	for ch := 0; ch < 3; ch++ {
-		noteVals := streams[ch*2].data   // NoteVal at 0,2,4
+		noteVals := streams[ch*2].data   // NoteVal at 0,2,4 (combined note+inst)
 		noteDurs := streams[ch*2+1].data // NoteDur at 1,3,5
-		decoded := make([]int, numRows)
+		decodedN := make([]int, numRows)
+		decodedI := make([]int, numRows) // Default to 0
 
 		row := 0
 		for i := 0; i < len(noteVals) && row < numRows; i++ {
@@ -1873,59 +1875,42 @@ func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters 
 			}
 			row += dur
 			if row < numRows && noteVals[i] != 0 {
-				decoded[row] = noteVals[i]
+				combined := noteVals[i]
+				note := combined >> 5
+				inst := combined & 0x1F
+				decodedN[row] = note
+				decodedI[row] = inst
 				row++
 			}
 		}
-		decodedNotes[ch] = decoded
+		decodedNotes[ch] = decodedN
+		decodedInstFromNote[ch] = decodedI
 	}
 
 	// Decode sparse Fx streams back to per-row format
 	// FxV/FxD are at indices 12+ch*2 and 12+ch*2+1
-	// FxV uses shifted encoding: 0 → effect=0, >0 → effect=((val-1)>>8)+1, param=(val-1)&0xFF
+	// FxV = non-zero (effect<<8)|param values only
+	// FxD = interleaved [gap, duration, gap, duration, ...]
 	var decodedFx [3][]int
 	for ch := 0; ch < 3; ch++ {
 		fxVal := streams[12+ch*2].data   // FxV at 12,14,16
 		fxDur := streams[12+ch*2+1].data // FxD at 13,15,17
-		decoded := make([]int, numRows)
+		decoded := make([]int, numRows)  // Default all to 0
 		row := 0
 		for i := 0; i < len(fxVal); i++ {
-			encodedVal := fxVal[i]
-			dur := fxDur[i]
-			// Decode shifted encoding back to (effect<<8)|param
-			var val int
-			if encodedVal > 0 {
-				shifted := encodedVal - 1
-				effect := (shifted >> 8) + 1
-				param := shifted & 0xFF
-				val = (effect << 8) | param
-			}
+			gap := fxDur[i*2]   // Gap before this effect
+			dur := fxDur[i*2+1] // Duration of this effect
+			row += gap          // Skip gap rows (effect=0)
 			for j := 0; j < dur && row < numRows; j++ {
-				decoded[row] = val
+				decoded[row] = fxVal[i]
 				row++
 			}
 		}
 		decodedFx[ch] = decoded
 	}
 
-	// Decode sparse inst streams back to per-row format
-	// InstV/InstD are at indices 18+ch*2 and 18+ch*2+1
-	// NEW FORMAT: InstD = delta since last emit (or song start), InstV = slot (0-30)
-	// Only non-zero instrument triggers are stored; decoder defaults to 0
-	var decodedInst [3][]int
-	for ch := 0; ch < 3; ch++ {
-		instVal := streams[18+ch*2].data   // InstV at 18,20,22 (stores 0-30)
-		instDur := streams[18+ch*2+1].data // InstD at 19,21,23
-		decoded := make([]int, numRows)    // Default all to 0
-		row := 0
-		for i := 0; i < len(instVal); i++ {
-			row += instDur[i] // Delta to next inst change
-			if row < numRows {
-				decoded[row] = instVal[i] + 1 // +1 to convert 0-30 back to 1-31
-			}
-		}
-		decodedInst[ch] = decoded
-	}
+	// Inst is now decoded from combined NoteVal (no separate InstV/InstD streams)
+	decodedInst := decodedInstFromNote
 
 	// Decode sparse transpose streams back to per-order format
 	// Streams: 6-7=Ch0 TransV,TransD, 8-9=Ch1, 10-11=Ch2
@@ -1972,10 +1957,10 @@ func runStreamOnlySimulation(streams []intStream, idxToNote []int) SIDRegisters 
 	}
 
 	// Decode merged incremental table stream for slot-based loading
-	// streams[24]: TblData (merged format: delta, slot, instDef[16], waveLen, waveData..., arpLen, arpData..., filtLen, filtData...)
+	// streams[18]: TblData (merged format: delta, slot, instDef[16], waveLen, waveData..., arpLen, arpData..., filtLen, filtData...)
 	// Special: delta=65535 is a song reset marker (resets all state, no slot/data follows)
 	const songResetMarker = 65535
-	tblData := streams[24].data
+	tblData := streams[18].data
 
 	// Build load events from merged stream
 	type loadEvent struct {
@@ -3513,9 +3498,9 @@ func main() {
 
 	for ch := 0; ch < 3; ch++ {
 		src := allStreams[ch]
-		var noteVals []int
+		var noteVals []int  // Combined: (note << 5) | inst
 		var noteDurs []int
-		instData := make([]int, 0, numRows)
+		instData := make([]int, 0, numRows) // Still needed for row-based decoding
 		fxData := make([]int, 0, numRows)
 		gap := 0
 
@@ -3531,16 +3516,17 @@ func main() {
 			// because the player uses current order's transpose for arp calculations
 			note := rawNote
 
-			// Sparse note encoding: only store non-zero notes
+			// Sparse note encoding: combine note+inst since inst only set with notes
+			// Format: (note << 5) | inst (note=0-127, inst=0-31)
 			if note == 0 {
 				gap++
 			} else {
 				noteDurs = append(noteDurs, gap)
-				noteVals = append(noteVals, note)
+				noteVals = append(noteVals, (note<<5)|inst) // Combined note+inst
 				gap = 0
 			}
 
-			// Inst and Fx remain row-based (needed for effect-only rows)
+			// Keep row-based inst for decoder validation
 			instData = append(instData, inst)
 			fxData = append(fxData, fxParam)
 		}
@@ -3548,7 +3534,7 @@ func main() {
 		// Handle trailing gap
 		if gap > 0 {
 			noteDurs = append(noteDurs, gap)
-			noteVals = append(noteVals, 0) // Sentinel for end
+			noteVals = append(noteVals, 0) // Sentinel for end (note=0, inst=0)
 		}
 
 		sparseNoteData[ch] = noteVals
@@ -3558,12 +3544,13 @@ func main() {
 	}
 
 
-	// Analyze note value distribution
+	// Analyze note value distribution (extract note from combined value)
 	noteFreq := make(map[int]int)
 	for ch := 0; ch < 3; ch++ {
-		for _, v := range sparseNoteData[ch] {
-			if v > 0 {
-				noteFreq[v]++
+		for _, combined := range sparseNoteData[ch] {
+			if combined > 0 {
+				note := combined >> 5 // Extract note from (note<<5)|inst
+				noteFreq[note]++
 			}
 		}
 	}
@@ -3588,21 +3575,26 @@ func main() {
 	}
 
 	// Create frequency-remapped note streams
+	// NoteVal now contains (note<<5)|inst, remap the note part only
 	var remappedNoteData [3][]int
 	for ch := 0; ch < 3; ch++ {
 		remapped := make([]int, len(sparseNoteData[ch]))
-		for i, v := range sparseNoteData[ch] {
-			if v == 0 {
+		for i, combined := range sparseNoteData[ch] {
+			if combined == 0 {
 				remapped[i] = 0 // Keep 0 as 0 (sentinel in sparse encoding)
 			} else {
-				remapped[i] = noteToIdx[v]
+				note := combined >> 5
+				inst := combined & 0x1F
+				remappedNote := noteToIdx[note]
+				remapped[i] = (remappedNote << 5) | inst // Recombine with inst
 			}
 		}
 		remappedNoteData[ch] = remapped
 	}
 
 	// Build stream array - Notes first (Fx added later after FEx conversion)
-	// Layout: Ch0-2(NoteVal,NoteDur), Ch0-2(TransV,TransD), Ch0-2(FxE,FxP,FxD), Ch0-2(InstV,InstD), TblData
+	// Layout: Ch0-2(NoteVal,NoteDur), Ch0-2(TransV,TransD), Ch0-2(FxV,FxD), TblData
+	// Note: NoteVal contains (noteIdx<<5)|inst - inst combined with notes
 	for ch := 0; ch < 3; ch++ {
 		streams = append(streams, intStream{remappedNoteData[ch], 3, fmt.Sprintf("Ch%d NoteVal", ch), true, 1024})
 		streams = append(streams, intStream{sparseNoteDur[ch], 1, fmt.Sprintf("Ch%d NoteDur", ch), true, 512})
@@ -3911,6 +3903,48 @@ func main() {
 		}
 	}
 
+	// Rebuild NoteVal with slot-converted inst (after inst-to-slot conversion)
+	sparseNoteData = [3][]int{}
+	sparseNoteDur = [3][]int{}
+	for ch := 0; ch < 3; ch++ {
+		src := allStreams[ch]
+		var noteVals []int
+		var noteDurs []int
+		gap := 0
+		for row := 0; row < numRows; row++ {
+			rawNote := int(src[row*3] & 0x7F)
+			slotInst := instStreamData[ch][row] // Now slot-converted
+			if rawNote == 0 {
+				gap++
+			} else {
+				noteDurs = append(noteDurs, gap)
+				noteVals = append(noteVals, (rawNote<<5)|slotInst)
+				gap = 0
+			}
+		}
+		if gap > 0 {
+			noteDurs = append(noteDurs, gap)
+			noteVals = append(noteVals, 0)
+		}
+		sparseNoteData[ch] = noteVals
+		sparseNoteDur[ch] = noteDurs
+		// Rebuild remapped note data with slot-converted inst
+		remapped := make([]int, len(noteVals))
+		for i, combined := range noteVals {
+			if combined == 0 {
+				remapped[i] = 0
+			} else {
+				note := combined >> 5
+				inst := combined & 0x1F
+				remappedNote := noteToIdx[note]
+				remapped[i] = (remappedNote << 5) | inst
+			}
+		}
+		// Update streams with new data
+		streams[ch*2].data = remapped     // NoteVal
+		streams[ch*2+1].data = noteDurs   // NoteDur
+	}
+
 	// Convert FEx effect parameters from original instrument IDs to slot IDs
 	fexCount := 0
 	for ch := 0; ch < 3; ch++ {
@@ -3945,23 +3979,24 @@ func main() {
 	}
 
 	// Now build sparse Fx encoding (after FEx slot conversion)
-	var sparseFxVal [3][]int // Combined (effect<<8)|param - for comparison
-	var sparseFxEff [3][]int // Effect number (0-12)
+	// Only store non-zero effects: FxV = values, FxD = interleaved [gap, duration]
+	// (Unlike InstV which is point triggers, effects have durations so need gap+dur)
+	var sparseFxVal [3][]int // (effect<<8)|param, only non-zero
+	var sparseFxEff [3][]int // Effect number (1-12)
 	var sparseFxPar [3][]int // Effect parameter
-	var sparseFxDur [3][]int
-	fmt.Println("\nFx+P sparse encoding (after FEx conversion):")
-	fxCombinedBits := 0
+	var sparseFxDur [3][]int // Interleaved [gap, duration, gap, duration, ...]
+	fmt.Println("\nFx sparse encoding (after FEx conversion):")
+	fxRLEBits := 0
 	fxSparseBits := 0
 	for ch := 0; ch < 3; ch++ {
 		zeros := 0
+		rleEntries := 0
 		for _, v := range fxStreamData[ch] {
 			if v == 0 {
 				zeros++
 			}
-			fxCombinedBits += expGolombBits(v, 0)
 		}
-		// Build sparse encoding: value + duration pairs
-		// FxV uses shifted encoding: effect=0 → 0, effect>0 → ((effect-1)<<8|param)+1
+		// Build RLE for comparison
 		i := 0
 		for i < len(fxStreamData[ch]) {
 			val := fxStreamData[ch][i]
@@ -3969,33 +4004,41 @@ func main() {
 			for i+dur < len(fxStreamData[ch]) && fxStreamData[ch][i+dur] == val {
 				dur++
 			}
-			// Convert to shifted encoding for better exp-golomb compression
-			effect := (val >> 8) & 0xF
-			param := val & 0xFF
-			encodedVal := 0
-			if effect > 0 {
-				encodedVal = ((effect-1)<<8 | param) + 1
-			}
-			sparseFxVal[ch] = append(sparseFxVal[ch], encodedVal)
-			sparseFxEff[ch] = append(sparseFxEff[ch], effect)
-			sparseFxPar[ch] = append(sparseFxPar[ch], param)
-			sparseFxDur[ch] = append(sparseFxDur[ch], dur)
+			fxRLEBits += expGolombBits(val, 0) + expGolombBits(dur, 0)
+			rleEntries++
 			i += dur
 		}
-		// Calculate sparse bits
-		for j := 0; j < len(sparseFxVal[ch]); j++ {
-			fxSparseBits += expGolombBits(sparseFxVal[ch][j], 0)
-			fxSparseBits += expGolombBits(sparseFxDur[ch][j], 0)
+		// Build sparse encoding: only non-zero effects with gap+duration
+		i = 0
+		gap := 0
+		for i < len(fxStreamData[ch]) {
+			val := fxStreamData[ch][i]
+			dur := 1
+			for i+dur < len(fxStreamData[ch]) && fxStreamData[ch][i+dur] == val {
+				dur++
+			}
+			if val == 0 {
+				gap += dur
+			} else {
+				sparseFxVal[ch] = append(sparseFxVal[ch], val)
+				sparseFxEff[ch] = append(sparseFxEff[ch], (val>>8)&0xF)
+				sparseFxPar[ch] = append(sparseFxPar[ch], val&0xFF)
+				sparseFxDur[ch] = append(sparseFxDur[ch], gap)
+				sparseFxDur[ch] = append(sparseFxDur[ch], dur)
+				fxSparseBits += expGolombBits(val, 0) + expGolombBits(gap, 0) + expGolombBits(dur, 0)
+				gap = 0
+			}
+			i += dur
 		}
-		fmt.Printf("  Ch%d: %d rows, %d zeros (%.1f%%), %d changes\n",
+		fmt.Printf("  Ch%d: %d rows, %d zeros (%.1f%%), %d RLE, %d sparse (gap+dur)\n",
 			ch, len(fxStreamData[ch]), zeros, 100.0*float64(zeros)/float64(len(fxStreamData[ch])),
-			len(sparseFxVal[ch]))
-		// Add Fx streams (combined value + duration)
+			rleEntries, len(sparseFxVal[ch]))
+		// Add Fx streams
 		streams = append(streams, intStream{sparseFxVal[ch], 0, fmt.Sprintf("Ch%d FxV", ch), true, 512})
 		streams = append(streams, intStream{sparseFxDur[ch], 0, fmt.Sprintf("Ch%d FxD", ch), true, 512})
 	}
-	fmt.Printf("  Total: combined %d bits, sparse %d bits (%+d bits = %+d bytes)\n",
-		fxCombinedBits, fxSparseBits, fxSparseBits-fxCombinedBits, (fxSparseBits-fxCombinedBits)/8)
+	fmt.Printf("  Total: RLE %d bits, sparse %d bits (%+d bits = %+d bytes)\n",
+		fxRLEBits, fxSparseBits, fxSparseBits-fxRLEBits, (fxSparseBits-fxRLEBits)/8)
 	// Verify no effect=0 with param>0
 	effect0NonZeroParam := 0
 	for ch := 0; ch < 3; ch++ {
@@ -4058,11 +4101,9 @@ func main() {
 			ch, total, len(sparseInstVal[ch]), oldEntries, sparseBits)
 		totalCurrentBits += currentBits
 		totalSparseBits += sparseBits
-		// Add to streams
-		streams = append(streams, intStream{sparseInstVal[ch], 0, fmt.Sprintf("Ch%d InstV", ch), true, 512})
-		streams = append(streams, intStream{sparseInstDur[ch], 0, fmt.Sprintf("Ch%d InstD", ch), true, 512})
+		// InstV/InstD no longer separate - inst is combined with NoteVal
 	}
-	fmt.Printf("  Total: %d entries (was %d)\n", len(sparseInstVal[0])+len(sparseInstVal[1])+len(sparseInstVal[2]), totalOldEntries)
+	fmt.Printf("  Total: %d entries (was %d) - now combined with NoteVal\n", len(sparseInstVal[0])+len(sparseInstVal[1])+len(sparseInstVal[2]), totalOldEntries)
 
 	// Sort incrLoadEvents by row for correct delta encoding
 	sort.Slice(incrLoadEvents, func(i, j int) bool {
@@ -4149,9 +4190,10 @@ func main() {
 				dur = noteDurs[i]
 			}
 			row += dur
-			// Place the note value
+			// Place the note index (extract from combined value)
 			if row < numRows && noteVals[i] != 0 {
-				decoded[row] = noteVals[i]
+				combined := noteVals[i]
+				decoded[row] = combined >> 5 // Extract note index from (noteIdx<<5)|inst
 				row++
 			}
 		}
@@ -4646,12 +4688,10 @@ func main() {
 	fmt.Println()
 	fmt.Println("Stream data format (all exp-golomb encoded):")
 	streamDescs := map[string]string{
-		"NoteVal": "note index (freq-sorted via LUT, 0=rest)",
-		"NoteDur": "rows before each note event",
-		"FxV":     "shifted: 0=no-effect, >0=((effect-1)<<8|param)+1",
-		"FxD":     "rows this fx value lasts",
-		"InstV":   "slot index (0-30, only triggers stored)",
-		"InstD":   "delta rows since last inst trigger (or song start)",
+		"NoteVal": "(noteIdx<<5)|inst, noteIdx freq-sorted (0=rest), inst=slot 0-30",
+		"NoteDur": "gap rows before each note event",
+		"FxV":     "(effect<<8)|param, sparse (0 never stored)",
+		"FxD":     "[gap, duration] interleaved per fx entry",
 		"TransV":  "transpose (zigzag: 0→0, -1→1, 1→2, ...)",
 		"TransD":  "orders until next transpose change",
 		"TblData": "delta, slot, inst[16], waveLen, wave[], arpLen, arp[], filtLen, filt[]; reset(65535): frame, row",

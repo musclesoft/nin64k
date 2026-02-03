@@ -673,33 +673,40 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	jmpMainFromCopy := placeholder()
 	patch16(jmpMainFromCopy, base+uint16(mainLoopPos))
 
-	// ==================== READ_EXPGOL ====================
+	// ==================== READ_GAMMA (k=0) / READ_EXPGOL (k=2) ====================
+	// Shared gamma decoding with zpCallerX as flag:
+	// - read_gamma: zpCallerX=0, returns gamma-1
+	// - read_expgol: zpCallerX=1/2/3, returns (gamma-1)*4 + 2 suffix bits
+
+	// read_gamma entry: set flag to 0, use BIT trick to skip STX
+	readGammaPos := label("read_gamma")
+	patch16(jsrExpgolLen2, base+uint16(readGammaPos))
+	emit(0x84, zpCallerX) // STY zpCallerX (Y=0, flag for gamma path)
+	emit(0x2C)            // .byte $2C - BIT abs opcode, skips next 2 bytes
+
+	// read_expgol entry: save X (non-zero) as flag (hidden by BIT when from read_gamma)
 	readExpgolPos := label("read_expgol")
 	patch16(jsrExpgol1, base+uint16(readExpgolPos))
 	patch16(jsrExpgol3, base+uint16(readExpgolPos))
-	patch16(jsrExpgolLen2, base+uint16(readExpgolPos))
+	emit(0x86, zpCallerX) // STX zpCallerX (X=1/2/3, flag for expgol path)
 
-	// Store caller's X - backref uses this for adjustment value
-	emit(0x86, zpCallerX) // STX zpCallerX
-
-	// Count leading zeros using X (inverted: count down, then INX in read loop)
+	// Shared gamma reading code
+	label("read_gamma_common")
 	emit(0xA2, 0x01)     // LDX #$01
-	emit(0x86, zpValLo) // STX zpValLo
-	emit(0x84, zpValHi) // STY zpValHi (Y=0)
+	emit(0x86, zpValLo)  // STX zpValLo
+	emit(0x84, zpValHi)  // STY zpValHi (Y=0)
 	countZerosPos := label("count_zeros")
 	emit(0xCA)                        // DEX
 	emit(0xE0, terminatorThreshold)   // CPX #(256-TERMINATOR_ZEROS)
 	bccTerminatorEarly := pos()
-	emit(0xF0, 0x00)    // BEQ terminator (TERMINATOR_ZEROS zeros = terminator)
-	label("do_read")
+	emit(0xF0, 0x00)    // BEQ terminator
 	emit(0x20)
 	jsrReadBitGamma := placeholder()
 	bccCountZeros := countZerosPos - pos() - 2
-	emit(0x90, byte(bccCountZeros)) // BCC @count_zeros
-	// X = $00 for 0 zeros, $FF..$F5 for 1-11 zeros (12+ handled above)
+	emit(0x90, byte(bccCountZeros)) // BCC count_zeros
 	emit(0x8A) // TXA (sets Z flag)
 	beqGammaDone := pos()
-	emit(0xF0, 0x00) // BEQ @gamma_done (0 zeros = valid)
+	emit(0xF0, 0x00) // BEQ gamma_done
 
 	readBitsLoopPos := label("read_gamma_bits")
 	emit(0x20)
@@ -708,7 +715,7 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	emit(0x26, zpValHi) // ROL zpValHi
 	emit(0xE8)           // INX
 	bneReadBits := readBitsLoopPos - pos() - 2
-	emit(0xD0, byte(bneReadBits)) // BNE @read_bits
+	emit(0xD0, byte(bneReadBits)) // BNE read_gamma_bits
 
 	gammaDonePos := label("gamma_done")
 	patchRel(beqGammaDone, gammaDonePos)
@@ -716,18 +723,22 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	// Decrement gamma by 1
 	emit(0xA5, zpValLo) // LDA zpValLo
 	bneNoGammaBorrow := pos()
-	emit(0xD0, 0x00)     // BNE +2
+	emit(0xD0, 0x02)     // BNE +2
 	emit(0xC6, zpValHi) // DEC zpValHi
-	noGammaBorrowPos := label("dec_gamma")
-	patchRel(bneNoGammaBorrow, noGammaBorrowPos)
+	label("gamma_dec_lo")
+	patchRel(bneNoGammaBorrow, pos())
 	emit(0xC6, zpValLo) // DEC zpValLo
 
-	// Shift left by 2: (gamma-1)*4
+	// Check flag: zpCallerX=0 means gamma (k=0), else expgol (k=2)
+	emit(0xA5, zpCallerX) // LDA zpCallerX
+	beqGammaReturn := pos()
+	emit(0xF0, 0x00)      // BEQ gamma_return (if flag=0, skip k=2 suffix)
+
+	// k=2 path: shift left by 2, read 2 suffix bits
 	emit(0x06, zpValLo) // ASL zpValLo
 	emit(0x26, zpValHi) // ROL zpValHi
 	emit(0x06, zpValLo) // ASL zpValLo
 	emit(0x26, zpValHi) // ROL zpValHi
-	// Read 2 suffix bits
 	emit(0x98)           // TYA (A=0)
 	emit(0x20)
 	jsrReadBitExp1 := placeholder()
@@ -737,7 +748,15 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 	emit(0x2A)           // ROL A (C=0: A is at most 3, bit 7 always 0)
 	emit(0x05, zpValLo) // ORA zpValLo
 	emit(0x85, zpValLo) // STA zpValLo
-	emit(0xA6, zpValHi) // LDX zpValHi (return hi byte in X for callers)
+	emit(0xA6, zpValHi) // LDX zpValHi
+	emit(0x60)           // RTS
+
+	// k=0 path: just return gamma-1
+	gammaReturnPos := label("gamma_return")
+	patchRel(beqGammaReturn, gammaReturnPos)
+	emit(0xA5, zpValLo) // LDA zpValLo (reload decremented value)
+	emit(0x18)          // CLC (ensure C=0 for ADC #2)
+	emit(0xA6, zpValHi) // LDX zpValHi
 	emit(0x60)           // RTS
 
 	// ==================== READ_BIT ====================
@@ -779,7 +798,7 @@ func GetDecompressorCodeWithLabels() ([]byte, map[string]int) {
 
 	// ==================== TERMINATOR (inlined) ====================
 	// Terminator is detected in count_zeros when CPX hits threshold
-	// Pop read_expgol return address and exit directly to decompress caller
+	// Pop read_expgol/read_gamma return address and exit directly to decompress caller
 	terminatorPos := label("terminator")
 	patchRel(bccTerminatorEarly, terminatorPos)
 	emit(0x68) // PLA (discard read_expgol return lo)

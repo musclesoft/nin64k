@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	kLen    = 2
+	kLen    = 0
 	kDist   = 2
 	kOffset = 2
 

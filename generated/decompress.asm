@@ -1,5 +1,5 @@
 ; Generated file - do not edit. Modify cmd/compress/decompress6502.go instead.
-; Size: 259 bytes
+; Size: 272 bytes
 ; External zero page variables (must be defined by caller)
 ; zp_src_lo       = $02   ; Source pointer (compressed data)
 ; zp_src_hi       = $03
@@ -110,7 +110,7 @@ backref_adjust:
         adc     #$40
 backref_no_adjust:
         sta     zp_ref_hi
-        jsr     read_expgol
+        jsr     read_gamma
         adc     #$02
         tax
         bcc     copy_loop
@@ -136,6 +136,9 @@ skip_val_hi_dec:
         ora     zp_val_hi
         bne     copy_loop
         jmp     main_loop
+read_gamma:
+        sty     zp_caller_x
+        .byte   $2C     ; BIT abs opcode - skip next 2 bytes
 read_expgol:
         stx     zp_caller_x
         ldx     #$01
@@ -157,10 +160,12 @@ read_gamma_bits:
         bne     read_gamma_bits
 gamma_done:
         lda     zp_val_lo
-        bne     dec_gamma
+        bne     gamma_dec_lo
         dec     zp_val_hi
-dec_gamma:
+gamma_dec_lo:
         dec     zp_val_lo
+        lda     zp_caller_x
+        beq     gamma_return
         asl     zp_val_lo
         rol     zp_val_hi
         asl     zp_val_lo
@@ -172,6 +177,11 @@ dec_gamma:
         rol a
         ora     zp_val_lo
         sta     zp_val_lo
+        ldx     zp_val_hi
+        rts
+gamma_return:
+        lda     zp_val_lo
+        clc
         ldx     zp_val_hi
         rts
 read_bit:
@@ -192,5 +202,5 @@ terminator:
         pla
         pla
         rts
-; checkpoint: max 53 cycles between calls
+; checkpoint: max 54 cycles between calls
 .endproc

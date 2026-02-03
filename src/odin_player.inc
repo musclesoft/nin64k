@@ -147,6 +147,9 @@ player_init:
         sta     chn_decoded_pat+0
         sta     chn_decoded_pat+1
         sta     chn_decoded_pat+2
+        sta     chn_decoded_quarter+0
+        sta     chn_decoded_quarter+1
+        sta     chn_decoded_quarter+2
         ; Set row_dict_addr = song_base + $9D9
         lda     zp_song_base
         clc
@@ -209,8 +212,11 @@ player_play:
         sta     forcenewpattern
 @pattern_ok:
         lda     trackrow
-        asl     a
-        adc     trackrow
+        sta     decode_row              ; set decode_row for get_trackptr_order
+        and     #$0f            ; row_in_quarter = trackrow & 15
+        sta     trackrow3       ; temp storage
+        asl     a               ; A = row_in_quarter * 2
+        adc     trackrow3       ; A = row_in_quarter * 3
         sta     trackrow3
         ldx     ordernumber
         ldy     #0
@@ -313,8 +319,11 @@ player_play:
         stx     hrtrackrow
         sty     hrordernumber
         lda     hrtrackrow
-        asl     a
-        adc     hrtrackrow
+        sta     decode_row              ; set decode_row for HR get_trackptr_order calls
+        and     #$0f            ; row_in_quarter = hrtrackrow & 15
+        sta     trackrow3       ; temp storage
+        asl     a               ; A = row_in_quarter * 2
+        adc     trackrow3       ; A = row_in_quarter * 3
         sta     trackrow3
         lda     speedcounter
         adc     chn_hardrestart+0
@@ -1007,14 +1016,60 @@ get_trackptr_order:
         txa
         tay
         lda     (zp_ptr),y          ; A = pattern index
-        ; Check if pattern is already decoded for this channel
+        ; Calculate which quarter is needed: quarter = decode_row >> 4 (0-3)
+        sta     @pat_idx            ; save pattern index
+        lda     decode_row
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a                   ; A = decode_row >> 4 = quarter (0-3)
+        sta     @needed_quarter
+        ; Check if pattern AND quarter match what's already decoded
 @channel:
         ldx     #0                  ; SMC: channel
+        lda     @pat_idx
         cmp     chn_decoded_pat,x
+        bne     @need_decode
+        lda     @needed_quarter
+        cmp     chn_decoded_quarter,x
         beq     @already_decoded
-        ; Need to decode pattern
-        sta     chn_decoded_pat,x   ; Mark as being decoded
-        jsr     decode_pattern      ; A = pattern index, X = channel
+@need_decode:
+        ; Check if pattern changed
+        lda     @pat_idx
+        cmp     chn_decoded_pat,x
+        beq     @same_pattern
+        ; New pattern - start from quarter 0
+        sta     chn_decoded_pat,x
+        lda     #0
+        sta     chn_decoded_quarter,x
+@decode_loop:
+        ; Decode current quarter
+        lda     @pat_idx
+        jsr     decode_pattern_quarter
+        ; Check if we've reached needed quarter
+        lda     chn_decoded_quarter,x
+        cmp     @needed_quarter
+        beq     @already_decoded
+        ; Need next quarter - increment and continue
+        inc     chn_decoded_quarter,x
+        jmp     @decode_loop
+@same_pattern:
+        ; Same pattern, different quarter - check if consecutive
+        lda     chn_decoded_quarter,x
+        clc
+        adc     #1
+        cmp     @needed_quarter
+        bne     @need_restart       ; not consecutive, restart from 0
+        ; Consecutive quarter - just decode the next one
+        sta     chn_decoded_quarter,x
+        lda     @pat_idx
+        jsr     decode_pattern_quarter
+        jmp     @already_decoded
+@need_restart:
+        ; Need to restart from quarter 0 (e.g., jumped backwards)
+        lda     #0
+        sta     chn_decoded_quarter,x
+        jmp     @decode_loop
 @already_decoded:
         ; Set zp_trackptr to channel's decode buffer
         lda     decode_buffer_lo,x
@@ -1022,18 +1077,26 @@ get_trackptr_order:
         lda     decode_buffer_hi,x
         sta     zp_trackptr+1
         rts
+@pat_idx:       .byte   0
+@needed_quarter: .byte  0
 
 ; Decode buffer address table
 decode_buffer_lo:
         .byte   <decode_buffer_0, <decode_buffer_1, <decode_buffer_2
 decode_buffer_hi:
         .byte   >decode_buffer_0, >decode_buffer_1, >decode_buffer_2
+; State offset table: channel * 2
+state_offset:
+        .byte   0, 2, 4
 
-; decode_pattern - Decode packed pattern to channel's decode buffer
+; decode_pattern_quarter - Decode 16 rows of pattern to channel's decode buffer
 ; Input: A = pattern index, X = channel (0-2)
+;        chn_decoded_quarter[X] = which quarter to decode (0-3)
 ; Preserves: X (channel)
 ; Uses: zp_decode_src, zp_decode_dst, zp_ptr
-decode_pattern:
+; For quarter 0: decodes rows 0-15 from start, saves state
+; For quarters 1-3: restores state, decodes 16 rows, saves state
+decode_pattern_quarter:
         stx     @save_channel       ; preserve channel for caller
         ; Calculate source: packed_data + packed_ptrs[pattern_idx]
         asl     a                   ; pattern index * 2 for word offset
@@ -1056,17 +1119,46 @@ decode_pattern:
         sta     zp_decode_dst
         lda     decode_buffer_hi,x
         sta     zp_decode_dst+1
-        ; Decode 64 rows (192 bytes output)
-        ; Initialize: src_off=0, dst_off=0, prev_row=0,0,0
+        ; Check which quarter we're decoding
+        lda     chn_decoded_quarter,x
+        beq     @first_quarter
+        ; Quarters 1-3: restore state from chn_decode_state
+        ; State format: src_off, rle_count (2 bytes per channel)
+        ; prev_row is read from end of buffer (last row of previous quarter)
+        lda     state_offset,x      ; X * 2
+        tay
+        lda     chn_decode_state,y
+        sta     @src_off
+        lda     chn_decode_state+1,y
+        sta     @rle_count
+        ; Read prev_row from buffer[45..47] (last row of previous quarter)
+        ldy     #45
+        lda     (zp_decode_dst),y
+        sta     @prev_row
+        iny
+        lda     (zp_decode_dst),y
+        sta     @prev_row+1
+        iny
+        lda     (zp_decode_dst),y
+        sta     @prev_row+2
+        lda     #0
+        sta     @dst_off            ; always write to buffer start
+        ; Check for pending RLE from previous quarter
+        lda     @rle_count
+        bne     @rle_loop           ; resume RLE if count > 0
+        jmp     @decode_loop
+@first_quarter:
+        ; First quarter: decode from start
         lda     #0
         sta     @src_off
         sta     @dst_off
+        sta     @rle_count
         sta     @prev_row
         sta     @prev_row+1
         sta     @prev_row+2
 @decode_loop:
         lda     @dst_off
-        cmp     #192
+        cmp     #48                 ; 16 rows × 3 bytes = 48 (quarter buffer)
         bcs     @decode_done
         ldy     @src_off
         lda     (zp_decode_src),y
@@ -1084,6 +1176,10 @@ decode_pattern:
         sta     @rle_count
         inc     @src_off            ; advance src past RLE byte
 @rle_loop:
+        ; Check if buffer is full before writing
+        lda     @dst_off
+        cmp     #48
+        bcs     @decode_done        ; stop if we'd overflow
         ; Copy prev row to dst using (zp),Y
         ldy     @dst_off
         lda     @prev_row
@@ -1113,6 +1209,19 @@ decode_pattern:
         jsr     @copy_dict_entry_16
         jmp     @decode_loop
 @decode_done:
+        ; Save state for next quarter (quarters 0-2, not 3)
+        ldx     @save_channel
+        lda     chn_decoded_quarter,x
+        cmp     #3
+        beq     @no_save_state      ; quarter 3, no next quarter to save for
+        ; Save state: src_off, rle_count (prev_row is in buffer[45..47])
+        lda     state_offset,x      ; X * 2
+        tay
+        lda     @src_off
+        sta     chn_decode_state,y
+        lda     @rle_count
+        sta     chn_decode_state+1,y
+@no_save_state:
         ldx     @save_channel       ; restore channel for caller
         rts
 
@@ -1284,6 +1393,7 @@ speedcounter:           .byte   0
 trackrow:               .byte   0
 trackrow3:              .byte   0
 hrtrackrow:             .byte   0
+decode_row:             .byte   0       ; row used for quarter calculation in decode
 firsttrackrow:          .byte   0
 ordernumber:            .byte   0
 nextordernumber:        .byte   0
@@ -1299,11 +1409,17 @@ packed_ptrs_addr:       .word   0       ; Address of packed pointers table
 
 ; Pattern decode state
 chn_decoded_pat:        .byte   $FF, $FF, $FF  ; Pattern index in each channel's decode buffer
+chn_decoded_quarter:    .byte   $FF, $FF, $FF  ; Which quarter is decoded (0-3)
 
-; Decode buffers (192 bytes × 3 channels = 576 bytes)
-decode_buffer_0:        .res    192
-decode_buffer_1:        .res    192
-decode_buffer_2:        .res    192
+; Decoder state saved for next quarter decode (2 bytes per channel)
+; Format: src_off (1 byte), rle_count (1 byte)
+; prev_row is read from buffer[45..47] when resuming
+chn_decode_state:       .res    6              ; 2 bytes × 3 channels
+
+; Decode buffers (48 bytes × 3 channels = 144 bytes) - quarter-pattern buffers
+decode_buffer_0:        .res    48
+decode_buffer_1:        .res    48
+decode_buffer_2:        .res    48
 
 ; Split frequency tables (104 entries: notes 0-103)
 ; Note 103 holds remapped absolute note value (was 127)

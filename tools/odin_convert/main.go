@@ -492,6 +492,53 @@ func collectPatternContents(raw []byte) map[string]bool {
 	return patterns
 }
 
+// analyzeRowDictCombinations analyzes the note/inst/fx combinations in a row dict
+// Returns counts for: nop, note-only, inst-only, fx-only, note+inst, note+fx, inst+fx, note+inst+fx
+func analyzeRowDictCombinations(dict []byte) [8]int {
+	var counts [8]int
+	numEntries := len(dict) / 3
+	for i := 0; i < numEntries; i++ {
+		off := i * 3
+		byte0 := dict[off]     // note (bit 7 = effect bit 3)
+		byte1 := dict[off+1]   // inst in bits 0-4, effect bits 0-2 in bits 5-7
+		byte2 := dict[off+2]   // param
+
+		note := byte0 & 0x7F
+		inst := byte1 & 0x1F
+		effect := (byte1 >> 5) | ((byte0 >> 4) & 8)
+		param := byte2
+
+		hasNote := note != 0
+		hasInst := inst != 0
+		hasFx := effect != 0 || (effect == 0 && param != 0 && hasNote)
+
+		// If no effect, param is meaningless
+		if effect == 0 {
+			hasFx = false
+		}
+
+		switch {
+		case !hasNote && !hasInst && !hasFx:
+			counts[0]++ // nop
+		case hasNote && !hasInst && !hasFx:
+			counts[1]++ // note-only
+		case !hasNote && hasInst && !hasFx:
+			counts[2]++ // inst-only
+		case !hasNote && !hasInst && hasFx:
+			counts[3]++ // fx-only
+		case hasNote && hasInst && !hasFx:
+			counts[4]++ // note+inst
+		case hasNote && !hasInst && hasFx:
+			counts[5]++ // note+fx
+		case !hasNote && hasInst && hasFx:
+			counts[6]++ // inst+fx
+		case hasNote && hasInst && hasFx:
+			counts[7]++ // note+inst+fx
+		}
+	}
+	return counts
+}
+
 // getPatternBreakInfo returns the first row with a break (0x0D) or position jump (0x0B) effect,
 // and the jump target if it's a position jump (-1 otherwise). Uses original (pre-remap) effect numbers.
 func getPatternBreakInfo(pat []byte) (breakRow int, jumpTarget int) {
@@ -1475,6 +1522,7 @@ func remapPatternEffects(pattern []byte, remap [16]byte) {
 				newHiNib = 0xB0 // filter mode
 			case 0xB0:
 				newHiNib = 0xC0 // fine slide
+				loNib = 0       // player ignores param, zero for compression
 			default:
 				newHiNib = hiNib // keep unchanged (shouldn't happen)
 			}
@@ -3044,32 +3092,32 @@ func main() {
 		if len(allEffectParams[eff]) == 0 {
 			continue
 		}
-		// For effect F, break down by sub-effect
+		// For effect F, break down by sub-effect (OLD/original Fxx meanings)
 		if eff == 0xF {
-			// Group Fxx params by sub-effect type
+			// Group Fxx params by sub-effect type (labels show original meanings)
 			subEffects := map[string]map[int]int{
-				"F(speed)":    make(map[int]int), // 00-7F
-				"F8(hrdrest)": make(map[int]int), // F8x -> 8x
-				"F9(filttrig)": make(map[int]int), // F9x -> 9x
-				"FB(filtmode)": make(map[int]int), // FBx -> Bx
-				"FE(filtcut)": make(map[int]int),  // FEx -> Ex
-				"FF(pulse)":   make(map[int]int),  // FFx -> Fx
+				"F(speed)":     make(map[int]int), // 00-7F
+				"F8(globalvol)": make(map[int]int), // F8x
+				"F9(filtmode)": make(map[int]int), // F9x
+				"FB(fineslide)": make(map[int]int), // FBx
+				"FE(filttrig)": make(map[int]int),  // FEx
+				"FF(hrdrest)":  make(map[int]int),  // FFx
 			}
-			subOrder := []string{"F(speed)", "FF(pulse)", "FE(filtcut)", "F8(hrdrest)", "F9(filttrig)", "FB(filtmode)"}
+			subOrder := []string{"F(speed)", "FF(hrdrest)", "FE(filttrig)", "F8(globalvol)", "F9(filtmode)", "FB(fineslide)"}
 			for p, c := range allEffectParams[eff] {
 				switch {
 				case p < 0x80:
 					subEffects["F(speed)"][p] = c
 				case p >= 0x80 && p < 0x90:
-					subEffects["F8(hrdrest)"][p&0x0F] = c
+					subEffects["F8(globalvol)"][p&0x0F] = c
 				case p >= 0x90 && p < 0xA0:
-					subEffects["F9(filttrig)"][p&0x0F] = c
+					subEffects["F9(filtmode)"][p&0x0F] = c
 				case p >= 0xB0 && p < 0xC0:
-					subEffects["FB(filtmode)"][p&0x0F] = c
+					subEffects["FB(fineslide)"][p&0x0F] = c
 				case p >= 0xE0 && p < 0xF0:
-					subEffects["FE(filtcut)"][p&0x0F] = c
+					subEffects["FE(filttrig)"][p&0x0F] = c
 				case p >= 0xF0:
-					subEffects["FF(pulse)"][p&0x0F] = c
+					subEffects["FF(hrdrest)"][p&0x0F] = c
 				}
 			}
 			for _, name := range subOrder {
@@ -3090,19 +3138,23 @@ func main() {
 				sort.Slice(pvs, func(i, j int) bool {
 					return pvs[i].count > pvs[j].count
 				})
-				fmt.Printf("  %s: %d unique values, %d total uses\n", name, len(pvs), total)
-				fmt.Printf("    ")
-				for i, pv := range pvs {
-					if i > 0 {
-						fmt.Printf(" ")
+				if len(pvs) == 1 {
+					fmt.Printf("  %s: %d uses, always $%X\n", name, total, pvs[0].param)
+				} else {
+					fmt.Printf("  %s: %d unique values, %d total uses\n", name, len(pvs), total)
+					fmt.Printf("    ")
+					for i, pv := range pvs {
+						if i > 0 {
+							fmt.Printf(" ")
+						}
+						if i >= 10 {
+							fmt.Printf("...")
+							break
+						}
+						fmt.Printf("$%X(%d)", pv.param, pv.count)
 					}
-					if i >= 10 {
-						fmt.Printf("...")
-						break
-					}
-					fmt.Printf("$%X(%d)", pv.param, pv.count)
+					fmt.Println()
 				}
-				fmt.Println()
 			}
 			continue
 		}
@@ -3119,8 +3171,10 @@ func main() {
 		sort.Slice(pvs, func(i, j int) bool {
 			return pvs[i].count > pvs[j].count
 		})
-		fmt.Printf("  %s: %d unique values, %d total uses\n", effectNames[eff], len(pvs), total)
-		if len(pvs) <= 20 {
+		if len(pvs) == 1 {
+			fmt.Printf("  %s: %d uses, always $%02X\n", effectNames[eff], total, pvs[0].param)
+		} else if len(pvs) <= 20 {
+			fmt.Printf("  %s: %d unique values, %d total uses\n", effectNames[eff], len(pvs), total)
 			fmt.Printf("    ")
 			for i, pv := range pvs {
 				if i > 0 {
@@ -3130,6 +3184,7 @@ func main() {
 			}
 			fmt.Println()
 		} else {
+			fmt.Printf("  %s: %d unique values, %d total uses\n", effectNames[eff], len(pvs), total)
 			fmt.Printf("    top 10:")
 			for i := 0; i < 10 && i < len(pvs); i++ {
 				fmt.Printf(" $%02X(%d)", pvs[i].param, pvs[i].count)
@@ -3185,6 +3240,27 @@ func main() {
 		}
 	}
 	fmt.Printf("Wrote %d parts to %s\n", 9, partsDir)
+
+	// Analyze row dict combinations across all songs
+	var totalCombos [8]int
+	const rowDictOff = 0x9D9
+	for songNum := 1; songNum <= 9; songNum++ {
+		if convertedSongs[songNum-1] == nil {
+			continue
+		}
+		dictSize := convertedStats[songNum-1].PatternDictSize * 3
+		combos := analyzeRowDictCombinations(convertedSongs[songNum-1][rowDictOff : rowDictOff+dictSize])
+		for i := 0; i < 8; i++ {
+			totalCombos[i] += combos[i]
+		}
+	}
+	comboNames := []string{"nop", "note", "inst", "fx", "note+inst", "note+fx", "inst+fx", "note+inst+fx"}
+	fmt.Println("Row dict combinations:")
+	for i, name := range comboNames {
+		if totalCombos[i] > 0 {
+			fmt.Printf("  %s: %d\n", name, totalCombos[i])
+		}
+	}
 
 	// Second pass: run tests
 	fmt.Println("=== Test Results ===")

@@ -4,7 +4,7 @@ selftest_checksums:
         .word   $D6B8               ; Song 2
         .word   $EB3A               ; Song 3
         .word   $79D3               ; Song 4
-        .word   $F837               ; Song 5
+        .word   $F82F               ; Song 5
         .word   $9888               ; Song 6
         .word   $12FB               ; Song 7
         .word   $D1CA               ; Song 8
@@ -21,4 +21,4 @@ selftest_sizes:
         .word   6696                ; Song 8
         .word   7622                ; Song 9
 
-selftest_stream_csum:  .word $7CCF
+selftest_stream_csum:  .word $7C8F

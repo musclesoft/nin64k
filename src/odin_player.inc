@@ -917,13 +917,13 @@ effect0f:
         cpy     #$c0
         bne     @done
 @fcx_fineslide:
-        asl     a
-        asl     a
-        adc     chn_slidedelta_lo,x
+        lda     chn_slidedelta_lo,x
+        clc
+        adc     #$04                    ; param always $1, shifted = $4
         sta     chn_slidedelta_lo,x
-        lda     chn_slidedelta_hi,x
-        adc     #$00
-        sta     chn_slidedelta_hi,x
+        bcc     @fs_nohi
+        inc     chn_slidedelta_hi,x
+@fs_nohi:
         lda     #$80
         sta     chn_slideenable,x
         rts

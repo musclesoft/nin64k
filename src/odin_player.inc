@@ -24,11 +24,13 @@ zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 ; $200: Transpose ch0-2 (256 bytes each)
 ; $500: Trackptr ch0-2 (256 bytes each)
 ; $800: Filtertable (234 bytes max)
-; $8EA: Wavetable (51 bytes max)
-; $91D: Arptable (188 bytes max)
-; $9D9: Row dictionary (1236 bytes = 412 entries × 3)
-; $EAD: Packed pointers (182 bytes = 91 patterns × 2)
-; $F63: Packed pattern data
+; $8EA: Arptable (188 bytes max)
+; $9A6: Row dictionary (1236 bytes = 412 entries × 3)
+; $E7A: Packed pointers (182 bytes = 91 patterns × 2)
+; $F30: Packed pattern data
+;
+; Global wavetable (163 bytes) is stored in player, shared across all songs.
+; Instrument wave indices point directly into global_wavetable.
 ;
 ; Pattern packing format:
 ;   Row dictionary: 3 bytes per entry [note, inst|effect, param], sorted by frequency
@@ -58,9 +60,9 @@ zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 ;   -> effect = (1<<5>>5) | (($00>>4)&8) = 1 | 0 = 1 (arpeggio $49)
 
 ; Pattern packing constants
-ROW_DICT_OFF        = $9D9
-PACKED_PTRS_OFF     = $EAD
-PACKED_DATA_OFF     = $F63
+ROW_DICT_OFF        = $9A6
+PACKED_PTRS_OFF     = $E7A
+PACKED_DATA_OFF     = $F30
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0
@@ -102,13 +104,9 @@ player_init:
         stx     trackptr_page+2
         ; Patch table addresses (SMC)
         inx                             ; X = base + 8
-        stx     wave_load_addr+1        ; $8EA high byte
         stx     filter_load+2           ; $800 high byte
-        inx                             ; X = base + 9
-        stx     arp_load_addr+1         ; $91D high byte
+        stx     arp_load_addr+1         ; $8EA high byte (same page)
         lda     #$ea
-        sta     wave_load_addr
-        lda     #$1d
         sta     arp_load_addr
         lda     #$00
         sta     filter_load+1
@@ -423,8 +421,7 @@ process_instrument:
         sta     zp_ptr+1
 
         ldy     chn_waveidx,x
-wave_load_addr = *+1
-        lda     $FFFF,y                 ; SMC: wavetable address patched in init
+        lda     global_wavetable,y      ; Global wavetable (shared across all songs)
         sta     chn_waveform,x
         iny
         tya
@@ -1356,3 +1353,6 @@ freqtable_hi:
         .byte   $89,$91,$99,$a3,$ac,$b7,$c1,$cd,$d9,$e6,$f4,$ff
         ; Notes 96-103: 96-102 unused (read $00), 103 = remapped from 127
         .byte   $00,$00,$00,$00,$00,$00,$00,$30
+
+; Global wavetable (shared across all songs)
+.include "../generated/wavetable.inc"

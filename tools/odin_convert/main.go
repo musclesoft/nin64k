@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -539,6 +540,245 @@ func analyzeRowDictCombinations(dict []byte) [8]int {
 	return counts
 }
 
+// WaveSnippet represents a wavetable snippet used by an instrument
+type WaveSnippet struct {
+	Content    []byte
+	LoopOffset int // offset of loop point within content
+}
+
+// GlobalWaveTable holds the combined wavetable and mapping info
+type GlobalWaveTable struct {
+	Data     []byte                      // the combined wavetable
+	Snippets map[string]int              // snippet content -> start offset in Data
+	Remap    map[int]map[int][3]int      // [songNum][instNum] -> [newStart, newEnd, newLoop]
+}
+
+// collectAllWaveSnippets collects wavetable snippets from all songs
+func collectAllWaveSnippets(songData [][]byte) map[string]WaveSnippet {
+	snippets := make(map[string]WaveSnippet)
+
+	for _, raw := range songData {
+		if raw == nil {
+			continue
+		}
+		baseAddr := int(raw[2]) << 8
+		instADAddr := readWord(raw, codeInstAD)
+		instSRAddr := readWord(raw, codeInstSR)
+		numInst := int(instSRAddr) - int(instADAddr)
+		srcInstOff := int(instADAddr) - baseAddr
+		waveOff := int(readWord(raw, codeWavetable)) - baseAddr
+
+		for inst := 0; inst < numInst; inst++ {
+			start := int(raw[srcInstOff+2*numInst+inst])
+			end := int(raw[srcInstOff+3*numInst+inst])
+			loop := int(raw[srcInstOff+4*numInst+inst])
+
+			if start >= 255 || end >= 255 || end < start {
+				continue
+			}
+
+			minIdx, maxIdx := start, end
+			if loop < minIdx {
+				minIdx = loop
+			}
+			if loop > maxIdx {
+				maxIdx = loop
+			}
+
+			off := waveOff + minIdx
+			length := maxIdx - minIdx + 1
+			if off >= 0 && off+length <= len(raw) {
+				content := raw[off : off+length]
+				key := string(content)
+				if _, exists := snippets[key]; !exists {
+					snippets[key] = WaveSnippet{
+						Content:    append([]byte{}, content...),
+						LoopOffset: loop - minIdx,
+					}
+				}
+			}
+		}
+	}
+	return snippets
+}
+
+// buildGlobalWaveTable builds a combined wavetable using greedy superstring algorithm
+func buildGlobalWaveTable(songData [][]byte) *GlobalWaveTable {
+	snippets := collectAllWaveSnippets(songData)
+
+	// Collect unique contents (sorted for determinism)
+	var contents [][]byte
+	for _, snip := range snippets {
+		contents = append(contents, snip.Content)
+	}
+	// Sort by length descending, then by content
+	sort.Slice(contents, func(i, j int) bool {
+		if len(contents[i]) != len(contents[j]) {
+			return len(contents[i]) > len(contents[j])
+		}
+		return string(contents[i]) < string(contents[j])
+	})
+
+	// Remove substrings (contents fully contained in other contents)
+	var filtered [][]byte
+	for i, s := range contents {
+		isSubstring := false
+		for j, t := range contents {
+			if i != j && len(t) >= len(s) && bytes.Contains(t, s) {
+				isSubstring = true
+				break
+			}
+		}
+		if !isSubstring {
+			filtered = append(filtered, s)
+		}
+	}
+	// Sort filtered for determinism
+	sort.Slice(filtered, func(i, j int) bool {
+		if len(filtered[i]) != len(filtered[j]) {
+			return len(filtered[i]) > len(filtered[j])
+		}
+		return string(filtered[i]) < string(filtered[j])
+	})
+
+	// Greedy superstring: repeatedly merge pair with maximum overlap
+	current := filtered
+	for len(current) > 1 {
+		bestI, bestJ := 0, 1
+		bestOverlap := 0
+		var bestMerged []byte
+
+		for i := 0; i < len(current); i++ {
+			for j := 0; j < len(current); j++ {
+				if i == j {
+					continue
+				}
+				// Find max overlap where suffix of current[i] == prefix of current[j]
+				maxOv := len(current[i])
+				if len(current[j]) < maxOv {
+					maxOv = len(current[j])
+				}
+				for ov := maxOv; ov > 0; ov-- {
+					if bytes.Equal(current[i][len(current[i])-ov:], current[j][:ov]) {
+						if ov > bestOverlap {
+							bestOverlap = ov
+							bestI, bestJ = i, j
+							bestMerged = append(append([]byte{}, current[i]...), current[j][ov:]...)
+						}
+						break
+					}
+				}
+			}
+		}
+
+		if bestMerged == nil {
+			// No overlap, concatenate first two
+			bestMerged = append(append([]byte{}, current[0]...), current[1]...)
+			bestI, bestJ = 0, 1
+		}
+
+		var next [][]byte
+		for k := range current {
+			if k != bestI && k != bestJ {
+				next = append(next, current[k])
+			}
+		}
+		next = append(next, bestMerged)
+		current = next
+	}
+
+	combined := current[0]
+
+	// Build snippet offset map
+	snippetOffsets := make(map[string]int)
+	for content := range snippets {
+		idx := bytes.Index(combined, []byte(content))
+		snippetOffsets[content] = idx
+	}
+
+	// Build per-song, per-instrument remap
+	remap := make(map[int]map[int][3]int)
+	for songNum := 1; songNum <= 9; songNum++ {
+		raw := songData[songNum-1]
+		if raw == nil {
+			continue
+		}
+		remap[songNum] = make(map[int][3]int)
+
+		baseAddr := int(raw[2]) << 8
+		instADAddr := readWord(raw, codeInstAD)
+		instSRAddr := readWord(raw, codeInstSR)
+		numInst := int(instSRAddr) - int(instADAddr)
+		srcInstOff := int(instADAddr) - baseAddr
+		waveOff := int(readWord(raw, codeWavetable)) - baseAddr
+
+		for inst := 0; inst < numInst; inst++ {
+			start := int(raw[srcInstOff+2*numInst+inst])
+			end := int(raw[srcInstOff+3*numInst+inst])
+			loop := int(raw[srcInstOff+4*numInst+inst])
+
+			if start >= 255 || end >= 255 || end < start {
+				remap[songNum][inst] = [3]int{255, 255, 255}
+				continue
+			}
+
+			minIdx, maxIdx := start, end
+			if loop < minIdx {
+				minIdx = loop
+			}
+			if loop > maxIdx {
+				maxIdx = loop
+			}
+
+			off := waveOff + minIdx
+			length := maxIdx - minIdx + 1
+			if off >= 0 && off+length <= len(raw) {
+				content := string(raw[off : off+length])
+				globalOffset := snippetOffsets[content]
+
+				// Remap indices: new = global_offset + (old - min)
+				newStart := globalOffset + (start - minIdx)
+				newEnd := globalOffset + (end - minIdx)
+				newLoop := globalOffset + (loop - minIdx)
+				remap[songNum][inst] = [3]int{newStart, newEnd, newLoop}
+			} else {
+				remap[songNum][inst] = [3]int{255, 255, 255}
+			}
+		}
+	}
+
+	return &GlobalWaveTable{
+		Data:     combined,
+		Snippets: snippetOffsets,
+		Remap:    remap,
+	}
+}
+
+// writeGlobalWaveTable writes the wavetable as an assembly include file
+func writeGlobalWaveTable(gwt *GlobalWaveTable, path string) error {
+	var buf bytes.Buffer
+	buf.WriteString("; Auto-generated global wavetable - DO NOT EDIT\n")
+	buf.WriteString(fmt.Sprintf("; %d bytes\n\n", len(gwt.Data)))
+	buf.WriteString("global_wavetable:\n")
+
+	for i := 0; i < len(gwt.Data); i += 16 {
+		buf.WriteString("        .byte   ")
+		end := i + 16
+		if end > len(gwt.Data) {
+			end = len(gwt.Data)
+		}
+		for j := i; j < end; j++ {
+			if j > i {
+				buf.WriteString(", ")
+			}
+			buf.WriteString(fmt.Sprintf("$%02X", gwt.Data[j]))
+		}
+		buf.WriteString("\n")
+	}
+
+	return os.WriteFile(path, buf.Bytes(), 0644)
+}
+
 // getPatternBreakInfo returns the first row with a break (0x0D) or position jump (0x0B) effect,
 // and the jump target if it's a position jump (-1 otherwise). Uses original (pre-remap) effect numbers.
 func getPatternBreakInfo(pat []byte) (breakRow int, jumpTarget int) {
@@ -678,13 +918,12 @@ type ConversionStats struct {
 
 // PrevSongTables holds table data from previous song for cross-song deduplication
 type PrevSongTables struct {
-	Wave    []byte
 	Arp     []byte
 	Filter  []byte
 	RowDict []byte
 }
 
-func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte) ([]byte, ConversionStats) {
+func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte, globalWave *GlobalWaveTable) ([]byte, ConversionStats) {
 	var stats ConversionStats
 	// Detect base address from entry point JMP (offset 0: 4c xx yy -> base is $yy00)
 	baseAddr := int(raw[2]) << 8
@@ -887,76 +1126,25 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	for key, insts := range waveGroups {
 		waveSorted = append(waveSorted, sortedGroup{key, insts})
 	}
-	// Sort: first by whether content exists in prev song (shared first), then by size desc
+	// Sort by length desc, then by content (wave is now global, no cross-song sharing)
 	for i := 0; i < len(waveSorted)-1; i++ {
 		for j := i + 1; j < len(waveSorted); j++ {
-			// Check if content exists in previous song's table
-			iInPrev := prevTables != nil && len(prevTables.Wave) > 0 && findInTable(prevTables.Wave, []byte(waveSorted[i].key.content)) >= 0
-			jInPrev := prevTables != nil && len(prevTables.Wave) > 0 && findInTable(prevTables.Wave, []byte(waveSorted[j].key.content)) >= 0
-			// Sort: shared content first, then by length desc, then by content
-			if jInPrev && !iInPrev {
+			li, lj := len(waveSorted[i].key.content), len(waveSorted[j].key.content)
+			if lj > li || (lj == li && waveSorted[j].key.content < waveSorted[i].key.content) {
 				waveSorted[i], waveSorted[j] = waveSorted[j], waveSorted[i]
-			} else if iInPrev == jInPrev {
-				li, lj := len(waveSorted[i].key.content), len(waveSorted[j].key.content)
-				if lj > li || (lj == li && waveSorted[j].key.content < waveSorted[i].key.content) {
-					waveSorted[i], waveSorted[j] = waveSorted[j], waveSorted[i]
-				}
 			}
 		}
 	}
 
-	// Build new table and compute remaps
-	// If prevTables provided, try to place content at same offsets as previous song
+	// Build wave remap (only used as fallback if globalWave is nil)
 	var newWaveTable []byte
-	wavePlaced := make([]bool, 51) // Track which positions are occupied
 	waveRemap := make([]int, numInst)
 	for _, sg := range waveSorted {
 		content := []byte(sg.key.content)
-		pos := -1
-		// First, check if this content exists in previous song's table
-		if prevTables != nil && len(prevTables.Wave) > 0 {
-			prevPos := findInTable(prevTables.Wave, content)
-			if prevPos >= 0 {
-				// Content exists in prev song - try to place at same offset
-				endPos := prevPos + len(content)
-				// Only allow cross-song placement if:
-				// 1. It fits within max table size (51 bytes)
-				// 2. It doesn't create gaps (prevPos <= current table length)
-				if endPos <= 51 && prevPos <= len(newWaveTable) {
-					// Check for conflicts using placed bitmap
-					canPlace := true
-					for i := 0; i < len(content); i++ {
-						if wavePlaced[prevPos+i] && newWaveTable[prevPos+i] != content[i] {
-							canPlace = false
-							break
-						}
-					}
-					if canPlace {
-						// Extend table if needed
-						for len(newWaveTable) < endPos {
-							newWaveTable = append(newWaveTable, 0)
-						}
-						copy(newWaveTable[prevPos:], content)
-						for i := 0; i < len(content); i++ {
-							wavePlaced[prevPos+i] = true
-						}
-						pos = prevPos
-					}
-				}
-			}
-		}
-		// Fall back to normal placement if cross-song placement didn't work
+		pos := findInTable(newWaveTable, content)
 		if pos < 0 {
-			pos = findInTable(newWaveTable, content)
-			if pos < 0 {
-				pos = len(newWaveTable)
-				newWaveTable = append(newWaveTable, content...)
-			}
-			for i := 0; i < len(content); i++ {
-				if pos+i < len(wavePlaced) {
-					wavePlaced[pos+i] = true
-				}
-			}
+			pos = len(newWaveTable)
+			newWaveTable = append(newWaveTable, content...)
 		}
 		for _, inst := range sg.insts {
 			waveRemap[inst] = pos - waveFullRanges[inst].min
@@ -1208,6 +1396,9 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	}
 
 	newWaveSize := len(newWaveTable)
+	if globalWave != nil {
+		newWaveSize = 0 // Wave is global, not per-song
+	}
 	newArpSize := len(newArpTable)
 	newFilterSize := len(newFilterTable)
 	stats.NewWaveSize = newWaveSize
@@ -1236,11 +1427,10 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	trackptr1Off := 0x600
 	trackptr2Off := 0x700
 	filterOff := 0x800         // Filter at $800 (234 bytes max)
-	waveOff := 0x8EA           // Wave at $8EA (51 bytes max)
-	arpOff := 0x91D            // Arp at $91D (188 bytes max)
-	rowDictOff := 0x9D9     // Row dictionary (1236 bytes = 412 entries × 3)
-	packedPtrsOff := 0xEAD  // Packed pointers (182 bytes = 91 patterns × 2)
-	packedDataOff := 0xF63  // Packed pattern data
+	arpOff := 0x8EA            // Arp at $8EA (188 bytes max)
+	rowDictOff := 0x9A6        // Row dictionary (1236 bytes = 412 entries × 3)
+	packedPtrsOff := 0xE7A     // Packed pointers (182 bytes = 91 patterns × 2)
+	packedDataOff := 0xF30     // Packed pattern data
 
 	// Extract patterns to slice for packing (do effect/order remapping first)
 	patternData := make([][]byte, numPatterns)
@@ -1364,15 +1554,22 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 			dstIdx := newInstOff + inst*16 + param
 			if srcIdx < len(raw) {
 				val := raw[srcIdx]
-				// Remap wave indices (params 2,3,4)
+				// Remap wave indices (params 2,3,4) using global wavetable
 				if param >= 2 && param <= 4 && val < 255 {
-					newVal := int(val) + waveRemap[inst]
-					if newVal < 0 {
-						newVal = 0
-					} else if newVal > 254 {
-						newVal = 254
+					if globalWave != nil {
+						if waveIdx, ok := globalWave.Remap[songNum][inst]; ok {
+							// param 2=start, 3=end, 4=loop -> indices 0,1,2 in waveIdx
+							val = byte(waveIdx[param-2])
+						}
+					} else {
+						newVal := int(val) + waveRemap[inst]
+						if newVal < 0 {
+							newVal = 0
+						} else if newVal > 254 {
+							newVal = 254
+						}
+						val = byte(newVal)
 					}
-					val = byte(newVal)
 				}
 				// Remap arp indices (params 5,6,7)
 				if param >= 5 && param <= 7 && val < 255 {
@@ -1415,9 +1612,8 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		}
 	}
 
-	// Copy deduplicated filter table
+	// Copy deduplicated tables (wavetable is global in player)
 	copy(out[filterOff:], newFilterTable)
-	copy(out[waveOff:], newWaveTable)
 	copy(out[arpOff:], newArpTable)
 
 	// Write pattern packing data
@@ -2909,13 +3105,38 @@ func testSong(songNum int, rawData, convertedData []byte, convStats ConversionSt
 	return result{songNum: songNum, passed: match, writes: len(builtinWrites), builtinCycles: builtinCycles, newCycles: newCycles, origSize: len(rawData), newSize: len(convertedData), convStats: convStats, coverage: cpuNew.Coverage, dataCoverage: cpuNew.DataCoverage, dataBase: playerBase, dataSize: len(playerData)}
 }
 
-func main() {
-	playerData, err := os.ReadFile(projectPath("build/player.bin"))
-	if err != nil {
-		fmt.Printf("Error loading build/player.bin: %v\n", err)
-		os.Exit(1)
+// rebuildPlayer rebuilds player.bin from source after wavetable.inc is generated
+func rebuildPlayer() error {
+	// Run from tools/odin_convert directory
+	toolsDir := projectPath("tools/odin_convert")
+	buildDir := projectPath("build")
+
+	// Ensure build directory exists
+	if err := os.MkdirAll(buildDir, 0755); err != nil {
+		return fmt.Errorf("mkdir build: %w", err)
 	}
 
+	// Assemble: ca65 -o build/player.o player_standalone.asm
+	asmCmd := exec.Command("ca65", "-o", filepath.Join(buildDir, "player.o"),
+		filepath.Join(toolsDir, "player_standalone.asm"))
+	asmCmd.Dir = toolsDir
+	if out, err := asmCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ca65: %w\n%s", err, out)
+	}
+
+	// Link: ld65 -C player.cfg -o build/player.bin build/player.o
+	linkCmd := exec.Command("ld65", "-C", filepath.Join(toolsDir, "player.cfg"),
+		"-o", filepath.Join(buildDir, "player.bin"),
+		filepath.Join(buildDir, "player.o"))
+	linkCmd.Dir = toolsDir
+	if out, err := linkCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("ld65: %w\n%s", err, out)
+	}
+
+	return nil
+}
+
+func main() {
 	// First pass: analyze all songs and print statistics
 	fmt.Println("=== Song Analysis ===")
 	songData := make([][]byte, 9)
@@ -3195,6 +3416,31 @@ func main() {
 
 	fmt.Println()
 
+	// Build global wavetable from all songs
+	globalWave := buildGlobalWaveTable(songData)
+	fmt.Printf("Global wavetable: %d bytes (from %d unique snippets)\n", len(globalWave.Data), len(globalWave.Snippets))
+
+	// Write global wavetable to generated file
+	waveTablePath := projectPath("generated/wavetable.inc")
+	if err := writeGlobalWaveTable(globalWave, waveTablePath); err != nil {
+		fmt.Printf("Error writing wavetable: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Wrote global wavetable to %s\n", waveTablePath)
+
+	// Rebuild player.bin with new wavetable
+	if err := rebuildPlayer(); err != nil {
+		fmt.Printf("Error rebuilding player: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Load freshly built player
+	playerData, err := os.ReadFile(projectPath("build/player.bin"))
+	if err != nil {
+		fmt.Printf("Error loading build/player.bin: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Convert all songs with cross-song table deduplication
 	// Each song's tables are passed to the next song for dedup
 	convertedSongs := make([][]byte, 9)
@@ -3204,19 +3450,17 @@ func main() {
 		if songData[songNum-1] == nil {
 			continue
 		}
-		convertedData, stats := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap)
+		convertedData, stats := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap, globalWave)
 		convertedSongs[songNum-1] = convertedData
 		convertedStats[songNum-1] = stats
 
 		// Extract tables for next song's dedup
 		const (
 			filterOff  = 0x800
-			waveOff    = 0x8EA
-			arpOff     = 0x91D
-			rowDictOff = 0x9D9
+			arpOff     = 0x8EA
+			rowDictOff = 0x9A6
 		)
 		prevTables = &PrevSongTables{
-			Wave:    nil, // Disabled: creates suboptimal layouts that exceed 51-byte limit
 			Arp:     append([]byte{}, convertedData[arpOff:arpOff+stats.NewArpSize]...),
 			Filter:  append([]byte{}, convertedData[filterOff:filterOff+stats.NewFilterSize]...),
 			RowDict: append([]byte{}, convertedData[rowDictOff:rowDictOff+stats.PatternDictSize*3]...),
@@ -3243,13 +3487,13 @@ func main() {
 
 	// Analyze row dict combinations across all songs
 	var totalCombos [8]int
-	const rowDictOff = 0x9D9
+	const rowDictOffAnalysis = 0x9A6
 	for songNum := 1; songNum <= 9; songNum++ {
 		if convertedSongs[songNum-1] == nil {
 			continue
 		}
 		dictSize := convertedStats[songNum-1].PatternDictSize * 3
-		combos := analyzeRowDictCombinations(convertedSongs[songNum-1][rowDictOff : rowDictOff+dictSize])
+		combos := analyzeRowDictCombinations(convertedSongs[songNum-1][rowDictOffAnalysis : rowDictOffAnalysis+dictSize])
 		for i := 0; i < 8; i++ {
 			totalCombos[i] += combos[i]
 		}
@@ -3514,7 +3758,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	nopIdx := -1 // [0,0,0]
 
 	for idx := 0; idx < dictSize; idx++ {
-		dictOff := 0x9D9 + idx*3
+		dictOff := 0x9A6 + idx*3
 		note := convertedData[dictOff]
 		instEffect := convertedData[dictOff+1]
 		param := convertedData[dictOff+2]
@@ -3555,7 +3799,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	found := 0
 
 	for extIdx := 224; extIdx < dictSize; extIdx++ {
-		extOff := 0x9D9 + extIdx*3
+		extOff := 0x9A6 + extIdx*3
 		extNote := convertedData[extOff]
 		extInstEffect := convertedData[extOff+1]
 		extSig := signature{extInstEffect, convertedData[extOff+2]}
@@ -3606,7 +3850,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 			cpu.Restore(snapshot)
 
 			extMemOff := bufferBase + uint16(extOff)
-			priMemOff := bufferBase + 0x9D9 + uint16(cand.idx*3)
+			priMemOff := bufferBase + 0x9A6 + uint16(cand.idx*3)
 			cpu.Memory[extMemOff] = cpu.Memory[priMemOff]
 			cpu.Memory[extMemOff+1] = cpu.Memory[priMemOff+1]
 			cpu.Memory[extMemOff+2] = cpu.Memory[priMemOff+2]

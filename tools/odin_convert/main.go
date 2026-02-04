@@ -3044,6 +3044,68 @@ func main() {
 		if len(allEffectParams[eff]) == 0 {
 			continue
 		}
+		// For effect F, break down by sub-effect
+		if eff == 0xF {
+			// Group Fxx params by sub-effect type
+			subEffects := map[string]map[int]int{
+				"F(speed)":    make(map[int]int), // 00-7F
+				"F8(hrdrest)": make(map[int]int), // F8x -> 8x
+				"F9(filttrig)": make(map[int]int), // F9x -> 9x
+				"FB(filtmode)": make(map[int]int), // FBx -> Bx
+				"FE(filtcut)": make(map[int]int),  // FEx -> Ex
+				"FF(pulse)":   make(map[int]int),  // FFx -> Fx
+			}
+			subOrder := []string{"F(speed)", "FF(pulse)", "FE(filtcut)", "F8(hrdrest)", "F9(filttrig)", "FB(filtmode)"}
+			for p, c := range allEffectParams[eff] {
+				switch {
+				case p < 0x80:
+					subEffects["F(speed)"][p] = c
+				case p >= 0x80 && p < 0x90:
+					subEffects["F8(hrdrest)"][p&0x0F] = c
+				case p >= 0x90 && p < 0xA0:
+					subEffects["F9(filttrig)"][p&0x0F] = c
+				case p >= 0xB0 && p < 0xC0:
+					subEffects["FB(filtmode)"][p&0x0F] = c
+				case p >= 0xE0 && p < 0xF0:
+					subEffects["FE(filtcut)"][p&0x0F] = c
+				case p >= 0xF0:
+					subEffects["FF(pulse)"][p&0x0F] = c
+				}
+			}
+			for _, name := range subOrder {
+				params := subEffects[name]
+				if len(params) == 0 {
+					continue
+				}
+				type pv struct {
+					param int
+					count int
+				}
+				var pvs []pv
+				total := 0
+				for p, c := range params {
+					pvs = append(pvs, pv{p, c})
+					total += c
+				}
+				sort.Slice(pvs, func(i, j int) bool {
+					return pvs[i].count > pvs[j].count
+				})
+				fmt.Printf("  %s: %d unique values, %d total uses\n", name, len(pvs), total)
+				fmt.Printf("    ")
+				for i, pv := range pvs {
+					if i > 0 {
+						fmt.Printf(" ")
+					}
+					if i >= 10 {
+						fmt.Printf("...")
+						break
+					}
+					fmt.Printf("$%X(%d)", pv.param, pv.count)
+				}
+				fmt.Println()
+			}
+			continue
+		}
 		type pv struct {
 			param int
 			count int
@@ -3076,37 +3138,6 @@ func main() {
 		}
 	}
 
-	// Analyze Fxx sub-effect high nibbles for remapping
-	if len(allEffectParams[0xF]) > 0 {
-		highNibbleCounts := make(map[int]int)
-		for param, count := range allEffectParams[0xF] {
-			if param < 0x80 {
-				highNibbleCounts[0] += count // speed values (0-7F combined as "0")
-			} else {
-				highNibbleCounts[param>>4] += count
-			}
-		}
-		type hnc struct {
-			nibble int
-			count  int
-		}
-		var hncs []hnc
-		for n, c := range highNibbleCounts {
-			hncs = append(hncs, hnc{n, c})
-		}
-		sort.Slice(hncs, func(i, j int) bool {
-			return hncs[i].count > hncs[j].count
-		})
-		fmt.Printf("Fxx high nibble frequency:")
-		for _, h := range hncs {
-			if h.nibble == 0 {
-				fmt.Printf(" speed(%d)", h.count)
-			} else {
-				fmt.Printf(" $%X(%d)", h.nibble, h.count)
-			}
-		}
-		fmt.Println()
-	}
 	fmt.Println()
 
 	// Convert all songs with cross-song table deduplication

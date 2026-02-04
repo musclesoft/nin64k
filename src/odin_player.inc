@@ -205,10 +205,8 @@ player_play:
         lda     nextordernumber
         sta     ordernumber
         inc     nextordernumber
-        lda     firsttrackrow
-        sta     trackrow
         lda     #$00
-        sta     firsttrackrow
+        sta     trackrow
         sta     forcenewpattern
 @pattern_ok:
         lda     trackrow
@@ -313,7 +311,7 @@ player_play:
         and     #$3f
         bne     @hr_setpos
 @hr_newpat:
-        ldx     firsttrackrow
+        ldx     #0
         ldy     nextordernumber
 @hr_setpos:
         stx     hrtrackrow
@@ -886,8 +884,6 @@ effect0b:
         rts
 
 effect0d:
-        lda     chn_effectpar,x
-        sta     firsttrackrow
         lda     #$80
         sta     forcenewpattern
         rts
@@ -1394,7 +1390,6 @@ trackrow:               .byte   0
 trackrow3:              .byte   0
 hrtrackrow:             .byte   0
 decode_row:             .byte   0       ; row used for quarter calculation in decode
-firsttrackrow:          .byte   0
 ordernumber:            .byte   0
 nextordernumber:        .byte   0
 hrordernumber:          .byte   0

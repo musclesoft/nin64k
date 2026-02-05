@@ -123,9 +123,6 @@ player_init:
         ; Initialize playback state (always start at order 0)
         lda     #$80
         sta     forcenewpattern
-        lda     #0
-        sta     ordernumber
-        sta     nextordernumber
         ldy     #6
         sty     speed
         dey
@@ -210,25 +207,15 @@ player_play:
         bcc     @pf_row_ok
 @pf_newpattern:
         ; Next frame will be new pattern
-        lda     nextordernumber
-        sta     prefetch_order
+        ldx     nextordernumber
         lda     #0
         beq     @pf_store_row
 @pf_row_ok:
-        sta     prefetch_row
-        lda     ordernumber
-        sta     prefetch_order
-        lda     prefetch_row
+        ldx     ordernumber
 @pf_store_row:
+        stx     prefetch_order
         sta     prefetch_row
         sta     decode_row
-        and     #$0f
-        sta     trackrow3
-        asl     a
-        adc     trackrow3
-        sta     trackrow3
-        ; Prefetch transpose and decode for all 3 channels
-        ldx     prefetch_order
         ldy     #0
         jsr     get_transpose_order
         sta     prefetch_transpose+0
@@ -267,12 +254,7 @@ player_play:
         sta     forcenewpattern
 @pattern_ok:
         lda     trackrow
-        sta     decode_row              ; set decode_row for get_trackptr_order
-        and     #$0f            ; row_in_quarter = trackrow & 15
-        sta     trackrow3       ; temp storage
-        asl     a               ; A = row_in_quarter * 2
-        adc     trackrow3       ; A = row_in_quarter * 3
-        sta     trackrow3
+        sta     decode_row
         ; Check if prefetch is valid
         lda     prefetch_done
         bpl     @no_prefetch_avail
@@ -314,10 +296,6 @@ player_play:
         ldy     #2
         jsr     get_trackptr_order
 @use_prefetch:
-        ; fetch_channel_row reads from decode buffers (already filled)
-        ; Set trackrow3=0 (decode buffer format), set zp_trackptr per channel
-        lda     #0
-        sta     trackrow3
         ldx     #0
         lda     decode_buffer_lo,x
         sta     zp_trackptr
@@ -659,14 +637,10 @@ player_play:
 @hr_setpos:
         stx     hrtrackrow
         sty     hrordernumber
-        lda     hrtrackrow
-        sta     decode_row              ; set decode_row for HR get_trackptr_order calls
-        and     #$0f            ; row_in_quarter = hrtrackrow & 15
-        sta     trackrow3       ; temp storage
-        asl     a               ; A = row_in_quarter * 2
-        adc     trackrow3       ; A = row_in_quarter * 3
-        sta     trackrow3
+        txa
+        sta     decode_row
         lda     speedcounter
+        clc
         adc     chn_hardrestart+0
         cmp     speed
         bcc     @hr1
@@ -733,7 +707,7 @@ player_play:
 ; check_hardrestart - Check if hard restart needed for channel X
 ; ============================================================================
 check_hardrestart:
-        ldy     trackrow3
+        ldy     #0
         lda     (zp_trackptr),y
         and     #$7f
         beq     @done
@@ -941,7 +915,7 @@ calcvibrato:
 ; fetch_channel_row - Fetch row data for channel X
 ; ============================================================================
 fetch_channel_row:
-        ldy     trackrow3
+        ldy     #0
         iny
         lda     (zp_trackptr),y
         lsr     a
@@ -1028,7 +1002,7 @@ fetch_channel_row:
         sta     chn_plsdir,x
         sta     chn_vibpos,x
 @checknote:
-        ldy     trackrow3
+        ldy     #0
         lda     (zp_trackptr),y
         and     #$7f
         beq     @done
@@ -1115,7 +1089,6 @@ get_transpose_order:
 ; get_trackptr_order - Set zp_trackptr for channel Y at order X
 ; Trackptr tables at page-aligned offsets: ch0=$500, ch1=$600, ch2=$700
 ; Uses streaming row-by-row decode: decodes single row into buffer
-; Sets trackrow3 = 0 (row always at offset 0 in buffer)
 get_trackptr_order:
         ; Save channel
         sty     @channel+1          ; SMC: save channel
@@ -1190,9 +1163,6 @@ get_trackptr_order:
         sta     zp_trackptr
         lda     decode_buffer_hi,x
         sta     zp_trackptr+1
-        ; Row is always at offset 0
-        lda     #0
-        sta     trackrow3
         rts
 @pat_idx:       .byte   0
 
@@ -1406,7 +1376,6 @@ mod3counter:            .byte   0
 speed:                  .byte   0
 speedcounter:           .byte   0
 trackrow:               .byte   0
-trackrow3:              .byte   0
 hrtrackrow:             .byte   0
 decode_row:             .byte   0       ; current row for pattern decode
 ordernumber:            .byte   0

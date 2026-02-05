@@ -918,9 +918,6 @@ effect0f:
         clc
         adc     #$04                    ; param always $1, shifted = $4
         sta     chn_slidedelta_lo,x
-        bcc     @fs_nohi
-        inc     chn_slidedelta_hi,x
-@fs_nohi:
         lda     #$80
         sta     chn_slideenable,x
         rts

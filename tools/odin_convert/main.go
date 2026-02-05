@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -3440,17 +3441,6 @@ func main() {
 	effectRemap[0xD] = 0 // break -> effect 0, param 2
 	effectRemap[0xF] = 0 // F is handled via fSubRemap; fineslide -> effect 0, param 3
 
-	// Print the required effectptrs table ordering for the player
-	fmt.Printf("effectptrs table order:")
-	for _, ef := range usedEffects {
-		if ef.code < 0x10 {
-			fmt.Printf(" effect%02x", ef.code)
-		} else {
-			fmt.Printf(" %s", ef.name)
-		}
-	}
-	fmt.Println()
-
 	// Analyze cross-song pattern sharing
 	allPatterns := make(map[string][]int) // content -> list of songs
 	for songNum := 1; songNum <= 9; songNum++ {
@@ -3847,8 +3837,7 @@ func main() {
 			fmt.Println()
 		}
 
-		// Report player data coverage (data tables in player binary)
-		// Find where code ends and data begins
+		// Report player data coverage (all data after code)
 		codeEnd := len(instrStarts)
 		if codeEnd > 0 {
 			lastInstr := instrStarts[codeEnd-1]
@@ -3865,19 +3854,16 @@ func main() {
 		}
 		fmt.Printf("Data coverage: %d/%d bytes (%.0f%%)\n", dataCovered, dataEnd-dataStart, 100*float64(dataCovered)/float64(dataEnd-dataStart))
 
-		// Show uncovered bytes with values
-		fmt.Printf("Uncovered: ")
-		first := true
+		// Show uncovered data bytes
+		var uncoveredData []string
 		for off := dataStart; off < dataEnd; off++ {
 			if !mergedDataCoverage[off] {
-				if !first {
-					fmt.Printf(", ")
-				}
-				fmt.Printf("%d:$%02x", off-dataStart, playerData[off])
-				first = false
+				uncoveredData = append(uncoveredData, fmt.Sprintf("%d:$%02X", off-dataStart, playerData[off]))
 			}
 		}
-		fmt.Println()
+		if len(uncoveredData) > 0 {
+			fmt.Printf("Uncovered data: %s\n", strings.Join(uncoveredData, ", "))
+		}
 
 	} else {
 		os.Exit(1)

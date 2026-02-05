@@ -49,9 +49,10 @@ zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 ;   Note values: $00=none, $01-$60=note 0-95 (subtract 1), $61=note-off
 ;   Effect = (InstEff >> 5) | ((Note >> 4) & $08)
 ;
-; Effect mapping (1-C frequency-sorted, 0=none, B-C=position-altering):
-;   1=arpeggio  2=porta    3=Fxx      4=SR        5=waveform 6=slidedn
-;   7=AD        8=reso     9=slideup  A=vibrato   B=break    C=jump
+; Effect mapping (frequency-sorted):
+;   0=special (param: 0=nop, 1=vib off, 2=break, 3=fineslide)
+;   1=arp 2=porta 3=speed 4=hrdrest 5=filttrig 6=SR 7=wave
+;   8=pulse 9=AD A=reso B=slide C=globalvol D=filtmode E=jump
 ;
 ; Example: $00 $20 $49
 ;   Note=$00:    note = $00 & $7F = 0 (none), effect bit 3 = 0
@@ -253,29 +254,256 @@ player_play:
         ; Effect 0: special handling based on param
         ; param 0=nop, 1=vib, 2=break, 3=fineslide
         lda     chn_effectpar,x
-        beq     @noeffect              ; param 0 = no effect
-        cmp     #1
-        beq     @effect0_vib
+        bne     @effect0_dispatch
+        jmp     @noeffect              ; param 0 = no effect
+@effect0_dispatch:
         cmp     #2
-        beq     @effect0_break
-        ; param 3 = fineslide (only remaining case)
-        jsr     effect_fineslide
+        bcs     @effect0_break_or_fineslide
+        ; param 1 = vib: disable vibrato
+        lda     #0
+        sta     chn_vibdepth,x
+        sta     chn_vibspeed,x
         jmp     @noeffect
-@effect0_vib:
-        jsr     effect_vib
+@effect0_break_or_fineslide:
+        beq     @effect0_break
+        ; param 3 = fineslide
+        lda     speedcounter
+        beq     @do_fineslide
+        jmp     @noeffect
+@do_fineslide:
+        lda     chn_slidedelta_lo,x
+        clc
+        adc     #$04
+        sta     chn_slidedelta_lo,x
+        lda     #$80
+        sta     chn_slideenable,x
         jmp     @noeffect
 @effect0_break:
-        jsr     effect_break
+        ; param 2 = break
+        lda     #$80
+        sta     forcenewpattern
         jmp     @noeffect
 @haseffect:
-        asl     a
+        ; Binary search dispatch for effects 1-E (14 effects), all inlined
+        cmp     #8
+        bcc     @fx_1_to_7
+        jmp     @fx_8_to_e
+@fx_1_to_7:
+        cmp     #4
+        bcc     @fx_1_to_3
+        ; Effects 4-7 (fall through to save JMP)
+        cmp     #6
+        bcs     @fx_6_7
+        cmp     #5
+        bcs     @fx_5
+        ; Effect 4 = hard restart (inlined)
+        lda     speedcounter
+        bne     @fx_exit2
+        lda     chn_effectpar,x
+        sta     chn_hardrestart,x
+@fx_exit2:
+        jmp     @noeffect
+@fx_5:
+        ; Effect 5 = filter trigger (inlined)
+        lda     speedcounter
+        bne     @fx_exit2
+        lda     chn_effectpar,x
+        beq     @fx_exit2
+        asl
+        asl
+        asl
+        asl
+        sta     zp_ptr
+        lda     #0
+        rol
+        adc     zp_song_base+1
+        sta     zp_ptr+1
+        ldy     #INST_FILTSTART
+        lda     (zp_ptr),y
+        sta     filter_idx
+        ldy     #INST_FILTEND
+        lda     (zp_ptr),y
+        sta     filter_end
+        ldy     #INST_FILTLOOP
+        lda     (zp_ptr),y
+        sta     filter_loop
+        jmp     @noeffect
+@fx_6_7:
+        cmp     #7
+        bcs     @fx_7
+        ; Effect 6 = set SR (inlined)
+        ldy     chn_effectpar,x
+        lda     sr_remap,y
+        sta     chn_sr,x
+        jmp     @noeffect
+@fx_7:
+        ; Effect 7 = set waveform (inlined)
+        ldy     chn_effectpar,x
+        lda     wave_remap,y
+        sta     chn_waveform,x
+        jmp     @noeffect
+@fx_1_to_3:
+        ; Effects 1-3 (most common: arp, porta, speed)
+        cmp     #2
+        bcs     @fx_2_3
+        ; Effect 1 = arpeggio (inlined)
+        ldy     mod3counter
+        beq     @arp_val2
+        dey
+        bne     @arp_val0
+        lda     chn_effectpar,x
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        clc
+        adc     chn_note,x
+        bcc     @arp_done
+@arp_val0:
+        lda     chn_note,x
+        bcc     @arp_done
+@arp_val2:
+        lda     chn_effectpar,x
+        and     #$0f
+        adc     chn_note,x
+@arp_done:
+        adc     chn_transpose,x
+        jsr     set_notefreq_and_freqlo
+        jmp     @noeffect
+@fx_2_3:
+        beq     @fx_2
+        ; Effect 3 = speed (inlined)
+        lda     speedcounter
+        bne     @fx_exit1
+        lda     chn_effectpar,x
+        sta     speed
+@fx_exit1:
+        jmp     @noeffect
+@fx_2:
+        ; Effect 2 = tone portamento (inlined)
+        lda     chn_effectpar,x
         tay
-        lda     effectptrs-2,y
-        sta     @effectjsr+1
-        lda     effectptrs-1,y
-        sta     @effectjsr+2
-@effectjsr:
-        jsr     $ffff
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     zp_ptr
+        tya
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     zp_ptr+1
+        jsr     freqcmp
+        bcc     @porta_up
+        lda     chn_freqlo,x
+        sbc     zp_ptr
+        sta     chn_freqlo,x
+        lda     chn_freqhi,x
+        sbc     zp_ptr+1
+        sta     chn_freqhi,x
+        jsr     freqcmp
+        bcs     @fx_exit1
+        bcc     @porta_snap
+@porta_up:
+        lda     chn_freqlo,x
+        adc     zp_ptr
+        sta     chn_freqlo,x
+        lda     chn_freqhi,x
+        adc     zp_ptr+1
+        sta     chn_freqhi,x
+        jsr     freqcmp
+        bcc     @fx_exit1
+@porta_snap:
+        lda     chn_notefreqlo,x
+        sta     chn_freqlo,x
+        lda     chn_notefreqhi,x
+        sta     chn_freqhi,x
+        jmp     @noeffect
+@fx_8_to_e:
+        cmp     #$c
+        bcs     @fx_c_to_e
+        cmp     #$a
+        bcs     @fx_a_b
+        cmp     #9
+        bcs     @fx_9
+        ; Effect 8 = pulse width (inlined)
+        lda     chn_effectpar,x
+        beq     @pulse_set
+        lda     #$80
+@pulse_set:
+        jsr     set_pulse_width
+        jmp     @noeffect
+@fx_9:
+        ; Effect 9 = set AD (inlined)
+        ldy     chn_effectpar,x
+        lda     ad_remap,y
+        sta     chn_ad,x
+        jmp     @noeffect
+@fx_a_b:
+        cmp     #$b
+        bcs     @fx_b
+        ; Effect A = filter resonance (inlined)
+        ldy     chn_effectpar,x
+        lda     reso_remap,y
+        sta     filter_resonance
+        jmp     @noeffect
+@fx_b:
+        ; Effect B = slide (inlined)
+        lda     #$80
+        sta     chn_slideenable,x
+        lda     #$20
+        sta     zp_ptr
+        lda     #$00
+        sta     zp_ptr+1
+        ldy     chn_effectpar,x
+        beq     @slide_up
+        lda     chn_slidedelta_lo,x
+        sec
+        sbc     zp_ptr
+        sta     chn_slidedelta_lo,x
+        lda     chn_slidedelta_hi,x
+        sbc     zp_ptr+1
+        sta     chn_slidedelta_hi,x
+        jmp     @noeffect
+@slide_up:
+        lda     chn_slidedelta_lo,x
+        clc
+        adc     zp_ptr
+        sta     chn_slidedelta_lo,x
+        lda     chn_slidedelta_hi,x
+        adc     zp_ptr+1
+        sta     chn_slidedelta_hi,x
+        jmp     @noeffect
+@fx_c_to_e:
+        cmp     #$e
+        bcs     @fx_e
+        cmp     #$d
+        bcs     @fx_d
+        ; Effect C = global volume (inlined)
+        lda     speedcounter
+        bne     @fx_exit3
+        lda     chn_effectpar,x
+        sta     globalvolume
+@fx_exit3:
+        jmp     @noeffect
+@fx_d:
+        ; Effect D = filter mode (inlined)
+        lda     speedcounter
+        bne     @fx_exit3
+        lda     chn_effectpar,x
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     filter_mode
+        jmp     @noeffect
+@fx_e:
+        ; Effect E = position jump (inlined)
+        lda     chn_effectpar,x
+        sta     nextordernumber
+        lda     #$80
+        sta     forcenewpattern
 @noeffect:
         lda     chn_slideenable,x
         beq     @noslide
@@ -303,7 +531,9 @@ player_play:
 @nextchn:
         inx
         cpx     #$03
-        bne     @chnloop
+        beq     @chnloop_done
+        jmp     @chnloop
+@chnloop_done:
 
         ldy     filter_idx
         beq     @filtdone
@@ -584,7 +814,7 @@ calcvibrato:
 @haveval:
         ora     chn_vibdepth,x
         tay
-        lda     vibrato_table,y
+        lda     vibrato_table-16,y      ; -16 because depth 0 row is deleted (never used)
         asl     a
         sta     zp_ptr
         lda     #$00
@@ -757,246 +987,6 @@ set_pulse_width:
         lsr     a
         lsr     a
         sta     chn_plswidthhi,x
-        rts
-
-; ============================================================================
-; Effects (frequency-sorted: A,3,F,8,9,2,7,E,1,4,D,B -> 1-C)
-; ============================================================================
-
-effect01:
-        lda     #$80
-        sta     chn_slideenable,x
-        lda     #$20
-        sta     zp_ptr
-        lda     #$00
-        sta     zp_ptr+1
-        ldy     chn_effectpar,x
-        beq     @up
-        lda     chn_slidedelta_lo,x
-        sec
-        sbc     zp_ptr
-        sta     chn_slidedelta_lo,x
-        lda     chn_slidedelta_hi,x
-        sbc     zp_ptr+1
-        sta     chn_slidedelta_hi,x
-        rts
-@up:
-        lda     chn_slidedelta_lo,x
-        clc
-        adc     zp_ptr
-        sta     chn_slidedelta_lo,x
-        lda     chn_slidedelta_hi,x
-        adc     zp_ptr+1
-        sta     chn_slidedelta_hi,x
-        rts
-
-effect02:
-        lda     chn_effectpar,x
-        beq     @set
-        lda     #$80
-@set:
-        jmp     set_pulse_width
-
-effect03:
-        lda     chn_effectpar,x
-        tay
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     zp_ptr
-        tya
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        sta     zp_ptr+1
-        jsr     freqcmp
-        bcc     @up
-        lda     chn_freqlo,x
-        sbc     zp_ptr
-        sta     chn_freqlo,x
-        lda     chn_freqhi,x
-        sbc     zp_ptr+1
-        sta     chn_freqhi,x
-        jsr     freqcmp
-        bcs     @done
-        bcc     @snap
-@up:
-        lda     chn_freqlo,x
-        adc     zp_ptr
-        sta     chn_freqlo,x
-        lda     chn_freqhi,x
-        adc     zp_ptr+1
-        sta     chn_freqhi,x
-        jsr     freqcmp
-        bcc     @done
-@snap:
-        lda     chn_notefreqlo,x
-        sta     chn_freqlo,x
-        lda     chn_notefreqhi,x
-        sta     chn_freqhi,x
-@done:
-        rts
-
-; Effect 0 sub-handlers (param 1=vib, 2=break, 3=fineslide)
-effect_vib:
-        lda     #0              ; disable vibrato
-        sta     chn_vibdepth,x
-        sta     chn_vibspeed,x
-        rts
-
-effect_break:
-        lda     #$80
-        sta     forcenewpattern
-        rts
-
-effect_fineslide:
-        lda     speedcounter
-        bne     @done
-        lda     chn_slidedelta_lo,x
-        clc
-        adc     #$04                    ; param always $1, shifted = $4
-        sta     chn_slidedelta_lo,x
-        lda     #$80
-        sta     chn_slideenable,x
-@done:
-        rts
-
-; Legacy effect04 handler (kept for reference, no longer used)
-effect04:
-        lda     #0              ; param always $00, just disable vibrato
-        sta     chn_vibdepth,x
-        sta     chn_vibspeed,x
-        rts
-
-effect07:
-        ldy     chn_effectpar,x
-        lda     ad_remap,y
-        sta     chn_ad,x
-        rts
-
-effect08:
-        ldy     chn_effectpar,x
-        lda     sr_remap,y
-        sta     chn_sr,x
-        rts
-
-effect09:
-        ldy     chn_effectpar,x
-        lda     wave_remap,y
-        sta     chn_waveform,x
-        rts
-
-effect0a:
-        ldy     mod3counter
-        beq     @val2
-        dey
-        bne     @val0
-        lda     chn_effectpar,x
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        clc
-        adc     chn_note,x
-        bcc     @done
-@val0:
-        lda     chn_note,x
-        bcc     @done
-@val2:
-        lda     chn_effectpar,x
-        and     #$0f
-        adc     chn_note,x
-@done:
-        adc     chn_transpose,x
-        jmp     set_notefreq_and_freqlo
-
-effect0b:
-        lda     chn_effectpar,x
-        sta     nextordernumber
-        lda     #$80
-        sta     forcenewpattern
-        rts
-
-effect0d:
-        lda     #$80
-        sta     forcenewpattern
-        rts
-
-effect0e:
-        ldy     chn_effectpar,x
-        lda     reso_remap,y
-        sta     filter_resonance
-        rts
-
-; Split F effects - now separate handlers instead of combined effect0f
-; Effect 3: speed (param $00-$7F direct speed value)
-effect_speed:
-        lda     speedcounter
-        bne     @done
-        lda     chn_effectpar,x
-        sta     speed
-@done:
-        rts
-
-; Effect 4: hard restart (param = hard restart value)
-effect_hrdrest:
-        lda     speedcounter
-        bne     @done
-        lda     chn_effectpar,x
-        sta     chn_hardrestart,x
-@done:
-        rts
-
-; Effect 5: filter trigger (param = instrument number for filter)
-effect_filttrig:
-        lda     speedcounter
-        bne     @done
-        lda     chn_effectpar,x
-        beq     @done           ; param 0 = no filter trigger
-        ; Setup zp_ptr = song_base + inst*16 (interleaved layout)
-        asl
-        asl
-        asl
-        asl                     ; A = inst*16 low byte
-        sta     zp_ptr
-        lda     #0
-        rol                     ; Get carry from shift
-        adc     zp_song_base+1
-        sta     zp_ptr+1
-        ldy     #INST_FILTSTART
-        lda     (zp_ptr),y
-        sta     filter_idx
-        ldy     #INST_FILTEND
-        lda     (zp_ptr),y
-        sta     filter_end
-        ldy     #INST_FILTLOOP
-        lda     (zp_ptr),y
-        sta     filter_loop
-@done:
-        rts
-
-; Effect C: global volume (param = volume 0-F)
-effect_globalvol:
-        lda     speedcounter
-        bne     @done
-        lda     chn_effectpar,x
-        sta     globalvolume
-@done:
-        rts
-
-; Effect D: filter mode (param = mode 0-F -> shifted to high nibble)
-effect_filtmode:
-        lda     speedcounter
-        bne     @done
-        lda     chn_effectpar,x
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     filter_mode
-@done:
         rts
 
 freqcmp:
@@ -1241,32 +1231,16 @@ filter_load:
 ; Tables
 ; ============================================================================
 
-; Effect table - frequency-sorted, indexed from 1
-; Effect 0 is special: param 0=nop, 1=vib, 2=break, 3=fineslide
-; Effects 1-E use this table:
-effectptrs:
-        .word   effect0a         ; 1 = arpeggio (old A) - 3483 uses
-        .word   effect03         ; 2 = tone portamento (old 3) - 3037 uses
-        .word   effect_speed     ; 3 = speed (old F/$00-$7F) - 1265 uses
-        .word   effect_hrdrest   ; 4 = hard restart (old F/$Fx) - 927 uses
-        .word   effect_filttrig  ; 5 = filter trigger (old F/$Ex) - 722 uses
-        .word   effect08         ; 6 = set SR (old 8) - 446 uses
-        .word   effect09         ; 7 = set waveform (old 9) - 387 uses
-        .word   effect02         ; 8 = pulse width (old 2) - 312 uses
-        .word   effect07         ; 9 = set AD (old 7) - 219 uses
-        .word   effect0e         ; A = filter resonance (old E) - 109 uses
-        .word   effect01         ; B = slide (old 1) - 96 uses
-        .word   effect_globalvol ; C = global volume (old F/$8x) - 66 uses
-        .word   effect_filtmode  ; D = filter mode (old F/$9x) - 40 uses
-        .word   effect0b         ; E = position jump (old B) - 4 uses
+; Effect dispatch uses binary search instead of jump table (see @haseffect)
+; Effect 0: param 0=nop, 1=vib, 2=break, 3=fineslide
+; Effects 1-E: arp, porta, speed, hrdrest, filttrig, SR, wave, pulse, AD, reso, slide, globalvol, filtmode, jump
 
 sidregoffs:
         .byte   0, 7, 14
 
-; Vibrato table (10 rows, frequency-sorted)
+; Vibrato table (9 rows, depth 0 deleted - code skips lookup when depth=0)
 ; Frequency order: 4(22) 2(13) 3(11) 1(6) 6(2) 10(1) 5(1) 8(1) 15(1)
 vibrato_table:
-        .byte   $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00  ; depth 0
         .byte   $00,$06,$0c,$13,$18,$1e,$24,$29,$2d,$31,$35,$38,$3b,$3d,$3f,$40  ; old depth 4 -> new 1
         .byte   $00,$03,$06,$09,$0c,$0f,$12,$14,$17,$19,$1b,$1c,$1e,$1f,$1f,$20  ; old depth 2 -> new 2
         .byte   $00,$05,$09,$0e,$12,$17,$1b,$1e,$22,$25,$28,$2a,$2c,$2e,$2f,$30  ; old depth 3 -> new 3
@@ -1337,7 +1311,7 @@ speedcounter:           .byte   0
 trackrow:               .byte   0
 trackrow3:              .byte   0
 hrtrackrow:             .byte   0
-decode_row:             .byte   0       ; row used for quarter calculation in decode
+decode_row:             .byte   0       ; current row for pattern decode
 ordernumber:            .byte   0
 nextordernumber:        .byte   0
 hrordernumber:          .byte   0

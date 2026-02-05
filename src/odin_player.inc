@@ -215,7 +215,7 @@ player_play:
         bne     @no_prefetch
         jmp     @do_prefetch
 @no_prefetch:
-        jmp     @allframes
+        jmp     pp_allframes
 @do_prefetch:
         ; Prefetch next row's data
         ; Calculate what next row/order will be
@@ -256,7 +256,7 @@ player_play:
         jsr     get_trackptr_order
         lda     #$80
         sta     prefetch_done
-        jmp     @allframes
+        jmp     pp_allframes
 @pattern_update:
         lda     #$00
         sta     speedcounter
@@ -336,15 +336,127 @@ player_play:
         sta     zp_trackptr+1
         jsr     fetch_channel_row
 
-@allframes:
+pp_allframes:
         ldx     #$00
-@chnloop:
+pp_chnloop:
         lda     #$00
         sta     chn_vibdepth,x
         lda     chn_inst,x
-        beq     @noinst
-        jsr     process_instrument
-@noinst:
+        bne     pi_hasinst
+        jmp     pi_noinst
+pi_hasinst:
+        ; Inline process_instrument
+        lda     chn_inst_ptr_lo,x
+        sta     zp_ptr
+        lda     chn_inst_ptr_hi,x
+        sta     zp_ptr+1
+        ldy     chn_waveidx,x
+        lda     global_wavetable,y
+        sta     chn_waveform,x
+        iny
+        tya
+        pha
+        ldy     #INST_WAVEEND
+        lda     (zp_ptr),y
+        sta     pi_waveend+1
+        pla
+pi_waveend:
+        cmp     #$00
+        bcc     pi_waveset
+        beq     pi_waveset
+        ldy     #INST_WAVELOOP
+        lda     (zp_ptr),y
+pi_waveset:
+        sta     chn_waveidx,x
+        lda     chn_effect,x
+        cmp     #$02
+        beq     pi_skiparp
+        ldy     chn_arpidx,x
+arp_load_addr = *+1
+        lda     $FFFF,y
+        bmi     pi_arpabs
+        clc
+        adc     chn_note,x
+        adc     chn_transpose,x
+pi_arpabs:
+        and     #$7f
+        pha
+        ldy     chn_arpidx,x
+        iny
+        tya
+        pha
+        ldy     #INST_ARPEND
+        lda     (zp_ptr),y
+        sta     pi_arpend+1
+        pla
+pi_arpend:
+        cmp     #$00
+        bcc     pi_arpset
+        beq     pi_arpset
+        ldy     #INST_ARPLOOP
+        lda     (zp_ptr),y
+pi_arpset:
+        sta     chn_arpidx,x
+        pla
+        tay
+        lda     freqtable_lo,y
+        sta     chn_notefreqlo,x
+        sta     chn_freqlo,x
+        lda     freqtable_hi,y
+        sta     chn_notefreqhi,x
+        sta     chn_freqhi,x
+pi_skiparp:
+        lda     chn_vibdelay,x
+        bne     pi_vibdelayed
+        ldy     #INST_VIBDEPSP
+        lda     (zp_ptr),y
+        tay
+        and     #$f0
+        sta     chn_vibdepth,x
+        beq     pi_pulse
+        tya
+        and     #$0f
+        sta     chn_vibspeed,x
+        jmp     pi_pulse
+pi_vibdelayed:
+        dec     chn_vibdelay,x
+pi_pulse:
+        lda     chn_plsspeed,x
+        beq     pi_noinst
+        lda     chn_plsdir,x
+        beq     pi_pulseup
+        lda     chn_plswidthlo,x
+        sec
+        sbc     chn_plsspeed,x
+        sta     chn_plswidthlo,x
+        lda     chn_plswidthhi,x
+        sbc     #$00
+        cmp     chn_plslimitdown,x
+        bpl     pi_pulsestore
+        lda     #$00
+        sta     chn_plsdir,x
+        sta     chn_plswidthlo,x
+        lda     chn_plslimitdown,x
+pi_pulsestore:
+        sta     chn_plswidthhi,x
+        jmp     pi_noinst
+pi_pulseup:
+        lda     chn_plswidthlo,x
+        clc
+        adc     chn_plsspeed,x
+        sta     chn_plswidthlo,x
+        lda     chn_plswidthhi,x
+        adc     #$00
+        cmp     chn_plslimitup,x
+        bmi     pi_pulsestore
+        beq     pi_pulsestore
+        lda     #$80
+        sta     chn_plsdir,x
+        lda     #$ff
+        sta     chn_plswidthlo,x
+        lda     chn_plslimitup,x
+        jmp     pi_pulsestore
+pi_noinst:
         lda     chn_effect,x
         bne     @haseffect
         ; Effect 0: special handling based on param
@@ -666,18 +778,18 @@ player_play:
         clc
         adc     chn_vibspeed,x
         sta     chn_vibpos,x
-        jmp     @nextchn
+        jmp     pp_nextchn
 @novib:
         lda     chn_freqlo,x
         sta     chn_finfreqlo,x
         lda     chn_freqhi,x
         sta     chn_finfreqhi,x
-@nextchn:
+pp_nextchn:
         inx
         cpx     #$03
-        beq     @chnloop_done
-        jmp     @chnloop
-@chnloop_done:
+        beq     pp_chnloop_done
+        jmp     pp_chnloop
+pp_chnloop_done:
 
         ldy     filter_idx
         beq     filtdone
@@ -798,126 +910,6 @@ check_hardrestart:
         sta     chn_sr,x
 @done:
         rts
-
-; ============================================================================
-; process_instrument - Wavetable, arpeggio, vibrato, pulse
-; ============================================================================
-process_instrument:
-        ; Load cached inst pointer
-        lda     chn_inst_ptr_lo,x
-        sta     zp_ptr
-        lda     chn_inst_ptr_hi,x
-        sta     zp_ptr+1
-
-        ldy     chn_waveidx,x
-        lda     global_wavetable,y      ; Global wavetable (shared across all songs)
-        sta     chn_waveform,x
-        iny
-        tya
-        pha                             ; Save new waveidx
-        ldy     #INST_WAVEEND
-        lda     (zp_ptr),y              ; Inline inst access
-        sta     pi_waveend+1
-        pla                             ; Restore new waveidx
-pi_waveend:
-        cmp     #$00
-        bcc     pi_waveset
-        beq     pi_waveset
-        ldy     #INST_WAVELOOP
-        lda     (zp_ptr),y              ; Inline inst access
-pi_waveset:
-        sta     chn_waveidx,x
-
-        lda     chn_effect,x
-        cmp     #$02              ; tone portamento (old effect 3 -> new effect 2)
-        beq     pi_skiparp
-        ldy     chn_arpidx,x
-arp_load_addr = *+1
-        lda     $FFFF,y                 ; SMC: arptable address patched in init
-        bmi     pi_arpabs
-        clc
-        adc     chn_note,x
-        adc     chn_transpose,x
-pi_arpabs:
-        and     #$7f
-        pha                             ; Save note value on stack
-        ldy     chn_arpidx,x
-        iny
-        tya
-        pha                             ; Save new arpidx
-        ldy     #INST_ARPEND
-        lda     (zp_ptr),y              ; Inline inst access
-        sta     pi_arpend+1
-        pla                             ; Restore new arpidx
-pi_arpend:
-        cmp     #$00
-        bcc     pi_arpset
-        beq     pi_arpset
-        ldy     #INST_ARPLOOP
-        lda     (zp_ptr),y              ; Inline inst access
-pi_arpset:
-        sta     chn_arpidx,x
-        pla                             ; Restore note value
-        tay
-        lda     freqtable_lo,y
-        sta     chn_notefreqlo,x
-        sta     chn_freqlo,x
-        lda     freqtable_hi,y
-        sta     chn_notefreqhi,x
-        sta     chn_freqhi,x
-pi_skiparp:
-
-        lda     chn_vibdelay,x
-        bne     pi_vibdelayed
-        ldy     #INST_VIBDEPSP
-        lda     (zp_ptr),y              ; Inline inst access
-        tay
-        and     #$f0
-        sta     chn_vibdepth,x
-        beq     pi_pulse
-        tya
-        and     #$0f
-        sta     chn_vibspeed,x
-        jmp     pi_pulse
-pi_vibdelayed:
-        dec     chn_vibdelay,x
-pi_pulse:
-        lda     chn_plsspeed,x
-        beq     pi_pulsedone
-        lda     chn_plsdir,x
-        beq     pi_pulseup
-        lda     chn_plswidthlo,x
-        sec
-        sbc     chn_plsspeed,x
-        sta     chn_plswidthlo,x
-        lda     chn_plswidthhi,x
-        sbc     #$00
-        cmp     chn_plslimitdown,x
-        bpl     pi_pulsestore
-        lda     #$00
-        sta     chn_plsdir,x
-        sta     chn_plswidthlo,x
-        lda     chn_plslimitdown,x
-pi_pulsestore:
-        sta     chn_plswidthhi,x
-pi_pulsedone:
-        rts
-pi_pulseup:
-        lda     chn_plswidthlo,x
-        clc
-        adc     chn_plsspeed,x
-        sta     chn_plswidthlo,x
-        lda     chn_plswidthhi,x
-        adc     #$00
-        cmp     chn_plslimitup,x
-        bmi     pi_pulsestore
-        beq     pi_pulsestore
-        lda     #$80
-        sta     chn_plsdir,x
-        lda     #$ff
-        sta     chn_plswidthlo,x
-        lda     chn_plslimitup,x
-        jmp     pi_pulsestore
 
 ; ============================================================================
 ; fetch_channel_row - Fetch row data for channel X

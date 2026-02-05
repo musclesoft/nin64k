@@ -120,7 +120,6 @@ player_init:
         lda     #$00
         sta     filter_load+1
         sta     zp_song_base
-        jsr     checkpoint
         ; Clear player variables
         ldy     #0
 @clear:
@@ -151,7 +150,6 @@ player_init:
         sta     chn_inst_ptr_hi+2
         lda     #$0f
         sta     globalvolume
-        jsr     checkpoint
         ; Initialize decode buffer state (mark all as empty)
         lda     #$FF
         sta     chn_decoded_pat+0
@@ -186,7 +184,6 @@ player_init:
         lda     zp_dict1+1
         adc     #>410
         sta     zp_dict2+1
-        jsr     checkpoint
         ; Set packed_ptrs_addr = song_base + PACKED_PTRS_OFF
         lda     zp_song_base
         clc
@@ -250,14 +247,12 @@ player_play:
         stx     prefetch_order
         sta     prefetch_row
         sta     decode_row
-        jsr     checkpoint
         ldy     #0
         jsr     get_transpose_order
         sta     prefetch_transpose+0
         jsr     checkpoint
         ldy     #0
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     prefetch_order
         ldy     #1
         jsr     get_transpose_order
@@ -265,7 +260,6 @@ player_play:
         jsr     checkpoint
         ldy     #1
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     prefetch_order
         ldy     #2
         jsr     get_transpose_order
@@ -273,12 +267,10 @@ player_play:
         jsr     checkpoint
         ldy     #2
         jsr     get_trackptr_order
-        jsr     checkpoint
         lda     #$80
         sta     prefetch_done
         jmp     pp_allframes
 @pattern_update:
-        jsr     checkpoint
         lda     #$00
         sta     speedcounter
         lda     forcenewpattern
@@ -317,7 +309,6 @@ player_play:
         sta     chn_transpose+2
         jmp     @use_prefetch
 @no_prefetch_avail:
-        jsr     checkpoint
         lda     #0
         sta     prefetch_done
         ldx     ordernumber
@@ -327,7 +318,6 @@ player_play:
         jsr     checkpoint
         ldy     #0
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     ordernumber
         ldy     #1
         jsr     get_transpose_order
@@ -335,7 +325,6 @@ player_play:
         jsr     checkpoint
         ldy     #1
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     ordernumber
         ldy     #2
         jsr     get_transpose_order
@@ -343,7 +332,6 @@ player_play:
         jsr     checkpoint
         ldy     #2
         jsr     get_trackptr_order
-        jsr     checkpoint
 @use_prefetch:
         jsr     checkpoint
         ldx     #0
@@ -366,7 +354,6 @@ player_play:
         lda     decode_buffer_hi,x
         sta     zp_trackptr+1
         jsr     fetch_channel_row
-        jsr     checkpoint
 
 pp_allframes:
         ldx     #$00
@@ -831,7 +818,6 @@ filter_load:
 filtok:
         sty     filter_idx
 filtdone:
-        jsr     checkpoint
 
         ldy     ordernumber
         lda     forcenewpattern
@@ -858,7 +844,6 @@ filtdone:
         ldx     hrordernumber
         ldy     #0
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     #0
         jsr     check_hardrestart
 @hr1:
@@ -868,7 +853,6 @@ filtdone:
         adc     chn_hardrestart+1
         cmp     speed
         bcc     @hr2
-        jsr     checkpoint
         ldx     hrordernumber
         ldy     #1
         jsr     get_trackptr_order
@@ -876,7 +860,6 @@ filtdone:
         ldx     #1
         jsr     check_hardrestart
 @hr2:
-        jsr     checkpoint
         lda     speedcounter
         clc
         adc     chn_hardrestart+2
@@ -886,7 +869,6 @@ filtdone:
         ldx     hrordernumber
         ldy     #2
         jsr     get_trackptr_order
-        jsr     checkpoint
         ldx     #2
         jsr     check_hardrestart
 

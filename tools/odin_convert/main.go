@@ -923,7 +923,7 @@ type PrevSongTables struct {
 	RowDict []byte
 }
 
-func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte, globalWave *GlobalWaveTable) ([]byte, ConversionStats) {
+func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte, fSubRemap map[int]byte, globalWave *GlobalWaveTable) ([]byte, ConversionStats) {
 	var stats ConversionStats
 	// Detect base address from entry point JMP (offset 0: 4c xx yy -> base is $yy00)
 	baseAddr := int(raw[2]) << 8
@@ -1534,7 +1534,7 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		if srcOff >= 0 && srcOff+192 <= len(raw) {
 			copy(pat, raw[srcOff:srcOff+192])
 			remapPatternPositionJumps(pat, orderMap)
-			remapPatternEffects(pat, effectRemap)
+			remapPatternEffects(pat, effectRemap, fSubRemap)
 		}
 		patternData[i] = pat
 	}
@@ -1598,7 +1598,7 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		if srcOff >= 0 && srcOff+192 <= len(raw) {
 			copy(pat, raw[srcOff:srcOff+192])
 			remapPatternPositionJumps(pat, orderMap)
-			remapPatternEffects(pat, effectRemap)
+			remapPatternEffects(pat, effectRemap, fSubRemap)
 		}
 		allPatternData[i] = pat
 	}
@@ -1742,7 +1742,10 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 }
 
 // remapPatternEffects remaps effect numbers and parameters in pattern data
-func remapPatternEffects(pattern []byte, remap [16]byte) {
+// New encoding:
+// - Effect 0: param 0=none, 1=vib, 2=break, 3=fineslide (no-param effects)
+// - Effects 1-E: the 14 variable-param effects (regular + F sub-effects)
+func remapPatternEffects(pattern []byte, remap [16]byte, fSubRemap map[int]byte) {
 	for row := 0; row < 64; row++ {
 		off := row * 3
 		byte0 := pattern[off]
@@ -1750,88 +1753,124 @@ func remapPatternEffects(pattern []byte, remap [16]byte) {
 		byte2 := pattern[off+2]
 		// Extract old effect: (byte1 >> 5) | ((byte0 >> 4) & 8)
 		oldEffect := (byte1 >> 5) | ((byte0 >> 4) & 8)
-		newEffect := remap[oldEffect]
-		// Encode new effect back: byte0 bit 7 = effect bit 3, byte1 bits 5-7 = effect bits 0-2
+
+		var newEffect byte
+		var newParam byte = byte2
+
+		switch oldEffect {
+		case 0:
+			// No effect -> effect 0, param 0
+			newEffect = 0
+			newParam = 0
+
+		case 4:
+			// Vib (always param $00) -> effect 0, param 1
+			newEffect = 0
+			newParam = 1
+
+		case 0xD:
+			// Break (always param $00) -> effect 0, param 2
+			newEffect = 0
+			newParam = 2
+
+		case 0xF:
+			// Extended effects - split into separate effects or effect 0
+			if byte2 < 0x80 {
+				// Speed ($00-$7F) -> separate effect
+				newEffect = fSubRemap[0x10] // speed
+				newParam = byte2
+			} else {
+				hiNib := byte2 & 0xF0
+				loNib := byte2 & 0x0F
+				switch hiNib {
+				case 0xB0:
+					// Fineslide (always param $B1) -> effect 0, param 3
+					newEffect = 0
+					newParam = 3
+				case 0xF0:
+					// Hard restart -> separate effect
+					newEffect = fSubRemap[0x11]
+					newParam = loNib
+				case 0xE0:
+					// Filter trigger -> separate effect
+					newEffect = fSubRemap[0x12]
+					newParam = loNib
+				case 0x80:
+					// Global volume -> separate effect
+					newEffect = fSubRemap[0x13]
+					newParam = loNib
+				case 0x90:
+					// Filter mode -> separate effect
+					newEffect = fSubRemap[0x14]
+					newParam = loNib
+				default:
+					newEffect = 0
+					newParam = 0
+				}
+			}
+
+		case 1:
+			// Slide: $80/$81 -> 0 (up), $00 -> 1 (down)
+			newEffect = remap[1]
+			if byte2&0x80 != 0 {
+				newParam = 0 // up
+			} else {
+				newParam = 1 // down
+			}
+
+		case 2:
+			// Pulse width: $00 -> 0, $80 -> 1
+			newEffect = remap[2]
+			if byte2 == 0x80 {
+				newParam = 1
+			} else {
+				newParam = 0
+			}
+
+		case 7:
+			// AD: $08 -> 0, $09 -> 1, $48 -> 2, $0A -> 3
+			newEffect = remap[7]
+			adRemap := map[byte]byte{0x08: 0, 0x09: 1, 0x48: 2, 0x0A: 3}
+			if v, ok := adRemap[byte2]; ok {
+				newParam = v
+			}
+
+		case 8:
+			// SR: $F9 -> 0, $0D -> 1, $FF -> 2, $F8 -> 3, $0F -> 4, $0E -> 5
+			newEffect = remap[8]
+			srRemap := map[byte]byte{0xF9: 0, 0x0D: 1, 0xFF: 2, 0xF8: 3, 0x0F: 4, 0x0E: 5}
+			if v, ok := srRemap[byte2]; ok {
+				newParam = v
+			}
+
+		case 9:
+			// Wave: $FF -> 0, $80 -> 1, $43 -> 2, $81 -> 3
+			newEffect = remap[9]
+			waveRemap := map[byte]byte{0xFF: 0, 0x80: 1, 0x43: 2, 0x81: 3}
+			if v, ok := waveRemap[byte2]; ok {
+				newParam = v
+			}
+
+		case 0xE:
+			// Reso: $F1 -> 0, $00 -> 1, $F4 -> 2, $F0 -> 3, $F2 -> 4, $52 -> 5, $F5 -> 6
+			newEffect = remap[0xE]
+			resoRemap := map[byte]byte{0xF1: 0, 0x00: 1, 0xF4: 2, 0xF0: 3, 0xF2: 4, 0x52: 5, 0xF5: 6}
+			if v, ok := resoRemap[byte2]; ok {
+				newParam = v
+			}
+
+		default:
+			// Other effects (3=porta, A=arp, B=jump) - just remap effect number
+			newEffect = remap[oldEffect]
+			newParam = byte2
+		}
+
+		// Encode new effect: byte0 bit 7 = effect bit 3, byte1 bits 5-7 = effect bits 0-2
 		byte0 = (byte0 & 0x7F) | ((newEffect & 8) << 4)
 		byte1 = (byte1 & 0x1F) | ((newEffect & 7) << 5)
 		pattern[off] = byte0
 		pattern[off+1] = byte1
-		// Clear param when effect=0 (param is meaningless for no-effect)
-		if newEffect == 0 {
-			pattern[off+2] = 0
-			continue
-		}
-		// Remap effect parameters for specific effects
-		// Old effect 1 (slide): $80/$81 -> 0 (up), $00 -> 1 (down)
-		if oldEffect == 1 {
-			if byte2&0x80 != 0 {
-				byte2 = 0 // up
-			} else {
-				byte2 = 1 // down
-			}
-			pattern[off+2] = byte2
-		}
-		// Old effect 2 (pulse width): $00 -> 0, $80 -> 1
-		if oldEffect == 2 {
-			if byte2 == 0x80 {
-				byte2 = 1
-			} else {
-				byte2 = 0
-			}
-			pattern[off+2] = byte2
-		}
-		// Old effect 7 (AD): $08 -> 0, $09 -> 1, $48 -> 2, $0A -> 3
-		if oldEffect == 7 {
-			adRemap := map[byte]byte{0x08: 0, 0x09: 1, 0x48: 2, 0x0A: 3}
-			if v, ok := adRemap[byte2]; ok {
-				pattern[off+2] = v
-			}
-		}
-		// Old effect 8 (SR): $F9 -> 0, $0D -> 1, $FF -> 2, $F8 -> 3, $0F -> 4, $0E -> 5
-		if oldEffect == 8 {
-			srRemap := map[byte]byte{0xF9: 0, 0x0D: 1, 0xFF: 2, 0xF8: 3, 0x0F: 4, 0x0E: 5}
-			if v, ok := srRemap[byte2]; ok {
-				pattern[off+2] = v
-			}
-		}
-		// Old effect 9 (wave): $FF -> 0, $80 -> 1, $43 -> 2, $81 -> 3
-		if oldEffect == 9 {
-			waveRemap := map[byte]byte{0xFF: 0, 0x80: 1, 0x43: 2, 0x81: 3}
-			if v, ok := waveRemap[byte2]; ok {
-				pattern[off+2] = v
-			}
-		}
-		// Old effect E (reso): $F1 -> 0, $00 -> 1, $F4 -> 2, $F0 -> 3, $F2 -> 4, $52 -> 5, $F5 -> 6
-		if oldEffect == 0xE {
-			resoRemap := map[byte]byte{0xF1: 0, 0x00: 1, 0xF4: 2, 0xF0: 3, 0xF2: 4, 0x52: 5, 0xF5: 6}
-			if v, ok := resoRemap[byte2]; ok {
-				pattern[off+2] = v
-			}
-		}
-		// Old effect F (extended): remap high nibbles by frequency
-		// Old -> New: $Fx->$8x, $Ex->$9x, $8x->$Ax, $9x->$Bx, $Bx->$Cx
-		// Speed values ($00-$7F) stay unchanged
-		if oldEffect == 0xF && byte2 >= 0x80 {
-			hiNib := byte2 & 0xF0
-			loNib := byte2 & 0x0F
-			var newHiNib byte
-			switch hiNib {
-			case 0xF0:
-				newHiNib = 0x80 // hard restart (most frequent)
-			case 0xE0:
-				newHiNib = 0x90 // filter trigger
-			case 0x80:
-				newHiNib = 0xA0 // global volume
-			case 0x90:
-				newHiNib = 0xB0 // filter mode
-			case 0xB0:
-				newHiNib = 0xC0 // fine slide
-				loNib = 0       // player ignores param, zero for compression
-			default:
-				newHiNib = hiNib // keep unchanged (shouldn't happen)
-			}
-			pattern[off+2] = newHiNib | loNib
-		}
+		pattern[off+2] = newParam
 	}
 }
 
@@ -3301,35 +3340,114 @@ func main() {
 	}
 	fmt.Println()
 
-	// Build frequency-sorted effect remapping (most frequent first, excluding 0 and unused)
-	// Collect used effects with their counts (excluding effect 0 = no effect)
+	// Build frequency-sorted effect remapping with new encoding:
+	// - Effect 0: param 0=none, 1=vib(was 4), 2=break(was D), 3=fineslide(was FB)
+	// - Effects 1-E: the 14 variable-param effects sorted by frequency
+	//
+	// Count effects with F sub-effects split out:
+	// - Regular effects: 1,2,3,7,8,9,A,B,E (skip 4,D,F which are handled specially)
+	// - F sub-effects: speed($00-$7F), hrdrest($Fx), filttrig($Ex), globalvol($8x), filtmode($9x)
+	// - Fineslide($Bx) becomes effect 0 param 3
 	type effectFreq struct {
-		oldEffect int
-		count     int
+		name  string
+		code  int // 0-15 for regular, 0x10+ for F sub-effects
+		count int
 	}
 	var usedEffects []effectFreq
-	for i := 1; i < 16; i++ {
-		if allEffects&(1<<i) != 0 {
-			usedEffects = append(usedEffects, effectFreq{i, allEffectCounts[i]})
+
+	// Count F sub-effects from all songs
+	fSubCounts := make(map[string]int)
+	for songNum := 1; songNum <= 9; songNum++ {
+		if songData[songNum-1] == nil {
+			continue
+		}
+		params := countEffectParams(songData[songNum-1])
+		for p, c := range params[0xF] {
+			switch {
+			case p < 0x80:
+				fSubCounts["speed"] += c
+			case p >= 0x80 && p < 0x90:
+				fSubCounts["globalvol"] += c
+			case p >= 0x90 && p < 0xA0:
+				fSubCounts["filtmode"] += c
+			case p >= 0xB0 && p < 0xC0:
+				fSubCounts["fineslide"] += c
+			case p >= 0xE0 && p < 0xF0:
+				fSubCounts["filttrig"] += c
+			case p >= 0xF0:
+				fSubCounts["hrdrest"] += c
+			}
 		}
 	}
+
+	// Add regular effects (excluding 4=vib, D=break, F=extended which are handled specially)
+	for i := 1; i < 16; i++ {
+		if i == 4 || i == 0xD || i == 0xF {
+			continue // These become effect 0 or are split into sub-effects
+		}
+		if allEffects&(1<<i) != 0 {
+			usedEffects = append(usedEffects, effectFreq{
+				name:  fmt.Sprintf("%X", i),
+				code:  i,
+				count: allEffectCounts[i],
+			})
+		}
+	}
+
+	// Add F sub-effects (excluding fineslide which becomes effect 0)
+	fSubNames := []struct {
+		name string
+		code int
+	}{
+		{"speed", 0x10},
+		{"hrdrest", 0x11},
+		{"filttrig", 0x12},
+		{"globalvol", 0x13},
+		{"filtmode", 0x14},
+	}
+	for _, fs := range fSubNames {
+		if c := fSubCounts[fs.name]; c > 0 {
+			usedEffects = append(usedEffects, effectFreq{
+				name:  "F/" + fs.name,
+				code:  fs.code,
+				count: c,
+			})
+		}
+	}
+
 	sort.Slice(usedEffects, func(i, j int) bool {
 		return usedEffects[i].count > usedEffects[j].count
 	})
 
-	// Generate remapping: old effect -> new effect (1-based, sorted by frequency)
-	effectRemap := [16]byte{} // 0 stays 0
+	// Generate remapping: code -> new effect (1-based, sorted by frequency)
+	// effectRemap[0-15] for regular effects, fSubRemap for F sub-effects
+	effectRemap := [16]byte{} // 0 stays 0, 4->will use 0, D->will use 0, F->special
+	fSubRemap := make(map[int]byte) // F sub-effect code -> new effect number
 	fmt.Printf("Effect frequency order (old->new):")
 	for newIdx, ef := range usedEffects {
-		effectRemap[ef.oldEffect] = byte(newIdx + 1)
-		fmt.Printf(" %X->%X(%d)", ef.oldEffect, newIdx+1, ef.count)
+		newEffect := byte(newIdx + 1)
+		if ef.code < 0x10 {
+			effectRemap[ef.code] = newEffect
+		} else {
+			fSubRemap[ef.code] = newEffect
+		}
+		fmt.Printf(" %s->%X(%d)", ef.name, newEffect, ef.count)
 	}
 	fmt.Println()
+
+	// Mark special effects that become effect 0
+	effectRemap[4] = 0   // vib -> effect 0, param 1
+	effectRemap[0xD] = 0 // break -> effect 0, param 2
+	effectRemap[0xF] = 0 // F is handled via fSubRemap; fineslide -> effect 0, param 3
 
 	// Print the required effectptrs table ordering for the player
 	fmt.Printf("effectptrs table order:")
 	for _, ef := range usedEffects {
-		fmt.Printf(" effect%02x", ef.oldEffect)
+		if ef.code < 0x10 {
+			fmt.Printf(" effect%02x", ef.code)
+		} else {
+			fmt.Printf(" %s", ef.name)
+		}
 	}
 	fmt.Println()
 
@@ -3364,7 +3482,7 @@ func main() {
 
 	// Analyze shared row dictionary encoding
 	analyzeTransposePatterns(songData)
-	analyzeSharedRowDict(songData, effectRemap)
+	analyzeSharedRowDict(songData, effectRemap, fSubRemap)
 
 	// Analyze vibrato depth usage frequency across all instruments
 	vibDepthCount := make(map[int]int)
@@ -3570,7 +3688,7 @@ func main() {
 		if songData[songNum-1] == nil {
 			continue
 		}
-		convertedData, stats := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap, globalWave)
+		convertedData, stats := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap, fSubRemap, globalWave)
 		convertedSongs[songNum-1] = convertedData
 		convertedStats[songNum-1] = stats
 
@@ -4167,7 +4285,7 @@ func analyzeTransposePatterns(songData [][]byte) {
 
 // analyzeSharedRowDict analyzes encoding with a shared row dictionary across all songs
 // Encoding: $00-$DF: dict index 0-223, $E0-$FE: RLE 1-31, $FF + 2 bytes: extended index
-func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte) {
+func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte, fSubRemap map[int]byte) {
 	fmt.Println("\n=== Shared Row Dictionary Analysis ===")
 
 	// Collect all patterns from all songs after effect remapping
@@ -4213,7 +4331,7 @@ func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte) {
 			srcOff := int(addr) - baseAddr
 			pat := make([]byte, 192)
 			copy(pat, raw[srcOff:srcOff+192])
-			remapPatternEffects(pat, effectRemap)
+			remapPatternEffects(pat, effectRemap, fSubRemap)
 			allPats = append(allPats, patternInfo{songNum, pat})
 		}
 	}

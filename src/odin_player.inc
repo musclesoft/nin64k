@@ -249,7 +249,25 @@ player_play:
         jsr     process_instrument
 @noinst:
         lda     chn_effect,x
-        beq     @noeffect
+        bne     @haseffect
+        ; Effect 0: special handling based on param
+        ; param 0=nop, 1=vib, 2=break, 3=fineslide
+        lda     chn_effectpar,x
+        beq     @noeffect              ; param 0 = no effect
+        cmp     #1
+        beq     @effect0_vib
+        cmp     #2
+        beq     @effect0_break
+        ; param 3 = fineslide (only remaining case)
+        jsr     effect_fineslide
+        jmp     @noeffect
+@effect0_vib:
+        jsr     effect_vib
+        jmp     @noeffect
+@effect0_break:
+        jsr     effect_break
+        jmp     @noeffect
+@haseffect:
         asl     a
         tay
         lda     effectptrs-2,y
@@ -821,6 +839,31 @@ effect03:
 @done:
         rts
 
+; Effect 0 sub-handlers (param 1=vib, 2=break, 3=fineslide)
+effect_vib:
+        lda     #0              ; disable vibrato
+        sta     chn_vibdepth,x
+        sta     chn_vibspeed,x
+        rts
+
+effect_break:
+        lda     #$80
+        sta     forcenewpattern
+        rts
+
+effect_fineslide:
+        lda     speedcounter
+        bne     @done
+        lda     chn_slidedelta_lo,x
+        clc
+        adc     #$04                    ; param always $1, shifted = $4
+        sta     chn_slidedelta_lo,x
+        lda     #$80
+        sta     chn_slideenable,x
+@done:
+        rts
+
+; Legacy effect04 handler (kept for reference, no longer used)
 effect04:
         lda     #0              ; param always $00, just disable vibrato
         sta     chn_vibdepth,x
@@ -887,60 +930,31 @@ effect0e:
         sta     filter_resonance
         rts
 
-; Fxx sub-effects (frequency-sorted high nibbles):
-; $0x-$7x: speed (1265 uses)
-; $8x: hard restart (old $Fx, 927 uses)
-; $9x: filter trigger (old $Ex, 722 uses)
-; $Ax: global volume (old $8x, 66 uses)
-; $Bx: filter mode (old $9x, 40 uses)
-; $Cx: fine slide (old $Bx, 16 uses)
-effect0f:
+; Split F effects - now separate handlers instead of combined effect0f
+; Effect 3: speed (param $00-$7F direct speed value)
+effect_speed:
         lda     speedcounter
         bne     @done
         lda     chn_effectpar,x
-        bpl     @speed
-        and     #$f0
-        tay
-        lda     chn_effectpar,x
-        and     #$0f
-        cpy     #$80
-        beq     @f8x_hardrestart
-        cpy     #$90
-        beq     @f9x_filttrig
-        cpy     #$a0
-        beq     @fax_globalvol
-        cpy     #$b0
-        beq     @fbx_filtmode
-        cpy     #$c0
-        bne     @done
-@fcx_fineslide:
-        lda     chn_slidedelta_lo,x
-        clc
-        adc     #$04                    ; param always $1, shifted = $4
-        sta     chn_slidedelta_lo,x
-        lda     #$80
-        sta     chn_slideenable,x
+        sta     speed
+@done:
         rts
-@f8x_hardrestart:
+
+; Effect 4: hard restart (param = hard restart value)
+effect_hrdrest:
+        lda     speedcounter
+        bne     @done
+        lda     chn_effectpar,x
         sta     chn_hardrestart,x
 @done:
         rts
-@speed:
-        sta     speed
-        rts
-@fax_globalvol:
-        sta     globalvolume
-        rts
-@fbx_filtmode:
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     filter_mode
-        rts
-@f9x_filttrig:
-        cmp     #0              ; Set Z flag from A (inst number)
-        beq     @done           ; F90 = no filter trigger
+
+; Effect 5: filter trigger (param = instrument number for filter)
+effect_filttrig:
+        lda     speedcounter
+        bne     @done
+        lda     chn_effectpar,x
+        beq     @done           ; param 0 = no filter trigger
         ; Setup zp_ptr = song_base + inst*16 (interleaved layout)
         asl
         asl
@@ -960,6 +974,29 @@ effect0f:
         ldy     #INST_FILTLOOP
         lda     (zp_ptr),y
         sta     filter_loop
+@done:
+        rts
+
+; Effect C: global volume (param = volume 0-F)
+effect_globalvol:
+        lda     speedcounter
+        bne     @done
+        lda     chn_effectpar,x
+        sta     globalvolume
+@done:
+        rts
+
+; Effect D: filter mode (param = mode 0-F -> shifted to high nibble)
+effect_filtmode:
+        lda     speedcounter
+        bne     @done
+        lda     chn_effectpar,x
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     filter_mode
+@done:
         rts
 
 freqcmp:
@@ -1204,21 +1241,24 @@ filter_load:
 ; Tables
 ; ============================================================================
 
-; Effect table - frequency-sorted (most used first), indexed from 1
-; 1-C map to old effects: A,3,F,8,9,2,7,E,1,4,D,B
+; Effect table - frequency-sorted, indexed from 1
+; Effect 0 is special: param 0=nop, 1=vib, 2=break, 3=fineslide
+; Effects 1-E use this table:
 effectptrs:
-        .word   effect0a      ; 1 = old A (arpeggio) - 3483 uses
-        .word   effect03      ; 2 = old 3 (tone portamento) - 3037 uses
-        .word   effect0f      ; 3 = old F (extended effects) - 3036 uses
-        .word   effect08      ; 4 = old 8 (set SR) - 446 uses
-        .word   effect09      ; 5 = old 9 (set waveform) - 387 uses
-        .word   effect02      ; 6 = old 2 (portamento down) - 312 uses
-        .word   effect07      ; 7 = old 7 (set AD) - 219 uses
-        .word   effect0e      ; 8 = old E (set filter resonance) - 109 uses
-        .word   effect01      ; 9 = old 1 (portamento up) - 96 uses
-        .word   effect04      ; A = old 4 (vibrato) - 64 uses
-        .word   effect0d      ; B = old D (pattern break) - 19 uses
-        .word   effect0b      ; C = old B (position jump) - 4 uses
+        .word   effect0a         ; 1 = arpeggio (old A) - 3483 uses
+        .word   effect03         ; 2 = tone portamento (old 3) - 3037 uses
+        .word   effect_speed     ; 3 = speed (old F/$00-$7F) - 1265 uses
+        .word   effect_hrdrest   ; 4 = hard restart (old F/$Fx) - 927 uses
+        .word   effect_filttrig  ; 5 = filter trigger (old F/$Ex) - 722 uses
+        .word   effect08         ; 6 = set SR (old 8) - 446 uses
+        .word   effect09         ; 7 = set waveform (old 9) - 387 uses
+        .word   effect02         ; 8 = pulse width (old 2) - 312 uses
+        .word   effect07         ; 9 = set AD (old 7) - 219 uses
+        .word   effect0e         ; A = filter resonance (old E) - 109 uses
+        .word   effect01         ; B = slide (old 1) - 96 uses
+        .word   effect_globalvol ; C = global volume (old F/$8x) - 66 uses
+        .word   effect_filtmode  ; D = filter mode (old F/$9x) - 40 uses
+        .word   effect0b         ; E = position jump (old B) - 4 uses
 
 sidregoffs:
         .byte   0, 7, 14

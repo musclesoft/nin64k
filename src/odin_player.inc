@@ -462,7 +462,14 @@ player_play:
         adc     chn_note,x
 @arp_done:
         adc     chn_transpose,x
-        jsr     set_notefreq_and_freqlo
+        ; Inline set_notefreq_and_freqlo
+        tay
+        lda     freqtable_lo,y
+        sta     chn_notefreqlo,x
+        sta     chn_freqlo,x
+        lda     freqtable_hi,y
+        sta     chn_notefreqhi,x
+        sta     chn_freqhi,x
         jmp     @noeffect
 @fx_2_3:
         beq     @fx_2
@@ -526,7 +533,19 @@ player_play:
         beq     @pulse_set
         lda     #$80
 @pulse_set:
-        jsr     set_pulse_width
+        ; Inline set_pulse_width
+        pha
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     chn_plswidthlo,x
+        pla
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     chn_plswidthhi,x
         jmp     @noeffect
 @fx_9:
         ; Effect 9 = set AD (inlined)
@@ -609,7 +628,40 @@ player_play:
 @noslide:
         lda     chn_vibdepth,x
         beq     @novib
-        jsr     calcvibrato
+        ; Inline calcvibrato
+        lda     chn_vibpos,x
+        and     #$1f
+        cmp     #$10
+        bcc     @vib_haveval
+        eor     #$1f
+@vib_haveval:
+        ora     chn_vibdepth,x
+        tay
+        lda     vibrato_table-16,y
+        asl     a
+        sta     zp_ptr
+        lda     #$00
+        rol     a
+        sta     zp_ptr+1
+        lda     chn_vibpos,x
+        and     #$20
+        bne     @vib_add
+        lda     chn_freqlo,x
+        sec
+        sbc     zp_ptr
+        sta     chn_finfreqlo,x
+        lda     chn_freqhi,x
+        sbc     zp_ptr+1
+        sta     chn_finfreqhi,x
+        jmp     @vib_done
+@vib_add:
+        lda     chn_freqlo,x
+        adc     zp_ptr
+        sta     chn_finfreqlo,x
+        lda     chn_freqhi,x
+        adc     zp_ptr+1
+        sta     chn_finfreqhi,x
+@vib_done:
         lda     chn_vibpos,x
         clc
         adc     chn_vibspeed,x
@@ -628,17 +680,18 @@ player_play:
 @chnloop_done:
 
         ldy     filter_idx
-        beq     @filtdone
-        jsr     get_filtertable_y
+        beq     filtdone
+filter_load:
+        lda     $FFFF,y             ; Inline get_filtertable_y (SMC: address patched in init)
         sta     filter_cutoff
         iny
         cpy     filter_end
-        bcc     @filtok
-        beq     @filtok
+        bcc     filtok
+        beq     filtok
         ldy     filter_loop
-@filtok:
+filtok:
         sty     filter_idx
-@filtdone:
+filtdone:
 
         ldy     ordernumber
         lda     forcenewpattern
@@ -867,68 +920,6 @@ pi_pulseup:
         jmp     pi_pulsestore
 
 ; ============================================================================
-; set_notefreq_and_freqlo - Set notefreq AND freqlo from note A
-; ============================================================================
-set_notefreq_and_freqlo:
-        tay
-        lda     freqtable_lo,y
-        sta     chn_notefreqlo,x
-        sta     chn_freqlo,x
-        lda     freqtable_hi,y
-        sta     chn_notefreqhi,x
-        sta     chn_freqhi,x
-        rts
-
-; ============================================================================
-; set_notefreq_only - Set only notefreq from note A
-; ============================================================================
-set_notefreq_only:
-        tay
-        lda     freqtable_lo,y
-        sta     chn_notefreqlo,x
-        lda     freqtable_hi,y
-        sta     chn_notefreqhi,x
-        rts
-
-; ============================================================================
-; calcvibrato
-; ============================================================================
-calcvibrato:
-        lda     chn_vibpos,x
-        and     #$1f
-        cmp     #$10
-        bcc     @haveval
-        eor     #$1f
-@haveval:
-        ora     chn_vibdepth,x
-        tay
-        lda     vibrato_table-16,y      ; -16 because depth 0 row is deleted (never used)
-        asl     a
-        sta     zp_ptr
-        lda     #$00
-        rol     a
-        sta     zp_ptr+1
-        lda     chn_vibpos,x
-        and     #$20
-        bne     @add
-        lda     chn_freqlo,x
-        sec
-        sbc     zp_ptr
-        sta     chn_finfreqlo,x
-        lda     chn_freqhi,x
-        sbc     zp_ptr+1
-        sta     chn_finfreqhi,x
-        rts
-@add:
-        lda     chn_freqlo,x
-        adc     zp_ptr
-        sta     chn_finfreqlo,x
-        lda     chn_freqhi,x
-        adc     zp_ptr+1
-        sta     chn_finfreqhi,x
-        rts
-
-; ============================================================================
 ; fetch_channel_row - Fetch row data for channel X
 ; ============================================================================
 fetch_channel_row:
@@ -1033,7 +1024,12 @@ fetch_channel_row:
         bne     @notporta
         clc
         adc     chn_transpose,x
-        jsr     set_notefreq_only
+        ; Inline set_notefreq_only
+        tay
+        lda     freqtable_lo,y
+        sta     chn_notefreqlo,x
+        lda     freqtable_hi,y
+        sta     chn_notefreqhi,x
 @notporta:
         ; Load cached inst pointer
         lda     chn_inst_ptr_lo,x
@@ -1057,24 +1053,6 @@ fetch_channel_row:
 @setgate:
         sta     chn_gateon,x
 @done:
-        rts
-
-; ============================================================================
-; set_pulse_width - A = packed pulse width
-; ============================================================================
-set_pulse_width:
-        pha
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     chn_plswidthlo,x
-        pla
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        sta     chn_plswidthhi,x
         rts
 
 freqcmp:
@@ -1289,12 +1267,6 @@ dar_ext_direct:
         lda     (zp_dict2),y
         sta     chn_prev_row_2,x
         inc     chn_src_off,x       ; advance past extended byte
-        rts
-
-; get_filtertable_y - Get filtertable entry Y (SMC: address patched in init)
-get_filtertable_y:
-filter_load:
-        lda     $FFFF,y
         rts
 
 ; ============================================================================

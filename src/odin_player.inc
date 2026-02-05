@@ -190,6 +190,64 @@ player_play:
         bne     @skip_pattern
         jmp     @pattern_update
 @skip_pattern:
+        ; Check if we should prefetch (speedcounter == speed-1)
+        clc
+        adc     #1
+        cmp     speed
+        bne     @no_prefetch
+        jmp     @do_prefetch
+@no_prefetch:
+        jmp     @allframes
+@do_prefetch:
+        ; Prefetch next row's data
+        ; Calculate what next row/order will be
+        lda     forcenewpattern
+        bmi     @pf_newpattern
+        lda     trackrow
+        clc
+        adc     #1
+        cmp     #$40
+        bcc     @pf_row_ok
+@pf_newpattern:
+        ; Next frame will be new pattern
+        lda     nextordernumber
+        sta     prefetch_order
+        lda     #0
+        beq     @pf_store_row
+@pf_row_ok:
+        sta     prefetch_row
+        lda     ordernumber
+        sta     prefetch_order
+        lda     prefetch_row
+@pf_store_row:
+        sta     prefetch_row
+        sta     decode_row
+        and     #$0f
+        sta     trackrow3
+        asl     a
+        adc     trackrow3
+        sta     trackrow3
+        ; Prefetch transpose and decode for all 3 channels
+        ldx     prefetch_order
+        ldy     #0
+        jsr     get_transpose_order
+        sta     prefetch_transpose+0
+        ldy     #0
+        jsr     get_trackptr_order
+        ldx     prefetch_order
+        ldy     #1
+        jsr     get_transpose_order
+        sta     prefetch_transpose+1
+        ldy     #1
+        jsr     get_trackptr_order
+        ldx     prefetch_order
+        ldy     #2
+        jsr     get_transpose_order
+        sta     prefetch_transpose+2
+        ldy     #2
+        jsr     get_trackptr_order
+        lda     #$80
+        sta     prefetch_done
         jmp     @allframes
 @pattern_update:
         lda     #$00
@@ -215,29 +273,68 @@ player_play:
         asl     a               ; A = row_in_quarter * 2
         adc     trackrow3       ; A = row_in_quarter * 3
         sta     trackrow3
+        ; Check if prefetch is valid
+        lda     prefetch_done
+        bpl     @no_prefetch_avail
+        lda     prefetch_order
+        cmp     ordernumber
+        bne     @no_prefetch_avail
+        lda     prefetch_row
+        cmp     trackrow
+        bne     @no_prefetch_avail
+        ; Prefetch valid - use cached transpose, buffers already decoded
+        lda     #0
+        sta     prefetch_done
+        lda     prefetch_transpose+0
+        sta     chn_transpose+0
+        lda     prefetch_transpose+1
+        sta     chn_transpose+1
+        lda     prefetch_transpose+2
+        sta     chn_transpose+2
+        jmp     @use_prefetch
+@no_prefetch_avail:
+        lda     #0
+        sta     prefetch_done
         ldx     ordernumber
         ldy     #0
         jsr     get_transpose_order
         sta     chn_transpose+0
         ldy     #0
         jsr     get_trackptr_order
-        ldx     #0
-        jsr     fetch_channel_row
         ldx     ordernumber
         ldy     #1
         jsr     get_transpose_order
         sta     chn_transpose+1
         ldy     #1
         jsr     get_trackptr_order
-        ldx     #1
-        jsr     fetch_channel_row
         ldx     ordernumber
         ldy     #2
         jsr     get_transpose_order
         sta     chn_transpose+2
         ldy     #2
         jsr     get_trackptr_order
+@use_prefetch:
+        ; fetch_channel_row reads from decode buffers (already filled)
+        ; Set trackrow3=0 (decode buffer format), set zp_trackptr per channel
+        lda     #0
+        sta     trackrow3
+        ldx     #0
+        lda     decode_buffer_lo,x
+        sta     zp_trackptr
+        lda     decode_buffer_hi,x
+        sta     zp_trackptr+1
+        jsr     fetch_channel_row
+        ldx     #1
+        lda     decode_buffer_lo,x
+        sta     zp_trackptr
+        lda     decode_buffer_hi,x
+        sta     zp_trackptr+1
+        jsr     fetch_channel_row
         ldx     #2
+        lda     decode_buffer_lo,x
+        sta     zp_trackptr
+        lda     decode_buffer_hi,x
+        sta     zp_trackptr+1
         jsr     fetch_channel_row
 
 @allframes:
@@ -1316,6 +1413,10 @@ ordernumber:            .byte   0
 nextordernumber:        .byte   0
 hrordernumber:          .byte   0
 forcenewpattern:        .byte   0
+prefetch_done:          .byte   0       ; $80 = prefetch valid
+prefetch_order:         .byte   0       ; order position used for prefetch
+prefetch_row:           .byte   0       ; row used for prefetch
+prefetch_transpose:     .byte   0, 0, 0 ; cached transpose values
 
 PLAYERVARSSIZE = * - chn_hardrestart
 

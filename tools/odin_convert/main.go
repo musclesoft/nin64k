@@ -3767,6 +3767,16 @@ func main() {
 		close(results)
 	}()
 
+	// Collect all results
+	var allResults []result
+	for r := range results {
+		allResults = append(allResults, r)
+	}
+	// Sort by song number
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].songNum < allResults[j].songNum
+	})
+
 	allPassed := true
 	maxWave, maxArp, maxFilter, maxPatterns, maxOrders := 0, 0, 0, 0, 0
 	maxDictSize, maxPackedSize := 0, 0
@@ -3775,7 +3785,7 @@ func main() {
 	mergedCoverage := make(map[uint16]bool)
 	mergedDataCoverage := make(map[int]bool)
 	maxDataSize := 0
-	for r := range results {
+	for _, r := range allResults {
 		if r.err != "" {
 			fmt.Printf("Song %d: ERROR %s\n", r.songNum, r.err)
 			allPassed = false

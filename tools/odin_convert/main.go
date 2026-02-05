@@ -3246,6 +3246,9 @@ func main() {
 	fmt.Printf("Global patterns: %d unique across all songs, %d shared between songs\n", totalUniquePatterns, sharedPatterns)
 	fmt.Printf("Pattern refs per song: %v (total %d, dedup saves %d)\n", songPatternCounts, totalPatternRefs, totalPatternRefs-totalUniquePatterns)
 
+	// Analyze shared row dictionary encoding
+	analyzeSharedRowDict(songData, effectRemap)
+
 	// Analyze vibrato depth usage frequency across all instruments
 	vibDepthCount := make(map[int]int)
 	for songNum := 1; songNum <= 9; songNum++ {
@@ -3899,6 +3902,319 @@ func analyzeEquivResults(results []EquivResult) {
 	} else {
 		fmt.Println("No equivalences found")
 	}
+}
+
+// analyzeSharedRowDict analyzes encoding with a shared row dictionary across all songs
+// Encoding: $00-$DF: dict index 0-223, $E0-$FE: RLE 1-31, $FF + 2 bytes: extended index
+func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte) {
+	fmt.Println("\n=== Shared Row Dictionary Analysis ===")
+
+	// Collect all patterns from all songs after effect remapping
+	type patternInfo struct {
+		songNum int
+		data    []byte
+	}
+	var allPats []patternInfo
+
+	for songNum := 1; songNum <= 9; songNum++ {
+		raw := songData[songNum-1]
+		if raw == nil {
+			continue
+		}
+		baseAddr := int(raw[2]) << 8
+		trackLo0Off := int(readWord(raw, codeTrackLo0)) - baseAddr
+		trackHi0Off := int(readWord(raw, codeTrackHi0)) - baseAddr
+		trackLo1Off := int(readWord(raw, codeTrackLo1)) - baseAddr
+		trackHi1Off := int(readWord(raw, codeTrackHi1)) - baseAddr
+		trackLo2Off := int(readWord(raw, codeTrackLo2)) - baseAddr
+		trackHi2Off := int(readWord(raw, codeTrackHi2)) - baseAddr
+		trackLoOff := []int{trackLo0Off, trackLo1Off, trackLo2Off}
+		trackHiOff := []int{trackHi0Off, trackHi1Off, trackHi2Off}
+		rawLen := len(raw)
+
+		patternAddrs := make(map[uint16]bool)
+		for order := 0; order < 256; order++ {
+			for ch := 0; ch < 3; ch++ {
+				if trackLoOff[ch]+order >= rawLen || trackHiOff[ch]+order >= rawLen {
+					continue
+				}
+				lo := raw[trackLoOff[ch]+order]
+				hi := raw[trackHiOff[ch]+order]
+				addr := uint16(lo) | uint16(hi)<<8
+				srcOff := int(addr) - baseAddr
+				if srcOff >= 0 && srcOff+192 <= rawLen {
+					patternAddrs[addr] = true
+				}
+			}
+		}
+
+		for addr := range patternAddrs {
+			srcOff := int(addr) - baseAddr
+			pat := make([]byte, 192)
+			copy(pat, raw[srcOff:srcOff+192])
+			remapPatternEffects(pat, effectRemap)
+			allPats = append(allPats, patternInfo{songNum, pat})
+		}
+	}
+
+	fmt.Printf("Total patterns across all songs: %d\n", len(allPats))
+
+	// Count row frequencies (after RLE - only count when row changes)
+	rowFreq := make(map[string]int)
+	for _, p := range allPats {
+		var prevRow [3]byte
+		for row := 0; row < 64; row++ {
+			off := row * 3
+			curRow := [3]byte{p.data[off], p.data[off+1], p.data[off+2]}
+			if curRow != prevRow {
+				rowFreq[string(curRow[:])]++
+			}
+			prevRow = curRow
+		}
+	}
+
+	fmt.Printf("Unique row entries: %d\n", len(rowFreq))
+
+	// Sort rows by frequency (most frequent first)
+	type rowEntry struct {
+		row  string
+		freq int
+	}
+	var sortedRows []rowEntry
+	for row, freq := range rowFreq {
+		sortedRows = append(sortedRows, rowEntry{row, freq})
+	}
+	sort.Slice(sortedRows, func(i, j int) bool {
+		if sortedRows[i].freq != sortedRows[j].freq {
+			return sortedRows[i].freq > sortedRows[j].freq
+		}
+		return sortedRows[i].row < sortedRows[j].row
+	})
+
+	// Build dictionary (row -> index)
+	rowToIdx := make(map[string]int)
+	for i, entry := range sortedRows {
+		rowToIdx[entry.row] = i
+	}
+
+	// Analyze effect parameters in per-song dictionaries (after remapping)
+	// Track max # of dict entries per effect/param across all songs
+	effectParamsMax := make(map[int]map[int]int) // effect -> param -> max count across songs
+	for i := 0; i < 16; i++ {
+		effectParamsMax[i] = make(map[int]int)
+	}
+
+	// Build per-song dictionaries and count effect/param entries
+	for songNum := 1; songNum <= 9; songNum++ {
+		// Find patterns for this song
+		var songPatterns [][]byte
+		for _, p := range allPats {
+			if p.songNum == songNum {
+				songPatterns = append(songPatterns, p.data)
+			}
+		}
+		if len(songPatterns) == 0 {
+			continue
+		}
+
+		// Build this song's dictionary (unique rows after RLE)
+		songRows := make(map[string]bool)
+		for _, pat := range songPatterns {
+			var prevRow [3]byte
+			for row := 0; row < 64; row++ {
+				off := row * 3
+				curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
+				if curRow != prevRow {
+					songRows[string(curRow[:])] = true
+				}
+				prevRow = curRow
+			}
+		}
+
+		// Count effect/param in this song's dict
+		songEffectParams := make(map[int]map[int]int)
+		for i := 0; i < 16; i++ {
+			songEffectParams[i] = make(map[int]int)
+		}
+		for rowStr := range songRows {
+			row := []byte(rowStr)
+			byte0 := row[0]
+			byte1 := row[1]
+			byte2 := row[2]
+			effect := int((byte1 >> 5) | ((byte0 >> 4) & 8))
+			songEffectParams[effect][int(byte2)]++
+		}
+
+		// Update max
+		for eff := 0; eff < 16; eff++ {
+			for param, count := range songEffectParams[eff] {
+				if count > effectParamsMax[eff][param] {
+					effectParamsMax[eff][param] = count
+				}
+			}
+		}
+	}
+
+	// Use effectParamsMax for display
+	effectParams := effectParamsMax
+
+	// Print effect parameter analysis (remapped effects)
+	fmt.Println("Effect parameters (max per-song dict entries):")
+	remappedNames := []string{"0", "1(D)", "2(3)", "3(F)", "4(1)", "5(4)", "6(7)", "7(8)", "8(9)", "9(A)", "10(2)", "11(E)", "12(B)"}
+	for eff := 0; eff < 13; eff++ {
+		if len(effectParams[eff]) == 0 {
+			continue
+		}
+		type pv struct {
+			param int
+			count int
+		}
+
+		// Effect 3 is remapped F - break down by sub-effect
+		// After remapping: $8x=hrdrst, $9x=ftrig, $Ax=gvol, $Bx=fmode, $Cx=fslide, $00-$7F=speed
+		if eff == 3 {
+			subEffects := map[string]map[int]int{
+				"3(F) speed":   make(map[int]int),
+				"3(FF) hrdrst": make(map[int]int),
+				"3(FE) ftrig":  make(map[int]int),
+				"3(F8) gvol":   make(map[int]int),
+				"3(F9) fmode":  make(map[int]int),
+				"3(FB) fslide": make(map[int]int),
+			}
+			for p, c := range effectParams[eff] {
+				switch {
+				case p < 0x80:
+					subEffects["3(F) speed"][p] = c
+				case p >= 0x80 && p < 0x90:
+					subEffects["3(FF) hrdrst"][p&0x0F] = c
+				case p >= 0x90 && p < 0xA0:
+					subEffects["3(FE) ftrig"][p&0x0F] = c
+				case p >= 0xA0 && p < 0xB0:
+					subEffects["3(F8) gvol"][p&0x0F] = c
+				case p >= 0xB0 && p < 0xC0:
+					subEffects["3(F9) fmode"][p&0x0F] = c
+				case p >= 0xC0 && p < 0xD0:
+					subEffects["3(FB) fslide"][p&0x0F] = c
+				}
+			}
+			subOrder := []string{"3(F) speed", "3(FF) hrdrst", "3(FE) ftrig", "3(F8) gvol", "3(F9) fmode", "3(FB) fslide"}
+			for _, name := range subOrder {
+				params := subEffects[name]
+				if len(params) == 0 {
+					continue
+				}
+				var pvs []pv
+				inDict := 0
+				for p, c := range params {
+					pvs = append(pvs, pv{p, c})
+					inDict += c
+				}
+				sort.Slice(pvs, func(i, j int) bool {
+					return pvs[i].count > pvs[j].count
+				})
+				fmt.Printf("  %s: %d params, %d max: ", name, len(pvs), inDict)
+				for i, pv := range pvs {
+					if i > 0 {
+						fmt.Printf(" ")
+					}
+					if i < 10 {
+						fmt.Printf("$%X(%d)", pv.param, pv.count)
+					}
+				}
+				if len(pvs) > 10 {
+					fmt.Printf(" ...")
+				}
+				fmt.Println()
+			}
+			continue
+		}
+
+		var pvs []pv
+		inDict := 0
+		for p, c := range effectParams[eff] {
+			pvs = append(pvs, pv{p, c})
+			inDict += c
+		}
+		sort.Slice(pvs, func(i, j int) bool {
+			return pvs[i].count > pvs[j].count
+		})
+		name := remappedNames[eff]
+		if len(pvs) <= 10 {
+			fmt.Printf("  %s: %d params, %d max: ", name, len(pvs), inDict)
+			for i, pv := range pvs {
+				if i > 0 {
+					fmt.Printf(" ")
+				}
+				fmt.Printf("$%02X(%d)", pv.param, pv.count)
+			}
+			fmt.Println()
+		} else {
+			fmt.Printf("  %s: %d params, %d max, top 10: ", name, len(pvs), inDict)
+			for i := 0; i < 10; i++ {
+				fmt.Printf("$%02X(%d) ", pvs[i].param, pvs[i].count)
+			}
+			fmt.Println()
+		}
+	}
+
+	// Pack all patterns with encoding
+	const primaryMax = 224
+	const rleMax = 31
+	const rleBase = 0xE0
+
+	totalBytes := 0
+	primaryCount := 0
+	extendedCount := 0
+	rleCount := 0
+
+	for _, p := range allPats {
+		var prevRow [3]byte
+		repeatCount := 0
+
+		for row := 0; row < 64; row++ {
+			off := row * 3
+			curRow := [3]byte{p.data[off], p.data[off+1], p.data[off+2]}
+
+			if curRow == prevRow {
+				repeatCount++
+				if repeatCount == rleMax || row == 63 {
+					totalBytes++
+					rleCount++
+					repeatCount = 0
+				}
+			} else {
+				if repeatCount > 0 {
+					totalBytes++
+					rleCount++
+					repeatCount = 0
+				}
+				idx := rowToIdx[string(curRow[:])]
+				if idx < primaryMax {
+					totalBytes++
+					primaryCount++
+				} else {
+					totalBytes += 3
+					extendedCount++
+				}
+			}
+			prevRow = curRow
+		}
+		if repeatCount > 0 {
+			totalBytes++
+			rleCount++
+		}
+	}
+
+	dictBytes := len(sortedRows) * 3
+
+	fmt.Printf("\nDict size: %d entries = %d bytes\n", len(sortedRows), dictBytes)
+	fmt.Printf("Packed data: %d bytes\n", totalBytes)
+	fmt.Printf("  Primary (1-byte): %d\n", primaryCount)
+	fmt.Printf("  Extended (3-byte): %d = %d extra bytes\n", extendedCount, extendedCount*2)
+	fmt.Printf("  RLE: %d\n", rleCount)
+	fmt.Printf("Total: %d bytes (dict) + %d bytes (data) = %d bytes\n", dictBytes, totalBytes, dictBytes+totalBytes)
+	fmt.Printf("Index distribution: %d < 224 (primary), %d >= 224 (extended)\n",
+		min(224, len(sortedRows)), max(0, len(sortedRows)-224))
 }
 
 func serializeWrites(writes []SIDWrite) []byte {

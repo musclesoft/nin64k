@@ -13,12 +13,12 @@
 
 ; Buffer layout constants (dual-buffer decompression)
 ; Buffer 1 (odd songs):  $2000
-; Buffer 2 (even songs): $4000
+; Buffer 2 (even songs): $3E00
 ; To change: update constants in cmd/compress/decompress6502.go, then rebuild
 DECOMP_BUF1_HI   = $20           ; Buffer 1 high byte
-DECOMP_BUF2_HI   = $40           ; Buffer 2 high byte
-DECOMP_BUF_GAP   = $20           ; Gap between buffers ($2000 >> 8)
-DECOMP_WRAP_HI   = $60           ; Buffer 2 + gap (wrap threshold)
+DECOMP_BUF2_HI   = $3E           ; Buffer 2 high byte
+DECOMP_BUF_GAP   = $1E           ; Gap between buffers ($2000 >> 8)
+DECOMP_WRAP_HI   = $5C           ; Buffer 2 + gap (wrap threshold)
 
 ; Internal zero page variables
 zp_val_lo       = $07
@@ -31,10 +31,10 @@ zp_caller_x     = $0C
 .proc decompress
         ldy     #$00
         lda     zp_out_hi
-        cmp     #$40
-        lda     #$E0
+        cmp     #$3E
+        lda     #$E2
         bcc     store_delta
-        lda     #$20
+        lda     #$1E
 store_delta:
         sta     zp_other_delta
 main_loop:
@@ -71,9 +71,9 @@ fwdref:
         bcc     store_and_check
         sbc     zp_other_delta
 store_and_check:
-        cmp     #$60
+        cmp     #$5C
         bcc     no_high_wrap
-        sbc     #$40
+        sbc     #$3C
 no_high_wrap:
         bne     backref_no_adjust
 set_x3:
@@ -107,7 +107,7 @@ backref_common:
         cmp     #$20
         bcs     backref_no_adjust
 backref_adjust:
-        adc     #$40
+        adc     #$3C
 backref_no_adjust:
         sta     zp_ref_hi
         jsr     read_gamma

@@ -18,9 +18,8 @@ const (
 	addrLow    = DecompBuf1Hi << 8 // Odd songs (S1, S3, S5, S7, S9)
 	addrHigh   = DecompBuf2Hi << 8 // Even songs (S2, S4, S6, S8)
 
-	// Buffer size for compression (max song length rounded to 4KB)
-	// This is independent of the C64's physical buffer gap
-	bufferSize = 8192
+	// Buffer size for compression - must match C64 buffer gap (DecompBufGap << 8)
+	bufferSize = DecompBufGap << 8 // $1E00 = 7680 bytes
 )
 
 var (

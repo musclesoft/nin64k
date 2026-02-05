@@ -37,9 +37,9 @@ const (
 //   4. Run: go run ./cmd/compress && make clean && make
 const (
 	DecompBuf1Hi  = 0x20 // Buffer 1 high byte ($2000)
-	DecompBuf2Hi  = 0x40 // Buffer 2 high byte ($4000)
-	DecompBufGap  = 0x20 // Gap between buffers ($2000 >> 8)
-	DecompWrapHi  = 0x60 // Buffer 2 + gap ($4000 + $2000 = $6000)
+	DecompBuf2Hi  = 0x3E // Buffer 2 high byte ($3E00)
+	DecompBufGap  = 0x1E // Gap between buffers ($1E00 >> 8)
+	DecompWrapHi  = 0x5C // Buffer 2 + gap ($3E00 + $1E00 = $5C00)
 	DecompWrapAdj = DecompWrapHi - DecompBuf1Hi // $40 = wrap adjustment
 )
 

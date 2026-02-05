@@ -1108,7 +1108,7 @@ get_transpose_order:
 ; Uses streaming row-by-row decode: decodes single row into buffer
 get_trackptr_order:
         ; Save channel
-        sty     @channel+1          ; SMC: save channel
+        sty     gto_channel+1       ; SMC: save channel
         ; Get pattern index from page-aligned table
         lda     trackptr_page,y
         sta     zp_ptr+1
@@ -1117,24 +1117,23 @@ get_trackptr_order:
         txa
         tay
         lda     (zp_ptr),y          ; A = pattern index
-        sta     @pat_idx
-@channel:
+gto_channel:
         ldx     #0                  ; SMC: channel
         ; Check if this exact row is already decoded
         cmp     chn_decoded_pat,x
-        bne     @need_decode
+        bne     gto_need_decode
         lda     decode_row
         cmp     chn_decoded_row,x
-        beq     @already_decoded
+        beq     gto_already_decoded
         ; Same pattern, different row - check if sequential
         lda     chn_decoded_row,x
         clc
         adc     #1
         cmp     decode_row
-        beq     @advance_one        ; sequential, decode next row
-@need_decode:
+        beq     gto_advance_one     ; sequential, decode next row
+gto_need_decode:
         ; Different pattern or non-sequential - restart from row 0
-        lda     @pat_idx
+        lda     (zp_ptr),y          ; re-read pattern index
         sta     chn_decoded_pat,x
         ; Reset decoder state
         lda     #0
@@ -1146,17 +1145,17 @@ get_trackptr_order:
         lda     #$ff
         sta     chn_decoded_row,x   ; mark as "before row 0"
         ; Skip to target row
-@skip_loop:
+gto_skip_loop:
         lda     chn_decoded_row,x
         cmp     decode_row
-        beq     @store_to_buffer    ; reached target, decode and store
+        beq     gto_store_to_buffer ; reached target, decode and store
         jsr     decode_advance_row  ; decode (skip) one row
         inc     chn_decoded_row,x
-        jmp     @skip_loop
-@advance_one:
+        jmp     gto_skip_loop
+gto_advance_one:
         ; Sequential advance - decode one more row
         jsr     decode_advance_row
-@store_to_buffer:
+gto_store_to_buffer:
         ; Copy current row (prev_row) to decode buffer
         lda     decode_buffer_lo,x
         sta     zp_decode_dst
@@ -1174,20 +1173,13 @@ get_trackptr_order:
         ; Update decoded row
         lda     decode_row
         sta     chn_decoded_row,x
-@already_decoded:
+gto_already_decoded:
         ; Set zp_trackptr to channel's decode buffer
         lda     decode_buffer_lo,x
         sta     zp_trackptr
         lda     decode_buffer_hi,x
         sta     zp_trackptr+1
         rts
-@pat_idx:       .byte   0
-
-; Decode buffer address table
-decode_buffer_lo:
-        .byte   <decode_buffer_0, <decode_buffer_1, <decode_buffer_2
-decode_buffer_hi:
-        .byte   >decode_buffer_0, >decode_buffer_1, >decode_buffer_2
 
 ; decode_advance_row - Decode one row, updating prev_row and state
 ; Input: X = channel (chn_decoded_pat,x must contain pattern index)
@@ -1195,11 +1187,11 @@ decode_buffer_hi:
 decode_advance_row:
         ; Check for pending RLE
         lda     chn_rle_count,x
-        beq     @not_rle
+        beq     dar_not_rle
         ; RLE: prev_row stays same, just decrement count
         dec     chn_rle_count,x
         rts
-@not_rle:
+dar_not_rle:
         ; Set up source pointer from pattern index
         ; Calculate source: packed_data + packed_ptrs[pattern_idx]
         lda     chn_decoded_pat,x
@@ -1229,12 +1221,12 @@ decode_advance_row:
         ldy     #0
         lda     (zp_decode_src),y
         cmp     #$E0
-        bcs     @check_rle
+        bcs     dar_check_rle
         ; 0x00-0xDF: primary dict index
-        jmp     @copy_dict_entry
-@check_rle:
+        jmp     dar_copy_dict_entry
+dar_check_rle:
         cmp     #$FF
-        beq     @extended
+        beq     dar_extended
         ; 0xE0-0xFE: RLE 1-31 (repeat prev row)
         sec
         sbc     #$DF                ; count = byte - 0xDF (1-31)
@@ -1242,22 +1234,22 @@ decode_advance_row:
         inc     chn_src_off,x       ; advance past RLE byte
         dec     chn_rle_count,x     ; consume one repeat for this row
         rts                         ; prev_row unchanged
-@extended:
+dar_extended:
         ; 0xFF + byte: extended dict index = 224 + next byte
         inc     chn_src_off,x       ; skip 0xFF marker
         ldy     #1
         lda     (zp_decode_src),y   ; get extended byte
         clc
         adc     #224                ; index lo = 224 + byte
-        sta     @dict_idx
+        sta     dar_dict_idx
         lda     #0
         adc     #0                  ; index hi = carry
-        sta     @dict_idx_hi
-        jmp     @copy_dict_entry_16
+        sta     dar_dict_idx_hi
+        jmp     dar_copy_dict_entry_16
 
 ; Copy dict entry A to prev_row (primary index 0-223)
 ; Split dict format: 3 separate arrays indexed by Y
-@copy_dict_entry:
+dar_copy_dict_entry:
         tay                         ; Y = index
         lda     (zp_dict0),y
         sta     chn_prev_row_0,x
@@ -1269,10 +1261,10 @@ decode_advance_row:
         rts
 
 ; Copy dict entry for extended index (224 + byte, indices 224-409)
-@copy_dict_entry_16:
-        ldy     @dict_idx           ; Y = index_lo
-        lda     @dict_idx_hi
-        beq     @ext_direct         ; index < 256, use Y directly
+dar_copy_dict_entry_16:
+        ldy     dar_dict_idx        ; Y = index_lo
+        lda     dar_dict_idx_hi
+        beq     dar_ext_direct      ; index < 256, use Y directly
         ; index >= 256: increment dict high bytes temporarily
         inc     zp_dict0+1
         inc     zp_dict1+1
@@ -1289,7 +1281,7 @@ decode_advance_row:
         dec     zp_dict2+1
         inc     chn_src_off,x       ; advance past extended byte
         rts
-@ext_direct:
+dar_ext_direct:
         lda     (zp_dict0),y
         sta     chn_prev_row_0,x
         lda     (zp_dict1),y
@@ -1299,10 +1291,6 @@ decode_advance_row:
         inc     chn_src_off,x       ; advance past extended byte
         rts
 
-; Local variables for decode
-@dict_idx:      .byte   0
-@dict_idx_hi:   .byte   0
-
 ; get_filtertable_y - Get filtertable entry Y (SMC: address patched in init)
 get_filtertable_y:
 filter_load:
@@ -1310,33 +1298,10 @@ filter_load:
         rts
 
 ; ============================================================================
-; Tables
+; Data Section (player variables initialized to zero serve as boundary marker)
 ; ============================================================================
 
-; Effect dispatch uses binary search instead of jump table (see @haseffect)
-; Effect 0: param 0=nop, 1=vib, 2=break, 3=fineslide
-; Effects 1-E: arp, porta, speed, hrdrest, filttrig, SR, wave, pulse, AD, reso, slide, globalvol, filtmode, jump
-
-sidregoffs:
-        .byte   0, 7, 14
-
-; Vibrato table (9 rows, depth 0 deleted - code skips lookup when depth=0)
-; Frequency order: 4(22) 2(13) 3(11) 1(6) 6(2) 10(1) 5(1) 8(1) 15(1)
-vibrato_table:
-        .byte   $00,$06,$0c,$13,$18,$1e,$24,$29,$2d,$31,$35,$38,$3b,$3d,$3f,$40  ; old depth 4 -> new 1
-        .byte   $00,$03,$06,$09,$0c,$0f,$12,$14,$17,$19,$1b,$1c,$1e,$1f,$1f,$20  ; old depth 2 -> new 2
-        .byte   $00,$05,$09,$0e,$12,$17,$1b,$1e,$22,$25,$28,$2a,$2c,$2e,$2f,$30  ; old depth 3 -> new 3
-        .byte   $00,$02,$03,$05,$06,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,$0f,$10,$10  ; old depth 1 -> new 4
-        .byte   $00,$09,$13,$1c,$25,$2d,$35,$3d,$44,$4a,$50,$55,$59,$5c,$5e,$60  ; old depth 6 -> new 5
-        .byte   $00,$00,$00,$00,$00,$00,$00,$66,$71,$00,$00,$00,$00,$00,$00,$9f  ; old depth 10 -> new 6 (cols 1-6,9-14 unused)
-        .byte   $00,$08,$10,$17,$1f,$26,$2c,$33,$39,$3e,$43,$47,$4a,$4d,$4e,$50  ; old depth 5 -> new 7
-        .byte   $00,$0d,$19,$25,$31,$3c,$47,$51,$5b,$63,$6a,$71,$76,$7a,$7e,$7f  ; old depth 8 -> new 8
-        .byte   $00,$18,$2f,$46,$5c,$71,$85,$98,$aa,$ba,$c8,$d4,$de,$e6,$eb,$ef  ; old depth 15 -> new 9
-
-; ============================================================================
-; Player Variables
-; ============================================================================
-
+; Player Variables (zero-initialized - forms natural code/data boundary)
 chn_hardrestart:        .byte   0, 0, 0
 chn_gateon:             .byte   0, 0, 0
 chn_slideenable:        .byte   0, 0, 0
@@ -1414,6 +1379,36 @@ chn_prev_row_2:         .byte   0, 0, 0        ; prev_row byte 2 (param) per cha
 decode_buffer_0:        .res    3
 decode_buffer_1:        .res    3
 decode_buffer_2:        .res    3
+
+; Decode buffer address tables
+decode_buffer_lo:
+        .byte   <decode_buffer_0, <decode_buffer_1, <decode_buffer_2
+decode_buffer_hi:
+        .byte   >decode_buffer_0, >decode_buffer_1, >decode_buffer_2
+
+; Local variables for decode_advance_row
+dar_dict_idx:           .byte   0
+dar_dict_idx_hi:        .byte   0
+
+; ============================================================================
+; Constant Tables
+; ============================================================================
+
+sidregoffs:
+        .byte   0, 7, 14
+
+; Vibrato table (9 rows, depth 0 deleted - code skips lookup when depth=0)
+; Frequency order: 4(22) 2(13) 3(11) 1(6) 6(2) 10(1) 5(1) 8(1) 15(1)
+vibrato_table:
+        .byte   $00,$06,$0c,$13,$18,$1e,$24,$29,$2d,$31,$35,$38,$3b,$3d,$3f,$40  ; old depth 4 -> new 1
+        .byte   $00,$03,$06,$09,$0c,$0f,$12,$14,$17,$19,$1b,$1c,$1e,$1f,$1f,$20  ; old depth 2 -> new 2
+        .byte   $00,$05,$09,$0e,$12,$17,$1b,$1e,$22,$25,$28,$2a,$2c,$2e,$2f,$30  ; old depth 3 -> new 3
+        .byte   $00,$02,$03,$05,$06,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,$0f,$10,$10  ; old depth 1 -> new 4
+        .byte   $00,$09,$13,$1c,$25,$2d,$35,$3d,$44,$4a,$50,$55,$59,$5c,$5e,$60  ; old depth 6 -> new 5
+        .byte   $00,$00,$00,$00,$00,$00,$00,$66,$71,$00,$00,$00,$00,$00,$00,$9f  ; old depth 10 -> new 6 (cols 1-6,9-14 unused)
+        .byte   $00,$08,$10,$17,$1f,$26,$2c,$33,$39,$3e,$43,$47,$4a,$4d,$4e,$50  ; old depth 5 -> new 7
+        .byte   $00,$0d,$19,$25,$31,$3c,$47,$51,$5b,$63,$6a,$71,$76,$7a,$7e,$7f  ; old depth 8 -> new 8
+        .byte   $00,$18,$2f,$46,$5c,$71,$85,$98,$aa,$ba,$c8,$d4,$de,$e6,$eb,$ef  ; old depth 15 -> new 9
 
 ; Split frequency tables (104 entries: notes 0-103)
 ; Note 103 holds remapped absolute note value (was 127)

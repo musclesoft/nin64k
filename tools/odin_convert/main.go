@@ -4632,6 +4632,10 @@ func findInstructionStarts(data []byte, base uint16) []uint16 {
 	rtsCount := 0
 	lastRtsOffset := -100
 	for offset < len(data) {
+		// Check for three consecutive zero bytes (code/data boundary marker)
+		if offset+2 < len(data) && data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
+			break // Hit data section
+		}
 		opcode := data[offset]
 		size := instrSize[opcode]
 		if size == 0 {

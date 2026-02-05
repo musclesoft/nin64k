@@ -3173,7 +3173,8 @@ func (c *CPU6502) Call(addr uint16) {
 }
 
 // RunFrames runs the play routine for n frames
-func (c *CPU6502) RunFrames(playAddr uint16, frames int) ([]SIDWrite, uint64) {
+// If initAddr != 0, measures init+play after normal playback for worst-case frame time
+func (c *CPU6502) RunFrames(playAddr uint16, frames int, initAddr uint16, initA, initX byte) ([]SIDWrite, uint64) {
 	c.SIDWrites = nil
 	c.CurrentFrame = 0
 	var maxCyclesPerFrame uint64
@@ -3185,6 +3186,21 @@ func (c *CPU6502) RunFrames(playAddr uint16, frames int) ([]SIDWrite, uint64) {
 		if frameCycles > maxCyclesPerFrame {
 			maxCyclesPerFrame = frameCycles
 		}
+	}
+	// Measure init+play cycle time separately (worst-case song switch)
+	if initAddr != 0 {
+		savedWrites := c.SIDWrites
+		c.SIDWrites = nil
+		startCycles := c.Cycles
+		c.A = initA
+		c.X = initX
+		c.Call(initAddr)
+		c.Call(playAddr)
+		frameCycles := c.Cycles - startCycles
+		if frameCycles > maxCyclesPerFrame {
+			maxCyclesPerFrame = frameCycles
+		}
+		c.SIDWrites = savedWrites // Restore original writes for comparison
 	}
 	return c.SIDWrites, maxCyclesPerFrame
 }
@@ -3243,7 +3259,7 @@ func testSong(songNum int, rawData, convertedData []byte, convStats ConversionSt
 	cpuBuiltin.Call(bufferBase)
 	cpuBuiltin.SIDWrites = nil
 	cpuBuiltin.Cycles = 0
-	builtinWrites, builtinMaxCycles := cpuBuiltin.RunFrames(playAddr, testFrames)
+	builtinWrites, builtinMaxCycles := cpuBuiltin.RunFrames(playAddr, testFrames, bufferBase, 0, 0)
 	builtinCycles := cpuBuiltin.Cycles
 
 	// Use pre-converted data (with cross-song deduplication applied)
@@ -3263,7 +3279,7 @@ func testSong(songNum int, rawData, convertedData []byte, convStats ConversionSt
 
 	cpuNew.SIDWrites = nil
 	cpuNew.Cycles = 0
-	newWrites, newMaxCycles := cpuNew.RunFrames(playerBase+3, testFrames)
+	newWrites, newMaxCycles := cpuNew.RunFrames(playerBase+3, testFrames, playerBase, 0, byte(bufferBase>>8))
 	newCycles := cpuNew.Cycles
 
 	match := bytes.Equal(serializeWrites(builtinWrites), serializeWrites(newWrites))
@@ -4102,7 +4118,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	snapshot := cpu.Snapshot()
 
 	// Get baseline
-	baselineWrites, _ := cpu.RunFrames(playerBase+3, testFrames)
+	baselineWrites, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
 	baseline := serializeWrites(baselineWrites)
 
 	// Test equivalences for each extended entry
@@ -4170,7 +4186,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 			cpu.Memory[bufferBase+0x99F+410+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+410+uint16(cand.idx)]
 			cpu.Memory[bufferBase+0x99F+820+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+820+uint16(cand.idx)]
 
-			testWrites, _ := cpu.RunFrames(playerBase+3, testFrames)
+			testWrites, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
 			testResult := serializeWrites(testWrites)
 
 			if bytes.Equal(baseline, testResult) {

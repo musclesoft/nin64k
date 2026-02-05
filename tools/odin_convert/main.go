@@ -1523,9 +1523,9 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	trackptr2Off := 0x700
 	filterOff := 0x800         // Filter at $800 (227 bytes max)
 	arpOff := 0x8E3            // Arp at $8E3 (188 bytes max)
-	rowDictOff := 0x99F        // Row dictionary (1230 bytes = 410 entries × 3)
-	packedPtrsOff := 0xE75     // Packed pointers (182 bytes = 91 patterns × 2)
-	packedDataOff := 0xF2B     // Packed pattern data
+	rowDictOff := 0x99F        // Row dict0 (notes), dict1 at +410, dict2 at +820
+	packedPtrsOff := 0xE6D     // Packed pointers (182 bytes = 91 patterns × 2)
+	packedDataOff := 0xF23     // Packed pattern data
 
 	// Extract patterns to slice for packing (do effect/order remapping first)
 	patternData := make([][]byte, numPatterns)
@@ -1726,8 +1726,14 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	copy(out[arpOff:], newArpTable)
 
 	// Write pattern packing data
-	// Row dictionary
-	copy(out[rowDictOff:], dict)
+	// Row dictionary in split format: 3 arrays of 410 bytes each
+	// dict0 (notes), dict1 (inst|effect), dict2 (params)
+	numEntries := len(dict) / 3
+	for i := 0; i < numEntries; i++ {
+		out[rowDictOff+i] = dict[i*3]           // note
+		out[rowDictOff+410+i] = dict[i*3+1]     // inst|effect
+		out[rowDictOff+820+i] = dict[i*3+2]     // param
+	}
 	// Packed pointers (offset into packed data per pattern)
 	for i, pOff := range patOffsets {
 		out[packedPtrsOff+i*2] = byte(pOff & 0xFF)
@@ -3678,10 +3684,18 @@ func main() {
 			arpOff     = 0x8E3
 			rowDictOff = 0x99F
 		)
+		// Read split dict back into interleaved format for dedup comparison
+		numEntries := stats.PatternDictSize
+		prevDict := make([]byte, numEntries*3)
+		for i := 0; i < numEntries; i++ {
+			prevDict[i*3] = convertedData[rowDictOff+i]         // note
+			prevDict[i*3+1] = convertedData[rowDictOff+410+i]   // inst|effect
+			prevDict[i*3+2] = convertedData[rowDictOff+820+i]   // param
+		}
 		prevTables = &PrevSongTables{
 			Arp:     append([]byte{}, convertedData[arpOff:arpOff+stats.NewArpSize]...),
 			Filter:  append([]byte{}, convertedData[filterOff:filterOff+stats.NewFilterSize]...),
-			RowDict: append([]byte{}, convertedData[rowDictOff:rowDictOff+stats.PatternDictSize*3]...),
+			RowDict: prevDict,
 		}
 	}
 
@@ -3710,8 +3724,16 @@ func main() {
 		if convertedSongs[songNum-1] == nil {
 			continue
 		}
-		dictSize := convertedStats[songNum-1].PatternDictSize * 3
-		combos := analyzeRowDictCombinations(convertedSongs[songNum-1][rowDictOffAnalysis : rowDictOffAnalysis+dictSize])
+		// Convert split dict format back to interleaved for analysis
+		numEntries := convertedStats[songNum-1].PatternDictSize
+		interleavedDict := make([]byte, numEntries*3)
+		data := convertedSongs[songNum-1]
+		for i := 0; i < numEntries; i++ {
+			interleavedDict[i*3] = data[rowDictOffAnalysis+i]
+			interleavedDict[i*3+1] = data[rowDictOffAnalysis+410+i]
+			interleavedDict[i*3+2] = data[rowDictOffAnalysis+820+i]
+		}
+		combos := analyzeRowDictCombinations(interleavedDict)
 		for i := 0; i < 8; i++ {
 			totalCombos[i] += combos[i]
 		}
@@ -3973,10 +3995,10 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	nopIdx := -1 // [0,0,0]
 
 	for idx := 0; idx < dictSize; idx++ {
-		dictOff := 0x99F + idx*3
-		note := convertedData[dictOff]
-		instEffect := convertedData[dictOff+1]
-		param := convertedData[dictOff+2]
+		// Split dict format: 3 arrays of 410 bytes each
+		note := convertedData[0x99F+idx]
+		instEffect := convertedData[0x99F+410+idx]
+		param := convertedData[0x99F+820+idx]
 
 		sig := signature{instEffect, param}
 		sigGroups[sig] = append(sigGroups[sig], idx)
@@ -4015,10 +4037,11 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	found := 0
 
 	for extIdx := 224; extIdx < dictSize; extIdx++ {
-		extOff := 0x99F + extIdx*3
-		extNote := convertedData[extOff]
-		extInstEffect := convertedData[extOff+1]
-		extSig := signature{extInstEffect, convertedData[extOff+2]}
+		// Split dict format: note at +idx, instEffect at +410+idx, param at +820+idx
+		extNote := convertedData[0x99F+extIdx]
+		extInstEffect := convertedData[0x99F+410+extIdx]
+		extParam := convertedData[0x99F+820+extIdx]
+		extSig := signature{extInstEffect, extParam}
 		extNE := noteEff{extNote, extInstEffect}
 
 		// Build ordered candidate list with types (test in priority order)
@@ -4065,11 +4088,11 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 
 			cpu.Restore(snapshot)
 
-			extMemOff := bufferBase + uint16(extOff)
-			priMemOff := bufferBase + 0x99F + uint16(cand.idx*3)
-			cpu.Memory[extMemOff] = cpu.Memory[priMemOff]
-			cpu.Memory[extMemOff+1] = cpu.Memory[priMemOff+1]
-			cpu.Memory[extMemOff+2] = cpu.Memory[priMemOff+2]
+			// Swap extended entry with primary entry (split dict format)
+			// Note bytes at 0x99F+idx, instEffect at 0x99F+410+idx, param at 0x99F+820+idx
+			cpu.Memory[bufferBase+0x99F+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+uint16(cand.idx)]
+			cpu.Memory[bufferBase+0x99F+410+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+410+uint16(cand.idx)]
+			cpu.Memory[bufferBase+0x99F+820+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+820+uint16(cand.idx)]
 
 			testWrites, _ := cpu.RunFrames(playerBase+3, testFrames)
 			testResult := serializeWrites(testWrites)

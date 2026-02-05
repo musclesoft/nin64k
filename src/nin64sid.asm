@@ -13,7 +13,7 @@
 
 .setcpu "6502"
 
-; Zero page (avoid player's $70-$7D)
+; Zero page (avoid player's $10-$21)
 zp_part_num     = $7E
 zp_preloaded    = $7F              ; Song number that's been preloaded
 zp_last_line    = $0D

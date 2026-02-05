@@ -10,14 +10,16 @@
         jmp     player_init             ; +$00: Init (A=song, X=buffer)
         jmp     player_play             ; +$03: Play one frame
 
-; Zero page usage (contiguous block $70-$7D)
-zp_song_base     = $70          ; 2 bytes: base address of current song data
-zp_ptr           = $72          ; 2 bytes: temp pointer / temp values
-zp_trackptr      = $74          ; 2 bytes: track pointer
-zp_row_dict      = $76          ; 2 bytes: row dictionary address
-zp_packed_data   = $78          ; 2 bytes: packed data address
-zp_decode_src    = $7A          ; 2 bytes: decode source pointer (temp)
-zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
+; Zero page usage (contiguous block $10-$21)
+zp_song_base     = $10          ; 2 bytes: base address of current song data
+zp_ptr           = $12          ; 2 bytes: temp pointer / temp values
+zp_trackptr      = $14          ; 2 bytes: track pointer
+zp_dict0         = $16          ; 2 bytes: dict0 (note bytes)
+zp_packed_data   = $18          ; 2 bytes: packed data address
+zp_decode_src    = $1A          ; 2 bytes: decode source pointer (temp)
+zp_decode_dst    = $1C          ; 2 bytes: decode dest pointer (temp)
+zp_dict1         = $1E          ; 2 bytes: dict1 (inst|effect bytes)
+zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 
 ; Song format: fixed offsets (all tables deduplicated)
 ; $000: Instruments (512 bytes) - interleaved: inst N at offset N*16
@@ -25,9 +27,11 @@ zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 ; $500: Trackptr ch0-2 (256 bytes each)
 ; $800: Filtertable (227 bytes max)
 ; $8E3: Arptable (188 bytes max)
-; $99F: Row dictionary (1230 bytes = 410 entries × 3)
-; $E75: Packed pointers (182 bytes = 91 patterns × 2)
-; $F2B: Packed pattern data
+; $99F: Row dict0 (410 bytes) - note bytes
+; $B39: Row dict1 (410 bytes) - inst|effect bytes
+; $CD3: Row dict2 (410 bytes) - param bytes
+; $E6D: Packed pointers (182 bytes = 91 patterns × 2)
+; $F23: Packed pattern data
 ;
 ; Global wavetable (163 bytes) is stored in player, shared across all songs.
 ; Instrument wave indices point directly into global_wavetable.
@@ -62,8 +66,8 @@ zp_decode_dst    = $7C          ; 2 bytes: decode dest pointer (temp)
 
 ; Pattern packing constants
 ROW_DICT_OFF        = $99F
-PACKED_PTRS_OFF     = $E75
-PACKED_DATA_OFF     = $F2B
+PACKED_PTRS_OFF     = $E6D
+PACKED_DATA_OFF     = $F23
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0
@@ -146,14 +150,31 @@ player_init:
         sta     chn_decoded_row+0
         sta     chn_decoded_row+1
         sta     chn_decoded_row+2
-        ; Set row_dict_addr = song_base + ROW_DICT_OFF
+        ; Set up split dictionary pointers (3 arrays of 410 bytes each)
+        ; dict0 (notes) at ROW_DICT_OFF
         lda     zp_song_base
         clc
         adc     #<ROW_DICT_OFF
-        sta     zp_row_dict
+        sta     zp_dict0
         lda     zp_song_base+1
         adc     #>ROW_DICT_OFF
-        sta     zp_row_dict+1
+        sta     zp_dict0+1
+        ; dict1 (inst|effect) at ROW_DICT_OFF + 410
+        lda     zp_dict0
+        clc
+        adc     #<410
+        sta     zp_dict1
+        lda     zp_dict0+1
+        adc     #>410
+        sta     zp_dict1+1
+        ; dict2 (params) at ROW_DICT_OFF + 820
+        lda     zp_dict1
+        clc
+        adc     #<410
+        sta     zp_dict2
+        lda     zp_dict1+1
+        adc     #>410
+        sta     zp_dict2+1
         ; Set packed_ptrs_addr = song_base + PACKED_PTRS_OFF
         lda     zp_song_base
         clc
@@ -1234,50 +1255,48 @@ decode_advance_row:
         sta     @dict_idx_hi
         jmp     @copy_dict_entry_16
 
-; Copy dict entry A to prev_row (primary index < 224)
+; Copy dict entry A to prev_row (primary index 0-223)
+; Split dict format: 3 separate arrays indexed by Y
 @copy_dict_entry:
-        sta     @dict_idx
-        lda     #0
-        sta     @dict_idx_hi
-        ; Fall through to 16-bit version
-
-; Copy dict entry to chn_prev_row_* for channel X
-@copy_dict_entry_16:
-        ; Calculate dict offset: index * 3 (16-bit index)
-        ; index*3 = index + index*2
-        lda     @dict_idx
-        asl     a                   ; A*2 lo
-        sta     zp_ptr
-        lda     @dict_idx_hi
-        rol     a                   ; A*2 hi
-        sta     zp_ptr+1
-        ; Add original index
-        lda     zp_ptr
-        clc
-        adc     @dict_idx
-        sta     zp_ptr
-        lda     zp_ptr+1
-        adc     @dict_idx_hi
-        sta     zp_ptr+1
-        ; Add row_dict base
-        lda     zp_ptr
-        clc
-        adc     zp_row_dict
-        sta     zp_ptr
-        lda     zp_ptr+1
-        adc     zp_row_dict+1
-        sta     zp_ptr+1
-        ; Copy 3 bytes to prev_row
-        ldy     #0
-        lda     (zp_ptr),y
+        tay                         ; Y = index
+        lda     (zp_dict0),y
         sta     chn_prev_row_0,x
-        iny
-        lda     (zp_ptr),y
+        lda     (zp_dict1),y
         sta     chn_prev_row_1,x
-        iny
-        lda     (zp_ptr),y
+        lda     (zp_dict2),y
         sta     chn_prev_row_2,x
         inc     chn_src_off,x       ; advance past dict index byte
+        rts
+
+; Copy dict entry for extended index (224 + byte, indices 224-409)
+@copy_dict_entry_16:
+        ldy     @dict_idx           ; Y = index_lo
+        lda     @dict_idx_hi
+        beq     @ext_direct         ; index < 256, use Y directly
+        ; index >= 256: increment dict high bytes temporarily
+        inc     zp_dict0+1
+        inc     zp_dict1+1
+        inc     zp_dict2+1
+        lda     (zp_dict0),y
+        sta     chn_prev_row_0,x
+        lda     (zp_dict1),y
+        sta     chn_prev_row_1,x
+        lda     (zp_dict2),y
+        sta     chn_prev_row_2,x
+        ; Restore dict pointers
+        dec     zp_dict0+1
+        dec     zp_dict1+1
+        dec     zp_dict2+1
+        inc     chn_src_off,x       ; advance past extended byte
+        rts
+@ext_direct:
+        lda     (zp_dict0),y
+        sta     chn_prev_row_0,x
+        lda     (zp_dict1),y
+        sta     chn_prev_row_1,x
+        lda     (zp_dict2),y
+        sta     chn_prev_row_2,x
+        inc     chn_src_off,x       ; advance past extended byte
         rts
 
 ; Local variables for decode

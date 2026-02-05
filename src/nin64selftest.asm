@@ -30,11 +30,11 @@
 
 .setcpu "6502"
 
-; Zero page (avoid player's $70-$7D)
+; Zero page (avoid player's $10-$21)
 zp_selected     = $7E
 zp_load_flag    = $7F
 zp_part_num     = $80
-; Selftest zero page ($D9-$E6 to avoid player's $FB-$FE)
+; Selftest zero page
 zp_csum_lo      = $D9
 zp_csum_hi      = $DA
 zp_size_lo      = $DB

@@ -990,8 +990,7 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		}
 	}
 
-	// Deduplicate patterns by content
-	// Map content hash to canonical address, and address to canonical address
+	// Deduplicate patterns by content (exact match or transpose-equivalent)
 	// Sort addresses first for deterministic output
 	var sortedPatternAddrs []uint16
 	for addr := range patternAddrs {
@@ -1004,17 +1003,112 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 			}
 		}
 	}
+
+	// Helper: check if two patterns are transpose-equivalent
+	// Returns (isEquiv, transposeOffset) where canonical_note + offset = this_note
+	checkTransposeEquiv := func(canonPat, thisPat []byte) (bool, int) {
+		transpose := 0
+		transposeSet := false
+		for row := 0; row < 64; row++ {
+			off := row * 3
+			noteCanon := canonPat[off] & 0x7F
+			noteThis := thisPat[off] & 0x7F
+			// Compare inst+effect bits (byte0 bit7 + byte1 + byte2)
+			if (canonPat[off]&0x80) != (thisPat[off]&0x80) || canonPat[off+1] != thisPat[off+1] || canonPat[off+2] != thisPat[off+2] {
+				return false, 0
+			}
+			// Check note transpose
+			if noteCanon != 0 || noteThis != 0 {
+				if noteCanon == 0 || noteThis == 0 {
+					return false, 0
+				}
+				diff := int(noteThis) - int(noteCanon)
+				if !transposeSet {
+					transpose = diff
+					transposeSet = true
+				} else if diff != transpose {
+					return false, 0
+				}
+			}
+		}
+		return true, transpose
+	}
+
 	contentToCanonical := make(map[string]uint16)
 	addrToCanonical := make(map[uint16]uint16)
+	addrTransposeDelta := make(map[uint16]int) // transpose delta: canonical_note + delta = original_note
 	for _, addr := range sortedPatternAddrs {
 		srcOff := int(addr) - baseAddr
 		content := string(raw[srcOff : srcOff+192])
+		// First check exact match
 		if canonical, exists := contentToCanonical[content]; exists {
 			addrToCanonical[addr] = canonical
+			addrTransposeDelta[addr] = 0
 		} else {
-			contentToCanonical[content] = addr
-			addrToCanonical[addr] = addr
+			// Check transpose equivalence against existing canonical patterns (in sorted order)
+			found := false
+			var canonAddrs []uint16
+			for _, ca := range contentToCanonical {
+				canonAddrs = append(canonAddrs, ca)
+			}
+			sort.Slice(canonAddrs, func(i, j int) bool { return canonAddrs[i] < canonAddrs[j] })
+			for _, canonAddr := range canonAddrs {
+				canonOff := int(canonAddr) - baseAddr
+				if isEquiv, delta := checkTransposeEquiv(raw[canonOff:canonOff+192], raw[srcOff:srcOff+192]); isEquiv && delta != 0 {
+					addrToCanonical[addr] = canonAddr
+					addrTransposeDelta[addr] = delta
+					found = true
+					break
+				}
+			}
+			if !found {
+				contentToCanonical[content] = addr
+				addrToCanonical[addr] = addr
+				addrTransposeDelta[addr] = 0
+			}
 		}
+	}
+
+	// Rewrite source transpose tables for transpose-equivalent patterns
+	// This must happen BEFORE building the dictionary so all patterns use canonical notes
+	srcTransposeOffsets := []int{srcTranspose0Off, srcTranspose1Off, srcTranspose2Off}
+	transposeRewrites := 0
+	for _, oldOrder := range reachableOrders {
+		for ch := 0; ch < 3; ch++ {
+			lo := raw[trackLoOff[ch]+oldOrder]
+			hi := raw[trackHiOff[ch]+oldOrder]
+			addr := uint16(lo) | uint16(hi)<<8
+			if delta := addrTransposeDelta[addr]; delta != 0 {
+				// Add delta to source transpose (canonical_note + delta = original_note)
+				// So when playing canonical notes with adjusted transpose, we get original pitch
+				oldTrans := raw[srcTransposeOffsets[ch]+oldOrder]
+				raw[srcTransposeOffsets[ch]+oldOrder] = byte(int(oldTrans) + delta)
+				transposeRewrites++
+			}
+		}
+	}
+	if transposeRewrites > 0 {
+		fmt.Printf("  Transpose dedup: adjusted %d transpose entries\n", transposeRewrites)
+	}
+
+	// Rewrite pattern pointers in raw[] to point to canonical patterns
+	// This ensures truncation limit calculations and other reads use canonical data
+	pointerRewrites := 0
+	for _, oldOrder := range reachableOrders {
+		for ch := 0; ch < 3; ch++ {
+			lo := raw[trackLoOff[ch]+oldOrder]
+			hi := raw[trackHiOff[ch]+oldOrder]
+			addr := uint16(lo) | uint16(hi)<<8
+			canonical := addrToCanonical[addr]
+			if canonical != addr {
+				raw[trackLoOff[ch]+oldOrder] = byte(canonical)
+				raw[trackHiOff[ch]+oldOrder] = byte(canonical >> 8)
+				pointerRewrites++
+			}
+		}
+	}
+	if pointerRewrites > 0 {
+		fmt.Printf("  Pattern dedup: rewrote %d pattern pointers\n", pointerRewrites)
 	}
 
 	// Build unique pattern list (only canonical addresses)
@@ -1495,8 +1589,22 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		prevDict = prevTables.RowDict
 	}
 
+	// Build dictionary from ALL patterns (including non-canonical transpose equivalents)
+	// This ensures rows from transpose-equivalent patterns are available for other patterns that share them
+	allPatternData := make([][]byte, len(sortedPatternAddrs))
+	for i, addr := range sortedPatternAddrs {
+		srcOff := int(addr) - baseAddr
+		pat := make([]byte, 192)
+		if srcOff >= 0 && srcOff+192 <= len(raw) {
+			copy(pat, raw[srcOff:srcOff+192])
+			remapPatternPositionJumps(pat, orderMap)
+			remapPatternEffects(pat, effectRemap)
+		}
+		allPatternData[i] = pat
+	}
+
 	// Build dictionary first to find NOP entry for dead entry mapping
-	dict, _ := buildPatternDict(patternData, prevDict)
+	dict, _ := buildPatternDict(allPatternData, prevDict)
 
 	// Load equivalence map for this song (needs dict to find NOP)
 	equivMap := loadSongEquivMap(songNum, dict)
@@ -3255,6 +3363,7 @@ func main() {
 	fmt.Printf("Pattern refs per song: %v (total %d, dedup saves %d)\n", songPatternCounts, totalPatternRefs, totalPatternRefs-totalUniquePatterns)
 
 	// Analyze shared row dictionary encoding
+	analyzeTransposePatterns(songData)
 	analyzeSharedRowDict(songData, effectRemap)
 
 	// Analyze vibrato depth usage frequency across all instruments
@@ -3913,6 +4022,147 @@ func analyzeEquivResults(results []EquivResult) {
 	} else {
 		fmt.Println("No equivalences found")
 	}
+}
+
+// analyzeTransposePatterns finds patterns that are duplicates with transpose applied
+func analyzeTransposePatterns(songData [][]byte) {
+	fmt.Println("\n=== Transpose Pattern Analysis ===")
+
+	// Collect all unique patterns across all songs
+	type patInfo struct {
+		songNum int
+		addr    uint16
+		data    []byte
+	}
+	var allPatterns []patInfo
+
+	for songNum := 1; songNum <= 9; songNum++ {
+		raw := songData[songNum-1]
+		if raw == nil {
+			continue
+		}
+		baseAddr := int(raw[2]) << 8
+		trackLo0Off := int(readWord(raw, codeTrackLo0)) - baseAddr
+		trackHi0Off := int(readWord(raw, codeTrackHi0)) - baseAddr
+		trackLo1Off := int(readWord(raw, codeTrackLo1)) - baseAddr
+		trackHi1Off := int(readWord(raw, codeTrackHi1)) - baseAddr
+		trackLo2Off := int(readWord(raw, codeTrackLo2)) - baseAddr
+		trackHi2Off := int(readWord(raw, codeTrackHi2)) - baseAddr
+		trackLoOff := []int{trackLo0Off, trackLo1Off, trackLo2Off}
+		trackHiOff := []int{trackHi0Off, trackHi1Off, trackHi2Off}
+		rawLen := len(raw)
+
+		seen := make(map[uint16]bool)
+		for order := 0; order < 256; order++ {
+			for ch := 0; ch < 3; ch++ {
+				if trackLoOff[ch]+order >= rawLen || trackHiOff[ch]+order >= rawLen {
+					continue
+				}
+				lo := raw[trackLoOff[ch]+order]
+				hi := raw[trackHiOff[ch]+order]
+				addr := uint16(lo) | uint16(hi)<<8
+				srcOff := int(addr) - baseAddr
+				if srcOff >= 0 && srcOff+192 <= rawLen && !seen[addr] {
+					seen[addr] = true
+					pat := make([]byte, 192)
+					copy(pat, raw[srcOff:srcOff+192])
+					allPatterns = append(allPatterns, patInfo{songNum, addr, pat})
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Total unique patterns: %d\n", len(allPatterns))
+
+	// Check each pair of patterns for transpose equivalence
+	// Two patterns are transpose-equivalent if all non-zero notes differ by the same constant
+	// and all other fields (inst, effect, param) are identical
+	transposeGroups := make(map[int][]int) // canonical index -> list of equivalent indices
+	canonical := make([]int, len(allPatterns))
+	for i := range canonical {
+		canonical[i] = i
+	}
+
+	for i := 0; i < len(allPatterns); i++ {
+		if canonical[i] != i {
+			continue // already matched
+		}
+		for j := i + 1; j < len(allPatterns); j++ {
+			if canonical[j] != j {
+				continue // already matched
+			}
+			// Check if patterns are transpose-equivalent
+			patA := allPatterns[i].data
+			patB := allPatterns[j].data
+			transpose := 0
+			transposeSet := false
+			match := true
+
+			for row := 0; row < 64 && match; row++ {
+				off := row * 3
+				noteA := patA[off] & 0x7F
+				noteB := patB[off] & 0x7F
+				// Compare inst+effect bits (byte0 bit7 + byte1)
+				if (patA[off]&0x80) != (patB[off]&0x80) || patA[off+1] != patB[off+1] || patA[off+2] != patB[off+2] {
+					match = false
+					break
+				}
+				// Check note transpose
+				if noteA != 0 || noteB != 0 {
+					if noteA == 0 || noteB == 0 {
+						// One has note, other doesn't
+						match = false
+						break
+					}
+					diff := int(noteB) - int(noteA)
+					if !transposeSet {
+						transpose = diff
+						transposeSet = true
+					} else if diff != transpose {
+						match = false
+						break
+					}
+				}
+			}
+
+			if match && transposeSet && transpose != 0 {
+				canonical[j] = i
+				transposeGroups[i] = append(transposeGroups[i], j)
+			}
+		}
+	}
+
+	// Count and report
+	totalDupes := 0
+	for i, group := range transposeGroups {
+		if len(group) > 0 {
+			totalDupes += len(group)
+			if len(group) <= 3 {
+				fmt.Printf("  Pattern song%d@$%04X has %d transpose dupes: ",
+					allPatterns[i].songNum, allPatterns[i].addr, len(group))
+				for _, j := range group {
+					// Calculate transpose
+					noteA := allPatterns[i].data[0] & 0x7F
+					noteB := allPatterns[j].data[0] & 0x7F
+					for row := 0; row < 64; row++ {
+						na := allPatterns[i].data[row*3] & 0x7F
+						nb := allPatterns[j].data[row*3] & 0x7F
+						if na != 0 && nb != 0 {
+							noteA, noteB = na, nb
+							break
+						}
+					}
+					transpose := int(noteB) - int(noteA)
+					fmt.Printf("song%d@$%04X(%+d) ", allPatterns[j].songNum, allPatterns[j].addr, transpose)
+				}
+				fmt.Println()
+			}
+		}
+	}
+
+	uniqueAfterDedup := len(allPatterns) - totalDupes
+	fmt.Printf("Transpose duplicates: %d patterns could be deduped\n", totalDupes)
+	fmt.Printf("Unique after dedup: %d (was %d)\n", uniqueAfterDedup, len(allPatterns))
 }
 
 // analyzeSharedRowDict analyzes encoding with a shared row dictionary across all songs

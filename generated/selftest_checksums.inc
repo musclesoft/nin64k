@@ -4,21 +4,21 @@ selftest_checksums:
         .word   $D567               ; Song 2
         .word   $F2E4               ; Song 3
         .word   $7DD0               ; Song 4
-        .word   $F8A6               ; Song 5
-        .word   $92EB               ; Song 6
-        .word   $14D0               ; Song 7
-        .word   $CDEB               ; Song 8
-        .word   $AB79               ; Song 9
+        .word   $ED41               ; Song 5
+        .word   $80C7               ; Song 6
+        .word   $1511               ; Song 7
+        .word   $CE04               ; Song 8
+        .word   $ABB1               ; Song 9
 
 selftest_sizes:
         .word   7582                ; Song 1
         .word   6427                ; Song 2
         .word   6792                ; Song 3
         .word   7557                ; Song 4
-        .word   7189                ; Song 5
-        .word   6591                ; Song 6
+        .word   7126                ; Song 5
+        .word   6527                ; Song 6
         .word   6059                ; Song 7
         .word   6645                ; Song 8
         .word   7571                ; Song 9
 
-selftest_stream_csum:  .word $54F3
+selftest_stream_csum:  .word $389B

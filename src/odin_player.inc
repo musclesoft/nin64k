@@ -385,7 +385,6 @@ player_play:
         ldy     #INST_VIBDELAY
         lda     (zp_ptr),y
         sta     chn_vibdelay,x
-        jsr     checkpoint
         ldy     #INST_PULSEWIDTH
         lda     (zp_ptr),y
         and     #$f0
@@ -472,13 +471,9 @@ pi_hasinst:
         lda     global_wavetable,y
         sta     chn_waveform,x
         iny
-        sty     zp_temp0
+        tya
         ldy     #INST_WAVEEND
-        lda     (zp_ptr),y
-        sta     pi_waveend+1
-        lda     zp_temp0
-pi_waveend:
-        cmp     #$00
+        cmp     (zp_ptr),y
         bcc     pi_waveset
         beq     pi_waveset
         iny                             ; INST_WAVELOOP
@@ -501,13 +496,9 @@ pi_arpabs:
         sta     zp_temp0            ; save note value
         ldy     chn_arpidx,x
         iny
-        sty     zp_temp0+1          ; save new arpidx
+        tya
         ldy     #INST_ARPEND
-        lda     (zp_ptr),y
-        sta     pi_arpend+1
-        lda     zp_temp0+1
-pi_arpend:
-        cmp     #$00
+        cmp     (zp_ptr),y
         bcc     pi_arpset
         beq     pi_arpset
         iny                             ; INST_ARPLOOP
@@ -796,18 +787,18 @@ fx_haseffect:
         sec
         sbc     #$20
         sta     chn_slidedelta_lo,x
-        lda     chn_slidedelta_hi,x
-        sbc     #$00
-        sta     chn_slidedelta_hi,x
+        bcs     @slide_dn_done
+        dec     chn_slidedelta_hi,x
+@slide_dn_done:
         jmp     do_slide_vib
 @slide_up:
         lda     chn_slidedelta_lo,x
         clc
         adc     #$20
         sta     chn_slidedelta_lo,x
-        lda     chn_slidedelta_hi,x
-        adc     #$00
-        sta     chn_slidedelta_hi,x
+        bcc     @slide_up_done
+        inc     chn_slidedelta_hi,x
+@slide_up_done:
         jmp     do_slide_vib
 @fx_c_to_e:
         cmp     #$e0
@@ -967,7 +958,6 @@ filtdone:
         jsr     check_hardrestart
 
 @dump:
-        jsr     checkpoint
         ldx     #$00
 @dumploop:
         jsr     checkpoint
@@ -997,8 +987,7 @@ filtdone:
         lda     globalvolume
         ora     filter_mode
         sta     $d418
-        jsr     checkpoint
-        rts
+        jmp     checkpoint
 
 ; ============================================================================
 ; check_hardrestart - Check if hard restart needed for channel X
@@ -1014,7 +1003,6 @@ check_hardrestart:
         bmi     @do_hr
         iny
         lda     (zp_trackptr),y
-        dey
         and     #$e0
         cmp     #$40              ; tone portamento (new effect 2 = bits 0-2 = 2 = 0x40 >> 5)
         beq     @done
@@ -1158,9 +1146,9 @@ dar_not_rle:
         ; (C already 0: previous ADC of ptr hi + base hi never overflows)
         adc     zp_temp0
         sta     zp_temp0
-        lda     #0
-        adc     zp_temp0+1
-        sta     zp_temp0+1
+        bcc     @dar_no_carry
+        inc     zp_temp0+1
+@dar_no_carry:
         jsr     checkpoint
         ; Read encoded byte
         ldy     #0
@@ -1188,7 +1176,7 @@ dar_extended:
         adc     #224                ; index lo = 224 + byte
         sta     dar_dict_idx
         lda     #0
-        adc     #0                  ; index hi = carry
+        rol                         ; index hi = carry
         sta     dar_dict_idx_hi
         jmp     dar_copy_dict_entry_16
 

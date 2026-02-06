@@ -277,8 +277,8 @@ player_play:
         bmi     @newpattern
         inc     trackrow
         lda     trackrow
-        cmp     #$40
-        bmi     @pattern_ok
+        asl     a
+        bpl     @pattern_ok
 @newpattern:
         lda     nextordernumber
         sta     ordernumber
@@ -334,26 +334,130 @@ player_play:
         jsr     get_trackptr_order
 @use_prefetch:
         jsr     checkpoint
-        ldx     #0
-        lda     decode_buffer_lo,x
-        sta     zp_trackptr
-        lda     decode_buffer_hi,x
-        sta     zp_trackptr+1
-        jsr     fetch_channel_row
-        jsr     checkpoint
-        ldx     #1
-        lda     decode_buffer_lo,x
-        sta     zp_trackptr
-        lda     decode_buffer_hi,x
-        sta     zp_trackptr+1
-        jsr     fetch_channel_row
-        jsr     checkpoint
         ldx     #2
+@fetch_channel_rows:
         lda     decode_buffer_lo,x
         sta     zp_trackptr
         lda     decode_buffer_hi,x
         sta     zp_trackptr+1
-        jsr     fetch_channel_row
+
+        ldy     #0
+        lda     (zp_trackptr),y
+        asl     a
+        pha
+        iny
+        lda     (zp_trackptr),y
+        pha
+        ror     a
+        and     #$f0
+        sta     chn_effect,x
+        iny
+        lda     (zp_trackptr),y
+        sta     chn_effectpar,x
+        pla
+        and     #$1f
+        beq     @fcr_checknote
+        sta     chn_inst,x
+        asl
+        asl
+        asl
+        asl
+        sta     zp_ptr
+        sta     chn_inst_ptr_lo,x
+        lda     #0
+        rol
+        adc     zp_song_base+1
+        sta     zp_ptr+1
+        sta     chn_inst_ptr_hi,x
+        jsr     checkpoint
+        ldy     #INST_AD
+        lda     (zp_ptr),y
+        sta     chn_ad,x
+        iny
+        lda     (zp_ptr),y
+        sta     chn_sr,x
+        iny
+        lda     (zp_ptr),y
+        sta     chn_waveidx,x
+        ldy     #INST_ARPSTART
+        lda     (zp_ptr),y
+        sta     chn_arpidx,x
+        ldy     #INST_VIBDELAY
+        lda     (zp_ptr),y
+        sta     chn_vibdelay,x
+        jsr     checkpoint
+        ldy     #INST_PULSEWIDTH
+        lda     (zp_ptr),y
+        asl     a
+        asl     a
+        asl     a
+        asl     a
+        sta     chn_plswidthlo,x
+        lda     (zp_ptr),y
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     chn_plswidthhi,x
+        iny
+        lda     (zp_ptr),y
+        sta     chn_plsspeed,x
+        iny
+        lda     (zp_ptr),y
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     chn_plslimitdown,x
+        lda     (zp_ptr),y
+        and     #$0f
+        sta     chn_plslimitup,x
+        lda     #$00
+        sta     chn_plsdir,x
+        sta     chn_vibpos,x
+@fcr_checknote:
+        jsr     checkpoint
+        pla
+        lsr     a
+        beq     @fcr_done
+        cmp     #$61
+        bcs     @fcr_noteoff
+        sbc     #0
+        sta     chn_note,x
+        ldy     chn_effect,x
+        cpy     #$20
+        bne     @fcr_notporta
+        clc
+        adc     chn_transpose,x
+        tay
+        lda     freqtable_lo,y
+        sta     chn_notefreqlo,x
+        lda     freqtable_hi,y
+        sta     chn_notefreqhi,x
+@fcr_notporta:
+        lda     chn_inst_ptr_lo,x
+        sta     zp_ptr
+        lda     chn_inst_ptr_hi,x
+        sta     zp_ptr+1
+        ldy     #INST_WAVESTART
+        lda     (zp_ptr),y
+        sta     chn_waveidx,x
+        ldy     #INST_ARPSTART
+        lda     (zp_ptr),y
+        sta     chn_arpidx,x
+        lda     #$00
+        sta     chn_slidedelta_lo,x
+        sta     chn_slidedelta_hi,x
+        sta     chn_slideenable,x
+        lda     #($ff ^ $fe ^ $61)
+@fcr_noteoff:
+        eor     #($fe ^ $61)
+        sta     chn_gateon,x
+@fcr_done:
+        jsr     checkpoint
+        dex
+        bmi     pp_allframes
+        jmp     @fetch_channel_rows
 
 pp_allframes:
         ldx     #$00
@@ -383,13 +487,13 @@ pi_waveend:
         cmp     #$00
         bcc     pi_waveset
         beq     pi_waveset
-        ldy     #INST_WAVELOOP
+        iny                             ; INST_WAVELOOP
         lda     (zp_ptr),y
 pi_waveset:
         sta     chn_waveidx,x
         jsr     checkpoint
         lda     chn_effect,x
-        cmp     #$02
+        cmp     #$20
         beq     pi_skiparp
         ldy     chn_arpidx,x
 arp_load_addr = *+1
@@ -412,7 +516,7 @@ pi_arpend:
         cmp     #$00
         bcc     pi_arpset
         beq     pi_arpset
-        ldy     #INST_ARPLOOP
+        iny                             ; INST_ARPLOOP
         lda     (zp_ptr),y
 pi_arpset:
         sta     chn_arpidx,x
@@ -513,16 +617,16 @@ pi_noinst:
         jmp     do_slide_vib
 fx_haseffect:
         ; Binary search dispatch for effects 1-E (14 effects), all inlined
-        cmp     #8
+        cmp     #$80
         bcc     @fx_1_to_7
         jmp     @fx_8_to_e
 @fx_1_to_7:
-        cmp     #4
+        cmp     #$40
         bcc     @fx_1_to_3
         ; Effects 4-7 (fall through to save JMP)
-        cmp     #6
+        cmp     #$60
         bcs     @fx_6_7
-        cmp     #5
+        cmp     #$50
         bcs     @fx_5
         ; Effect 4 = hard restart (inlined)
         lda     speedcounter
@@ -543,15 +647,15 @@ fx_haseffect:
         ldy     #INST_FILTSTART
         lda     (zp_ptr),y
         sta     filter_idx
-        ldy     #INST_FILTEND
+        iny                             ; INST_FILTEND
         lda     (zp_ptr),y
         sta     filter_end
-        ldy     #INST_FILTLOOP
+        iny                             ; INST_FILTLOOP
         lda     (zp_ptr),y
         sta     filter_loop
         jmp     do_slide_vib
 @fx_6_7:
-        cmp     #7
+        cmp     #$70
         bcs     @fx_7
         ; Effect 6 = set SR (inlined)
         lda     chn_effectpar,x
@@ -564,7 +668,7 @@ fx_haseffect:
         jmp     do_slide_vib
 @fx_1_to_3:
         ; Effects 1-3 (most common: arp, porta, speed)
-        cmp     #2
+        cmp     #$20
         bcs     @fx_2_3
         ; Effect 1 = arpeggio (inlined)
         ldy     mod3counter
@@ -658,11 +762,11 @@ fx_haseffect:
         sta     chn_freqhi,x
         jmp     do_slide_vib
 @fx_8_to_e:
-        cmp     #$c
+        cmp     #$c0
         bcs     @fx_c_to_e
-        cmp     #$a
+        cmp     #$a0
         bcs     @fx_a_b
-        cmp     #9
+        cmp     #$90
         bcs     @fx_9
         ; Effect 8 = pulse width (inlined, hardcoded values)
         lda     chn_effectpar,x
@@ -682,7 +786,7 @@ fx_haseffect:
         sta     chn_ad,x
         jmp     do_slide_vib
 @fx_a_b:
-        cmp     #$b
+        cmp     #$b0
         bcs     @fx_b
         ; Effect A = filter resonance (inlined)
         lda     chn_effectpar,x
@@ -692,33 +796,29 @@ fx_haseffect:
         ; Effect B = slide (inlined)
         lda     #$80
         sta     chn_slideenable,x
-        lda     #$20
-        sta     zp_ptr
-        lda     #$00
-        sta     zp_ptr+1
         ldy     chn_effectpar,x
         beq     @slide_up
         lda     chn_slidedelta_lo,x
         sec
-        sbc     zp_ptr
+        sbc     #$20
         sta     chn_slidedelta_lo,x
         lda     chn_slidedelta_hi,x
-        sbc     zp_ptr+1
+        sbc     #$00
         sta     chn_slidedelta_hi,x
         jmp     do_slide_vib
 @slide_up:
         lda     chn_slidedelta_lo,x
         clc
-        adc     zp_ptr
+        adc     #$20
         sta     chn_slidedelta_lo,x
         lda     chn_slidedelta_hi,x
-        adc     zp_ptr+1
+        adc     #$00
         sta     chn_slidedelta_hi,x
         jmp     do_slide_vib
 @fx_c_to_e:
-        cmp     #$e
+        cmp     #$e0
         bcs     @fx_e
-        cmp     #$d
+        cmp     #$d0
         bcs     @fx_d
         ; Effect C = global volume (inlined)
         lda     speedcounter
@@ -929,144 +1029,6 @@ check_hardrestart:
         sta     chn_waveform,x
         sta     chn_ad,x
         sta     chn_sr,x
-@done:
-        rts
-
-; ============================================================================
-; fetch_channel_row - Fetch row data for channel X
-; ============================================================================
-fetch_channel_row:
-        ldy     #1
-        lda     (zp_trackptr),y
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        sta     chn_effect,x
-        iny
-        lda     (zp_trackptr),y
-        sta     chn_effectpar,x
-        dey
-        dey
-        lda     (zp_trackptr),y
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        and     #$08
-        ora     chn_effect,x
-        sta     chn_effect,x
-        iny
-        lda     (zp_trackptr),y
-        and     #$1f
-        beq     @checknote
-        sta     chn_inst,x
-        ; Setup zp_ptr = song_base + inst*16 (interleaved layout)
-        asl
-        asl
-        asl
-        asl                             ; A = inst*16 low byte
-        sta     zp_ptr
-        sta     chn_inst_ptr_lo,x       ; Cache low byte
-        lda     #0
-        rol                             ; Get carry from shift
-        adc     zp_song_base+1
-        sta     zp_ptr+1
-        sta     chn_inst_ptr_hi,x       ; Cache high byte
-        jsr     checkpoint
-        ; Load all instrument params with inline (zp_ptr),y
-        ldy     #INST_AD
-        lda     (zp_ptr),y
-        sta     chn_ad,x
-        ldy     #INST_SR
-        lda     (zp_ptr),y
-        sta     chn_sr,x
-        ldy     #INST_WAVESTART
-        lda     (zp_ptr),y
-        sta     chn_waveidx,x
-        ldy     #INST_ARPSTART
-        lda     (zp_ptr),y
-        sta     chn_arpidx,x
-        ldy     #INST_VIBDELAY
-        lda     (zp_ptr),y
-        sta     chn_vibdelay,x
-        jsr     checkpoint
-        ldy     #INST_PULSEWIDTH
-        lda     (zp_ptr),y
-        sta     zp_temp0
-        asl     a
-        asl     a
-        asl     a
-        asl     a
-        sta     chn_plswidthlo,x
-        lda     zp_temp0
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        sta     chn_plswidthhi,x
-        ldy     #INST_PULSESPEED
-        lda     (zp_ptr),y
-        sta     chn_plsspeed,x
-        ldy     #INST_PULSELIMITS
-        lda     (zp_ptr),y
-        sta     zp_temp0
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        sta     chn_plslimitdown,x
-        lda     zp_temp0
-        and     #$0f
-        sta     chn_plslimitup,x
-        lda     #$00
-        sta     chn_plsdir,x
-        sta     chn_vibpos,x
-@checknote:
-        jsr     checkpoint
-        ldy     #0
-        lda     (zp_trackptr),y
-        and     #$7f
-        beq     @done
-        cmp     #$61
-        beq     @noteoff
-        sec
-        sbc     #$01
-        sta     chn_note,x
-        ldy     chn_effect,x
-        cpy     #$02              ; tone portamento (old effect 3 -> new effect 2)
-        bne     @notporta
-        clc
-        adc     chn_transpose,x
-        ; Inline set_notefreq_only
-        tay
-        lda     freqtable_lo,y
-        sta     chn_notefreqlo,x
-        lda     freqtable_hi,y
-        sta     chn_notefreqhi,x
-@notporta:
-        ; Load cached inst pointer
-        lda     chn_inst_ptr_lo,x
-        sta     zp_ptr
-        lda     chn_inst_ptr_hi,x
-        sta     zp_ptr+1
-        ldy     #INST_WAVESTART
-        lda     (zp_ptr),y
-        sta     chn_waveidx,x
-        ldy     #INST_ARPSTART
-        lda     (zp_ptr),y
-        sta     chn_arpidx,x
-        lda     #$00
-        sta     chn_slidedelta_lo,x
-        sta     chn_slidedelta_hi,x
-        sta     chn_slideenable,x
-        lda     #$ff
-        bne     @setgate
-@noteoff:
-        lda     #$fe
-@setgate:
-        sta     chn_gateon,x
 @done:
         rts
 

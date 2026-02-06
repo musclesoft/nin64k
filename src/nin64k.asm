@@ -7,7 +7,6 @@
 ; Zero page (avoid player's $10-$21)
 zp_part_num     = $7E
 zp_preloaded    = $7F              ; Song number that's been preloaded
-zp_last_line    = $0D
 
 ; Decompressor zero page (external interface)
 zp_src_lo       = $02
@@ -44,6 +43,7 @@ start:
         lda     #$35
         sta     $01
         jsr     init_stream
+        jsr     sprites_init
 
         ; Init player for song 1
         lda     #1
@@ -110,13 +110,22 @@ main_loop:
 ; Uses guard flag to prevent re-entry when called from within player_play
 ; ----------------------------------------------------------------------------
 checkpoint:
+        lda     #$07
+        and     $D012
+        beq     @no_vblank
+        sta     $D021
+        lda     #$06
+        sta     $D021
         lda     $D012
-        sta     $D020
-        cmp     #$fd
+        cmp     #$f9
         bcc     @no_vblank
+        lda     #$10
+        sta     $D011
 @wait:
         lda     $D012
         bmi     @wait
+        lda     #$18
+        sta     $D011
         jsr     play_frame
 @no_vblank:
         rts
@@ -246,6 +255,7 @@ init_stream:
         sta     zp_src_hi
         rts
 
+.include "sprites.inc"
 ; ============================================================================
 ; Decompressor (calls checkpoint for vblank detection during decompression)
 ; ============================================================================

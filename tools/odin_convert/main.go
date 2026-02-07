@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 var projectRoot string
@@ -1943,12 +1945,23 @@ func loadSongEquivMap(songNum int, dict []byte) map[int]int {
 	}
 
 	// Convert row hex equiv to index equiv
+	// For each extended row, find the best replacement (lowest index in dict)
 	equivMap := make(map[int]int)
-	for extRowHex, priRowHex := range songEquiv {
+	for extRowHex, priRowHexList := range songEquiv {
 		extIdx, extOk := rowToIdx[extRowHex]
-		priIdx, priOk := rowToIdx[priRowHex]
-		if extOk && priOk {
-			equivMap[extIdx] = priIdx
+		if !extOk {
+			continue
+		}
+		bestPriIdx := -1
+		for _, priRowHex := range priRowHexList {
+			if priIdx, ok := rowToIdx[priRowHex]; ok {
+				if bestPriIdx == -1 || priIdx < bestPriIdx {
+					bestPriIdx = priIdx
+				}
+			}
+		}
+		if bestPriIdx >= 0 && bestPriIdx < extIdx {
+			equivMap[extIdx] = bestPriIdx
 		}
 	}
 
@@ -3583,7 +3596,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  (none)       Convert songs and run verification tests")
-	fmt.Println("  -equivtest   Rebuild equivalence cache (slow, tests all candidates)")
+	fmt.Println("  -equivtest   Rebuild equivalence cache (slow, tests all pairs)")
 	fmt.Println("  -h, --help   Show this help message")
 }
 
@@ -3592,7 +3605,7 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-equivtest":
-			// Handled at end of main
+			// Handled after songs are converted
 		case "-h", "-help", "--help":
 			printUsage()
 			return
@@ -4262,327 +4275,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Dead entry test if requested
+	// Equiv test if requested
 	if len(os.Args) > 1 && os.Args[1] == "-equivtest" {
 		fmt.Println("\n=== Equivalence Test ===")
-		testEquivalence(convertedSongs, convertedStats, playerData)
+		runEquivTest(convertedSongs, convertedStats, playerData)
 	}
 }
 
-// Equivalence types
-const (
-	EquivNOP      = "nop"       // [0,0,0] full NOP
-	EquivSameEff  = "same_eff"  // [x,y,*] same note, same inst/effect
-	EquivSameSig  = "same_sig"  // [*,y,z] same inst/effect/param
-	EquivSameNote = "same_note" // [x,*,*] same note
-)
-
-// EquivResult stores equivalence test results
+// EquivResult stores equivalence cache results
 // Uses row values (hex) instead of indices for position-independent caching
 type EquivResult struct {
-	SongNum      int               `json:"song"`
-	Equiv        map[string]string `json:"equiv"`        // extended row hex -> primary row hex
-	EquivTypes   map[string]string `json:"equiv_types"`  // extended row hex -> type of match
-	Tested       int               `json:"tested"`
-	Found        int               `json:"found"`
-	TypeCounts   map[string]int    `json:"type_counts"`  // found count per type
-	TypeTested   map[string]int    `json:"type_tested"`  // tested count per type
+	SongNum int                 `json:"song"`
+	Equiv   map[string][]string `json:"equiv"` // extended row hex -> list of valid replacements
 }
 
-// testEquivalence tests all candidate types:
-// 1. Full NOP [0,0,0] - the universal silent entry
-// 2. Same effect [x,y,*] - same note and inst/effect, any param
-// 3. Same signature [*,y,z] - same inst/effect/param, any note
-// 4. Same note [x,*,*] - same note, any inst/effect/param
-func testEquivalence(convertedSongs [][]byte, convertedStats []ConversionStats, playerData []byte) {
-	cacheFile := projectPath("tools/odin_convert/equiv_cache.json")
-
-	// Try to load cached results
-	var results []EquivResult
-	if data, err := os.ReadFile(cacheFile); err == nil {
-		if json.Unmarshal(data, &results) == nil && len(results) == 9 {
-			fmt.Println("Loaded cached equivalence results from", cacheFile)
-			analyzeEquivResults(results)
-			return
-		}
-	}
-
-	fmt.Println("Running equivalence tests (parallel)...")
-	fmt.Println("Testing: [0,0,0] NOP, [x,y,*] same_eff, [*,y,z] same_sig, [x,*,*] same_note")
-	results = make([]EquivResult, 9)
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	resultChan := make(chan EquivResult, 9)
-
-	for songNum := 1; songNum <= 9; songNum++ {
-		if convertedSongs[songNum-1] == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(sn int, convertedData []byte, stats ConversionStats) {
-			defer wg.Done()
-			resultChan <- testEquivalenceSong(sn, convertedData, stats.PatternDictSize, playerData)
-		}(songNum, convertedSongs[songNum-1], convertedStats[songNum-1])
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	for r := range resultChan {
-		mu.Lock()
-		results[r.SongNum-1] = r
-		mu.Unlock()
-		fmt.Printf("Song %d: found %d equivalences\n", r.SongNum, r.Found)
-	}
-
-	// Save cache
-	if data, err := json.MarshalIndent(results, "", "  "); err == nil {
-		os.WriteFile(cacheFile, data, 0644)
-		fmt.Println("Saved results to", cacheFile)
-	}
-
-	analyzeEquivResults(results)
-}
-
-// testEquivalenceSong tests a single song's equivalence candidates
-func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, playerData []byte) EquivResult {
-	testFrames := int(partTimes[songNum-1])
-
-	var bufferBase uint16
-	if songNum%2 == 1 {
-		bufferBase = 0x1000
-	} else {
-		bufferBase = 0x7000
-	}
-	playerBase := uint16(0xF000)
-
-	type signature struct {
-		instEffect byte
-		param      byte
-	}
-	type noteEff struct {
-		note       byte
-		instEffect byte
-	}
-	// Candidate types tested and ruled out empirically (0% or near-0% hit rate):
-	// - same_inst [x,i&1F,*]: same note + instrument, ignore effect - subset of same_note
-	// - zero_eff [x,i&1F,0]: same note+inst with zero param - subset of same_note
-	// - eff_only [*,eff,z]: same effect bits + param - 1 hit from 88K tests (0.001%)
-	// - arp_0c [x,y,0C->0]: arp param $0C -> $00 - subset of same_eff
-	// - actual_sig [eff,z]: computed effect + param (eff uses note bit 7) - 1 hit from 86K (0.001%)
-	// - note0 [0,*,*]: entries with note=0 - all covered by earlier types
-
-	sigGroups := make(map[signature][]int)
-	noteGroups := make(map[byte][]int)
-	noteEffGroups := make(map[noteEff][]int)
-
-	// Index 0 is always [0,0,0] (NOP) - implicit, not stored in dict
-	// Add it to groups so it can be a candidate
-	sigGroups[signature{0, 0}] = append(sigGroups[signature{0, 0}], 0)
-	noteGroups[0] = append(noteGroups[0], 0)
-	noteEffGroups[noteEff{0, 0}] = append(noteEffGroups[noteEff{0, 0}], 0)
-
-	// Dict entries 1..N are stored at offsets 0..N-1
-	for idx := 1; idx < dictSize; idx++ {
-		note := convertedData[0x99F+idx-1]
-		instEffect := convertedData[0x99F+399+idx-1]
-		param := convertedData[0x99F+798+idx-1]
-
-		sigGroups[signature{instEffect, param}] = append(sigGroups[signature{instEffect, param}], idx)
-		noteGroups[note] = append(noteGroups[note], idx)
-		noteEffGroups[noteEff{note, instEffect}] = append(noteEffGroups[noteEff{note, instEffect}], idx)
-	}
-
-	cpu := NewCPU()
-	copy(cpu.Memory[bufferBase:], convertedData)
-	copy(cpu.Memory[playerBase:], playerData)
-	cpu.A = 0
-	cpu.X = byte(bufferBase >> 8)
-	cpu.Call(playerBase)
-	cpu.SIDWrites = nil
-	cpu.Cycles = 0
-	snapshot := cpu.Snapshot()
-
-	baseline, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
-
-	// Index 0 is [0,0,0], entries 1..N stored at offsets 0..N-1
-	rowHex := func(idx int) string {
-		if idx == 0 {
-			return "000000"
-		}
-		return fmt.Sprintf("%02x%02x%02x", convertedData[0x99F+idx-1], convertedData[0x99F+399+idx-1], convertedData[0x99F+798+idx-1])
-	}
-
-	type equivMatch struct {
-		extRowHex   string
-		priRowHex   string
-		equivTyp    string
-		testedTypes map[string]int
-	}
-
-	type candidate struct {
-		idx      int
-		equivTyp string
-	}
-
-	testCount := dictSize - 1
-	if testCount <= 0 {
-		return EquivResult{SongNum: songNum, Equiv: make(map[string]string), EquivTypes: make(map[string]string), TypeCounts: make(map[string]int), TypeTested: make(map[string]int)}
-	}
-
-	numWorkers := 8
-	if testCount < numWorkers {
-		numWorkers = testCount
-	}
-	jobs := make(chan int, testCount)
-	results := make(chan equivMatch, testCount)
-
-	for w := 0; w < numWorkers; w++ {
-		go func() {
-			workerCPU := NewCPU()
-			for testIdx := range jobs {
-				// Entry testIdx is at offset testIdx-1
-				testNote := convertedData[0x99F+testIdx-1]
-				testInstEffect := convertedData[0x99F+399+testIdx-1]
-				testParam := convertedData[0x99F+798+testIdx-1]
-
-				var candidates []candidate
-				seen := make(map[int]bool)
-				testedTypes := make(map[string]int)
-
-				addCandidates := func(indices []int, typ string) {
-					for _, idx := range indices {
-						if idx < testIdx && !seen[idx] {
-							candidates = append(candidates, candidate{idx, typ})
-							seen[idx] = true
-							testedTypes[typ]++
-						}
-					}
-				}
-
-				// 1. NOP [0,0,0] - index 0 is always NOP
-				if !seen[0] {
-					candidates = append(candidates, candidate{0, EquivNOP})
-					seen[0] = true
-					testedTypes[EquivNOP]++
-				}
-
-				// 2. Same effect [x,y,*] - same note and inst/effect
-				addCandidates(noteEffGroups[noteEff{testNote, testInstEffect}], EquivSameEff)
-
-				// 3. Same signature [*,y,z] - same inst/effect/param
-				addCandidates(sigGroups[signature{testInstEffect, testParam}], EquivSameSig)
-
-				// 4. Same note [x,*,*]
-				addCandidates(noteGroups[testNote], EquivSameNote)
-
-				match := equivMatch{testedTypes: testedTypes}
-				for _, cand := range candidates {
-					workerCPU.Restore(snapshot)
-					// Substitute: copy candidate's values to test entry's slot
-					// Entry i is at memory offset i-1, entry 0 is [0,0,0]
-					testOff := uint16(testIdx - 1)
-					if cand.idx == 0 {
-						workerCPU.Memory[bufferBase+0x99F+testOff] = 0
-						workerCPU.Memory[bufferBase+0x99F+399+testOff] = 0
-						workerCPU.Memory[bufferBase+0x99F+798+testOff] = 0
-					} else {
-						candOff := uint16(cand.idx - 1)
-						workerCPU.Memory[bufferBase+0x99F+testOff] = workerCPU.Memory[bufferBase+0x99F+candOff]
-						workerCPU.Memory[bufferBase+0x99F+399+testOff] = workerCPU.Memory[bufferBase+0x99F+399+candOff]
-						workerCPU.Memory[bufferBase+0x99F+798+testOff] = workerCPU.Memory[bufferBase+0x99F+798+candOff]
-					}
-
-					if workerCPU.RunFramesMatch(playerBase+3, testFrames, baseline) {
-						match.extRowHex = rowHex(testIdx)
-						match.priRowHex = rowHex(cand.idx)
-						match.equivTyp = cand.equivTyp
-						break
-					}
-				}
-				results <- match
-			}
-		}()
-	}
-
-	for testIdx := 1; testIdx < dictSize; testIdx++ {
-		jobs <- testIdx
-	}
-	close(jobs)
-
-	equiv := make(map[string]string)
-	equivTypes := make(map[string]string)
-	typeCounts := make(map[string]int)
-	typeTested := make(map[string]int)
-	tested := 0
-	found := 0
-
-	for i := 1; i < dictSize; i++ {
-		match := <-results
-		for typ, cnt := range match.testedTypes {
-			typeTested[typ] += cnt
-			tested += cnt
-		}
-		if match.extRowHex != "" {
-			equiv[match.extRowHex] = match.priRowHex
-			equivTypes[match.extRowHex] = match.equivTyp
-			typeCounts[match.equivTyp]++
-			found++
-		}
-	}
-
-	return EquivResult{
-		SongNum:    songNum,
-		Equiv:      equiv,
-		EquivTypes: equivTypes,
-		Tested:     tested,
-		Found:      found,
-		TypeCounts: typeCounts,
-		TypeTested: typeTested,
-	}
-}
-
-func analyzeEquivResults(results []EquivResult) {
-	fmt.Println("\n=== Equivalence Analysis ===")
-	totalEquiv := 0
-	totalCounts := make(map[string]int)
-	totalTested := make(map[string]int)
-	for _, r := range results {
-		totalEquiv += len(r.Equiv)
-		for typ, cnt := range r.TypeCounts {
-			totalCounts[typ] += cnt
-		}
-		for typ, cnt := range r.TypeTested {
-			totalTested[typ] += cnt
-		}
-	}
-
-	types := []struct {
-		name string
-		desc string
-	}{
-		{EquivNOP, "[0,0,0] nop"},
-		{EquivSameEff, "[x,y,*] same_eff"},
-		{EquivSameSig, "[*,y,z] same_sig"},
-		{EquivSameNote, "[x,*,*] same_note"},
-	}
-
-	fmt.Printf("Total: %d equivalences found\n\n", totalEquiv)
-	fmt.Printf("%-22s %6s %6s %8s\n", "Type", "Found", "Tested", "Rate")
-	fmt.Printf("%-22s %6s %6s %8s\n", "----", "-----", "------", "----")
-	for _, t := range types {
-		found := totalCounts[t.name]
-		tested := totalTested[t.name]
-		rate := ""
-		if tested > 0 {
-			rate = fmt.Sprintf("%.1f%%", float64(found)*100/float64(tested))
-		}
-		fmt.Printf("%-22s %6d %6d %8s\n", t.desc, found, tested, rate)
-	}
-}
 
 // analyzeTransposePatterns finds patterns that are duplicates with transpose applied
 func analyzeTransposePatterns(songData [][]byte) {
@@ -5103,3 +4809,211 @@ func findInstructionStarts(data []byte, base uint16) []uint16 {
 	return starts
 }
 
+// runEquivTest tests all pairs to build the equivalence cache
+func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, playerData []byte) {
+	fmt.Println("Testing ALL pairs with full song duration (highly parallel)...")
+
+	results := make([]EquivResult, 9)
+	songMu := make([]sync.Mutex, 9)
+	for i := range results {
+		results[i] = EquivResult{SongNum: i + 1, Equiv: make(map[string][]string)}
+	}
+
+	var totalPairs int64
+	songPairs := make([]int64, 9)
+	for songNum := 1; songNum <= 9; songNum++ {
+		if convertedSongs[songNum-1] == nil {
+			continue
+		}
+		dictSize := convertedStats[songNum-1].PatternDictSize
+		pairs := int64(dictSize) * int64(dictSize-1) / 2
+		songPairs[songNum-1] = pairs
+		totalPairs += pairs
+		fmt.Printf("Song %d: %d dict entries = %d pairs\n", songNum, dictSize, pairs)
+	}
+	fmt.Printf("Total pairs to test: %d\n\n", totalPairs)
+
+	// Shared progress counters
+	var testsCompleted int64
+	var matchesFound int64
+	var songsComplete int32
+	startTime := time.Now()
+	done := make(chan struct{})
+
+	// Progress and save ticker
+	go func() {
+		cacheFile := projectPath("tools/odin_convert/equiv_cache.json")
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				completed := atomic.LoadInt64(&testsCompleted)
+				matches := atomic.LoadInt64(&matchesFound)
+				songs := atomic.LoadInt32(&songsComplete)
+				elapsed := time.Since(startTime)
+				pct := float64(completed) / float64(totalPairs) * 100
+				rate := float64(completed) / elapsed.Seconds()
+				eta := time.Duration(float64(totalPairs-completed)/rate) * time.Second
+
+				fmt.Printf("\n=== Progress at %s ===\n", time.Now().Format("15:04:05"))
+				fmt.Printf("Tested: %d / %d (%.1f%%) - Songs complete: %d/9\n", completed, totalPairs, pct, songs)
+				fmt.Printf("Speed: %.0f tests/sec - ETA: %v\n", rate, eta.Round(time.Second))
+				fmt.Printf("Matches found: %d (%.4f%%)\n", matches, float64(matches)/float64(completed)*100)
+
+				// Save current results
+				var resultsCopy []EquivResult
+				for i := range results {
+					songMu[i].Lock()
+					equivCopy := make(map[string][]string)
+					for k, v := range results[i].Equiv {
+						vCopy := make([]string, len(v))
+						copy(vCopy, v)
+						equivCopy[k] = vCopy
+					}
+					resultsCopy = append(resultsCopy, EquivResult{SongNum: i + 1, Equiv: equivCopy})
+					songMu[i].Unlock()
+				}
+				data, _ := json.MarshalIndent(resultsCopy, "", "  ")
+				os.WriteFile(cacheFile, data, 0644)
+				fmt.Printf("Saved checkpoint to %s\n", cacheFile)
+			}
+		}
+	}()
+
+	// Create work items for all songs
+	type workItem struct {
+		songNum int
+		idx1    int
+		idx2    int
+	}
+	work := make(chan workItem, 10000)
+
+	// Start workers
+	numWorkers := 32
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Each worker has its own CPU per song for isolation
+			cpus := make([]*CPU6502, 9)
+			snapshots := make([]CPUSnapshot, 9)
+			snapshotInit := make([]bool, 9)
+			baselines := make([][]SIDWrite, 9)
+
+			for item := range work {
+				sn := item.songNum
+				idx1, idx2 := item.idx1, item.idx2
+
+				// Lazy init CPU for this song
+				if !snapshotInit[sn-1] {
+					convertedData := convertedSongs[sn-1]
+					testFrames := int(partTimes[sn-1])
+					var bufferBase uint16
+					if sn%2 == 1 {
+						bufferBase = 0x1000
+					} else {
+						bufferBase = 0x7000
+					}
+					playerBase := uint16(0xF000)
+
+					cpu := NewCPU()
+					copy(cpu.Memory[bufferBase:], convertedData)
+					copy(cpu.Memory[playerBase:], playerData)
+					cpu.A = 0
+					cpu.X = byte(bufferBase >> 8)
+					cpu.Call(playerBase)
+					cpu.SIDWrites = nil
+					cpu.Cycles = 0
+					snapshots[sn-1] = cpu.Snapshot()
+					baselines[sn-1], _ = cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
+					cpus[sn-1] = cpu
+					snapshotInit[sn-1] = true
+				}
+
+				cpu := cpus[sn-1]
+				snapshot := snapshots[sn-1]
+				baseline := baselines[sn-1]
+				convertedData := convertedSongs[sn-1]
+				testFrames := int(partTimes[sn-1])
+				var bufferBase uint16
+				if sn%2 == 1 {
+					bufferBase = 0x1000
+				} else {
+					bufferBase = 0x7000
+				}
+				playerBase := uint16(0xF000)
+
+				cpu.Restore(snapshot)
+				off2 := uint16(idx2 - 1)
+				if idx1 == 0 {
+					cpu.Memory[bufferBase+0x99F+off2] = 0
+					cpu.Memory[bufferBase+0x99F+399+off2] = 0
+					cpu.Memory[bufferBase+0x99F+798+off2] = 0
+				} else {
+					off1 := uint16(idx1 - 1)
+					cpu.Memory[bufferBase+0x99F+off2] = cpu.Memory[bufferBase+0x99F+off1]
+					cpu.Memory[bufferBase+0x99F+399+off2] = cpu.Memory[bufferBase+0x99F+399+off1]
+					cpu.Memory[bufferBase+0x99F+798+off2] = cpu.Memory[bufferBase+0x99F+798+off1]
+				}
+
+				if cpu.RunFramesMatch(playerBase+3, testFrames, baseline) {
+					row2 := rowHexFromData(convertedData, idx2)
+					row1 := rowHexFromData(convertedData, idx1)
+					songMu[sn-1].Lock()
+					results[sn-1].Equiv[row2] = append(results[sn-1].Equiv[row2], row1)
+					songMu[sn-1].Unlock()
+					atomic.AddInt64(&matchesFound, 1)
+				}
+				atomic.AddInt64(&testsCompleted, 1)
+			}
+		}()
+	}
+
+	// Generate work items
+	go func() {
+		for songNum := 1; songNum <= 9; songNum++ {
+			if convertedSongs[songNum-1] == nil {
+				continue
+			}
+			dictSize := convertedStats[songNum-1].PatternDictSize
+			for idx1 := 0; idx1 < dictSize; idx1++ {
+				for idx2 := idx1 + 1; idx2 < dictSize; idx2++ {
+					work <- workItem{songNum, idx1, idx2}
+				}
+			}
+			atomic.AddInt32(&songsComplete, 1)
+			fmt.Printf("Song %d work items queued\n", songNum)
+		}
+		close(work)
+	}()
+
+	wg.Wait()
+	close(done)
+
+	// Sort all values and write final cache
+	for i := range results {
+		for k := range results[i].Equiv {
+			sort.Strings(results[i].Equiv[k])
+		}
+	}
+
+	cacheFile := projectPath("tools/odin_convert/equiv_cache.json")
+	data, _ := json.MarshalIndent(results, "", "  ")
+	os.WriteFile(cacheFile, data, 0644)
+
+	totalFound := atomic.LoadInt64(&matchesFound)
+	fmt.Printf("\n=== COMPLETE ===\n")
+	fmt.Printf("Wrote %d pairs to %s\n", totalFound, cacheFile)
+	fmt.Printf("Duration: %v\n", time.Since(startTime).Round(time.Second))
+}
+
+func rowHexFromData(convertedData []byte, idx int) string {
+	if idx == 0 {
+		return "000000"
+	}
+	return fmt.Sprintf("%02x%02x%02x", convertedData[0x99F+idx-1], convertedData[0x99F+399+idx-1], convertedData[0x99F+798+idx-1])
+}

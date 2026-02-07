@@ -3394,6 +3394,28 @@ func (c *CPU6502) Call(addr uint16) {
 	}
 }
 
+// RunFramesMatch runs frames and compares against baseline, returning true if they match.
+// Aborts early on first difference for efficiency.
+func (c *CPU6502) RunFramesMatch(playAddr uint16, frames int, baseline []SIDWrite) bool {
+	c.SIDWrites = nil
+	c.CurrentFrame = 0
+	baseIdx := 0
+	for i := 0; i < frames; i++ {
+		c.CurrentFrame = i
+		startLen := len(c.SIDWrites)
+		c.Call(playAddr)
+		for j := startLen; j < len(c.SIDWrites); j++ {
+			if baseIdx >= len(baseline) ||
+				c.SIDWrites[j].Addr != baseline[baseIdx].Addr ||
+				c.SIDWrites[j].Value != baseline[baseIdx].Value {
+				return false
+			}
+			baseIdx++
+		}
+	}
+	return baseIdx == len(baseline)
+}
+
 // RunFrames runs the play routine for n frames
 // If initAddr != 0, measures init+play after normal playback for worst-case frame time
 func (c *CPU6502) RunFrames(playAddr uint16, frames int, initAddr uint16, initA, initX byte) ([]SIDWrite, uint64) {
@@ -4250,20 +4272,21 @@ func main() {
 // Equivalence types
 const (
 	EquivNOP      = "nop"       // [0,0,0] full NOP
+	EquivSameEff  = "same_eff"  // [x,y,*] same note, same inst/effect
 	EquivSameSig  = "same_sig"  // [*,y,z] same inst/effect/param
 	EquivSameNote = "same_note" // [x,*,*] same note
-	EquivSameEff  = "same_eff"  // [x,y,*] same note, same inst/effect
 )
 
 // EquivResult stores equivalence test results
 // Uses row values (hex) instead of indices for position-independent caching
 type EquivResult struct {
-	SongNum    int               `json:"song"`
-	Equiv      map[string]string `json:"equiv"`       // extended row hex -> primary row hex
-	EquivTypes map[string]string `json:"equiv_types"` // extended row hex -> type of match
-	Tested     int               `json:"tested"`
-	Found      int               `json:"found"`
-	TypeCounts map[string]int    `json:"type_counts"` // count per type
+	SongNum      int               `json:"song"`
+	Equiv        map[string]string `json:"equiv"`        // extended row hex -> primary row hex
+	EquivTypes   map[string]string `json:"equiv_types"`  // extended row hex -> type of match
+	Tested       int               `json:"tested"`
+	Found        int               `json:"found"`
+	TypeCounts   map[string]int    `json:"type_counts"`  // found count per type
+	TypeTested   map[string]int    `json:"type_tested"`  // tested count per type
 }
 
 // testEquivalence tests all candidate types:
@@ -4312,9 +4335,7 @@ func testEquivalence(convertedSongs [][]byte, convertedStats []ConversionStats, 
 		mu.Lock()
 		results[r.SongNum-1] = r
 		mu.Unlock()
-		fmt.Printf("Song %d: tested %d, found %d (nop=%d, same_eff=%d, same_sig=%d, same_note=%d)\n",
-			r.SongNum, r.Tested, r.Found,
-			r.TypeCounts[EquivNOP], r.TypeCounts[EquivSameEff], r.TypeCounts[EquivSameSig], r.TypeCounts[EquivSameNote])
+		fmt.Printf("Song %d: found %d equivalences\n", r.SongNum, r.Found)
 	}
 
 	// Save cache
@@ -4338,7 +4359,6 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	}
 	playerBase := uint16(0xF000)
 
-	// Build candidate groups
 	type signature struct {
 		instEffect byte
 		param      byte
@@ -4347,34 +4367,35 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 		note       byte
 		instEffect byte
 	}
+	// Candidate types tested and ruled out empirically (0% or near-0% hit rate):
+	// - same_inst [x,i&1F,*]: same note + instrument, ignore effect - subset of same_note
+	// - zero_eff [x,i&1F,0]: same note+inst with zero param - subset of same_note
+	// - eff_only [*,eff,z]: same effect bits + param - 1 hit from 88K tests (0.001%)
+	// - arp_0c [x,y,0C->0]: arp param $0C -> $00 - subset of same_eff
+	// - actual_sig [eff,z]: computed effect + param (eff uses note bit 7) - 1 hit from 86K (0.001%)
+	// - note0 [0,*,*]: entries with note=0 - all covered by earlier types
+
 	sigGroups := make(map[signature][]int)
 	noteGroups := make(map[byte][]int)
 	noteEffGroups := make(map[noteEff][]int)
 
-	// Track special entries
-	nopIdx := -1 // [0,0,0]
+	// Index 0 is always [0,0,0] (NOP) - implicit, not stored in dict
+	// Add it to groups so it can be a candidate
+	sigGroups[signature{0, 0}] = append(sigGroups[signature{0, 0}], 0)
+	noteGroups[0] = append(noteGroups[0], 0)
+	noteEffGroups[noteEff{0, 0}] = append(noteEffGroups[noteEff{0, 0}], 0)
 
-	for idx := 0; idx < dictSize; idx++ {
-		// Split dict format: 3 arrays of 410 bytes each
-		note := convertedData[0x99F+idx]
-		instEffect := convertedData[0x99F+410+idx]
-		param := convertedData[0x99F+820+idx]
+	// Dict entries 1..N are stored at offsets 0..N-1
+	for idx := 1; idx < dictSize; idx++ {
+		note := convertedData[0x99F+idx-1]
+		instEffect := convertedData[0x99F+410+idx-1]
+		param := convertedData[0x99F+820+idx-1]
 
-		sig := signature{instEffect, param}
-		sigGroups[sig] = append(sigGroups[sig], idx)
+		sigGroups[signature{instEffect, param}] = append(sigGroups[signature{instEffect, param}], idx)
 		noteGroups[note] = append(noteGroups[note], idx)
-		ne := noteEff{note, instEffect}
-		noteEffGroups[ne] = append(noteEffGroups[ne], idx)
-
-		if idx < 225 {
-			// [0,0,0] NOP
-			if note == 0 && instEffect == 0 && param == 0 {
-				nopIdx = idx
-			}
-		}
+		noteEffGroups[noteEff{note, instEffect}] = append(noteEffGroups[noteEff{note, instEffect}], idx)
 	}
 
-	// Initialize player and take snapshot after init
 	cpu := NewCPU()
 	copy(cpu.Memory[bufferBase:], convertedData)
 	copy(cpu.Memory[playerBase:], playerData)
@@ -4385,94 +4406,131 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	cpu.Cycles = 0
 	snapshot := cpu.Snapshot()
 
-	// Get baseline
-	baselineWrites, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
-	baseline := serializeWrites(baselineWrites)
+	baseline, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
 
-	// Test equivalences for each extended entry
+	// Index 0 is [0,0,0], entries 1..N stored at offsets 0..N-1
+	rowHex := func(idx int) string {
+		if idx == 0 {
+			return "000000"
+		}
+		return fmt.Sprintf("%02x%02x%02x", convertedData[0x99F+idx-1], convertedData[0x99F+410+idx-1], convertedData[0x99F+820+idx-1])
+	}
+
+	type equivMatch struct {
+		extRowHex   string
+		priRowHex   string
+		equivTyp    string
+		testedTypes map[string]int
+	}
+
+	type candidate struct {
+		idx      int
+		equivTyp string
+	}
+
+	testCount := dictSize - 1
+	if testCount <= 0 {
+		return EquivResult{SongNum: songNum, Equiv: make(map[string]string), EquivTypes: make(map[string]string), TypeCounts: make(map[string]int), TypeTested: make(map[string]int)}
+	}
+
+	numWorkers := 8
+	if testCount < numWorkers {
+		numWorkers = testCount
+	}
+	jobs := make(chan int, testCount)
+	results := make(chan equivMatch, testCount)
+
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			workerCPU := NewCPU()
+			for testIdx := range jobs {
+				// Entry testIdx is at offset testIdx-1
+				testNote := convertedData[0x99F+testIdx-1]
+				testInstEffect := convertedData[0x99F+410+testIdx-1]
+				testParam := convertedData[0x99F+820+testIdx-1]
+
+				var candidates []candidate
+				seen := make(map[int]bool)
+				testedTypes := make(map[string]int)
+
+				addCandidates := func(indices []int, typ string) {
+					for _, idx := range indices {
+						if idx < testIdx && !seen[idx] {
+							candidates = append(candidates, candidate{idx, typ})
+							seen[idx] = true
+							testedTypes[typ]++
+						}
+					}
+				}
+
+				// 1. NOP [0,0,0] - index 0 is always NOP
+				if !seen[0] {
+					candidates = append(candidates, candidate{0, EquivNOP})
+					seen[0] = true
+					testedTypes[EquivNOP]++
+				}
+
+				// 2. Same effect [x,y,*] - same note and inst/effect
+				addCandidates(noteEffGroups[noteEff{testNote, testInstEffect}], EquivSameEff)
+
+				// 3. Same signature [*,y,z] - same inst/effect/param
+				addCandidates(sigGroups[signature{testInstEffect, testParam}], EquivSameSig)
+
+				// 4. Same note [x,*,*]
+				addCandidates(noteGroups[testNote], EquivSameNote)
+
+				match := equivMatch{testedTypes: testedTypes}
+				for _, cand := range candidates {
+					workerCPU.Restore(snapshot)
+					// Substitute: copy candidate's values to test entry's slot
+					// Entry i is at memory offset i-1, entry 0 is [0,0,0]
+					testOff := uint16(testIdx - 1)
+					if cand.idx == 0 {
+						workerCPU.Memory[bufferBase+0x99F+testOff] = 0
+						workerCPU.Memory[bufferBase+0x99F+410+testOff] = 0
+						workerCPU.Memory[bufferBase+0x99F+820+testOff] = 0
+					} else {
+						candOff := uint16(cand.idx - 1)
+						workerCPU.Memory[bufferBase+0x99F+testOff] = workerCPU.Memory[bufferBase+0x99F+candOff]
+						workerCPU.Memory[bufferBase+0x99F+410+testOff] = workerCPU.Memory[bufferBase+0x99F+410+candOff]
+						workerCPU.Memory[bufferBase+0x99F+820+testOff] = workerCPU.Memory[bufferBase+0x99F+820+candOff]
+					}
+
+					if workerCPU.RunFramesMatch(playerBase+3, testFrames, baseline) {
+						match.extRowHex = rowHex(testIdx)
+						match.priRowHex = rowHex(cand.idx)
+						match.equivTyp = cand.equivTyp
+						break
+					}
+				}
+				results <- match
+			}
+		}()
+	}
+
+	for testIdx := 1; testIdx < dictSize; testIdx++ {
+		jobs <- testIdx
+	}
+	close(jobs)
+
 	equiv := make(map[string]string)
 	equivTypes := make(map[string]string)
 	typeCounts := make(map[string]int)
+	typeTested := make(map[string]int)
 	tested := 0
 	found := 0
 
-	// Helper to get row hex from dict index
-	rowHex := func(idx int) string {
-		note := convertedData[0x99F+idx]
-		instEff := convertedData[0x99F+410+idx]
-		param := convertedData[0x99F+820+idx]
-		return fmt.Sprintf("%02x%02x%02x", note, instEff, param)
-	}
-
-	for extIdx := 225; extIdx < dictSize; extIdx++ {
-		// Split dict format: note at +idx, instEffect at +410+idx, param at +820+idx
-		extNote := convertedData[0x99F+extIdx]
-		extInstEffect := convertedData[0x99F+410+extIdx]
-		extParam := convertedData[0x99F+820+extIdx]
-		extSig := signature{extInstEffect, extParam}
-		extNE := noteEff{extNote, extInstEffect}
-		extRowHex := rowHex(extIdx)
-
-		// Build ordered candidate list with types (test in priority order)
-		type candidate struct {
-			idx      int
-			equivTyp string
+	for i := 1; i < dictSize; i++ {
+		match := <-results
+		for typ, cnt := range match.testedTypes {
+			typeTested[typ] += cnt
+			tested += cnt
 		}
-		var candidates []candidate
-		seen := make(map[int]bool)
-
-		// 1. NOP [0,0,0] - highest priority
-		if nopIdx >= 0 && !seen[nopIdx] {
-			candidates = append(candidates, candidate{nopIdx, EquivNOP})
-			seen[nopIdx] = true
-		}
-
-		// 2. Same effect [x,y,*] - same note and inst/effect, any param
-		for _, idx := range noteEffGroups[extNE] {
-			if idx < 225 && !seen[idx] {
-				candidates = append(candidates, candidate{idx, EquivSameEff})
-				seen[idx] = true
-			}
-		}
-
-		// 3. Same signature [*,y,z]
-		for _, idx := range sigGroups[extSig] {
-			if idx < 225 && !seen[idx] {
-				candidates = append(candidates, candidate{idx, EquivSameSig})
-				seen[idx] = true
-			}
-		}
-
-		// 4. Same note [x,*,*]
-		for _, idx := range noteGroups[extNote] {
-			if idx < 225 && !seen[idx] {
-				candidates = append(candidates, candidate{idx, EquivSameNote})
-				seen[idx] = true
-			}
-		}
-
-		// Test each candidate in priority order
-		for _, cand := range candidates {
-			tested++
-
-			cpu.Restore(snapshot)
-
-			// Swap extended entry with primary entry (split dict format)
-			// Note bytes at 0x99F+idx, instEffect at 0x99F+410+idx, param at 0x99F+820+idx
-			cpu.Memory[bufferBase+0x99F+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+uint16(cand.idx)]
-			cpu.Memory[bufferBase+0x99F+410+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+410+uint16(cand.idx)]
-			cpu.Memory[bufferBase+0x99F+820+uint16(extIdx)] = cpu.Memory[bufferBase+0x99F+820+uint16(cand.idx)]
-
-			testWrites, _ := cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
-			testResult := serializeWrites(testWrites)
-
-			if bytes.Equal(baseline, testResult) {
-				equiv[extRowHex] = rowHex(cand.idx)
-				equivTypes[extRowHex] = cand.equivTyp
-				typeCounts[cand.equivTyp]++
-				found++
-				break
-			}
+		if match.extRowHex != "" {
+			equiv[match.extRowHex] = match.priRowHex
+			equivTypes[match.extRowHex] = match.equivTyp
+			typeCounts[match.equivTyp]++
+			found++
 		}
 	}
 
@@ -4483,6 +4541,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 		Tested:     tested,
 		Found:      found,
 		TypeCounts: typeCounts,
+		TypeTested: typeTested,
 	}
 }
 
@@ -4490,22 +4549,38 @@ func analyzeEquivResults(results []EquivResult) {
 	fmt.Println("\n=== Equivalence Analysis ===")
 	totalEquiv := 0
 	totalCounts := make(map[string]int)
+	totalTested := make(map[string]int)
 	for _, r := range results {
-		if len(r.Equiv) > 0 {
-			totalEquiv += len(r.Equiv)
-			for typ, cnt := range r.TypeCounts {
-				totalCounts[typ] += cnt
-			}
+		totalEquiv += len(r.Equiv)
+		for typ, cnt := range r.TypeCounts {
+			totalCounts[typ] += cnt
+		}
+		for typ, cnt := range r.TypeTested {
+			totalTested[typ] += cnt
 		}
 	}
-	if totalEquiv > 0 {
-		fmt.Printf("Total: %d extended entries -> save %d bytes\n", totalEquiv, totalEquiv)
-		fmt.Printf("  [0,0,0] nop:      %d\n", totalCounts[EquivNOP])
-		fmt.Printf("  [x,y,*] same_eff: %d\n", totalCounts[EquivSameEff])
-		fmt.Printf("  [*,y,z] same_sig: %d\n", totalCounts[EquivSameSig])
-		fmt.Printf("  [x,*,*] same_note: %d\n", totalCounts[EquivSameNote])
-	} else {
-		fmt.Println("No equivalences found")
+
+	types := []struct {
+		name string
+		desc string
+	}{
+		{EquivNOP, "[0,0,0] nop"},
+		{EquivSameEff, "[x,y,*] same_eff"},
+		{EquivSameSig, "[*,y,z] same_sig"},
+		{EquivSameNote, "[x,*,*] same_note"},
+	}
+
+	fmt.Printf("Total: %d equivalences found\n\n", totalEquiv)
+	fmt.Printf("%-22s %6s %6s %8s\n", "Type", "Found", "Tested", "Rate")
+	fmt.Printf("%-22s %6s %6s %8s\n", "----", "-----", "------", "----")
+	for _, t := range types {
+		found := totalCounts[t.name]
+		tested := totalTested[t.name]
+		rate := ""
+		if tested > 0 {
+			rate = fmt.Sprintf("%.1f%%", float64(found)*100/float64(tested))
+		}
+		fmt.Printf("%-22s %6d %6d %8s\n", t.desc, found, tested, rate)
 	}
 }
 

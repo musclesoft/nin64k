@@ -31,11 +31,11 @@ zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 ; $500: Trackptr ch0-2 (256 bytes each)
 ; $800: Filtertable (227 bytes max)
 ; $8E3: Arptable (188 bytes max)
-; $99F: Row dict0 (396 bytes) - note bytes
-; $B2B: Row dict1 (396 bytes) - inst|effect bytes
-; $CB7: Row dict2 (396 bytes) - param bytes
-; $E43: Packed pointers (182 bytes = 91 patterns × 2)
-; $EF9: Packed pattern data
+; $99F: Row dict0 (365 bytes) - note bytes
+; $B04: Row dict1 (365 bytes) - inst|effect bytes
+; $C79: Row dict2 (365 bytes) - param bytes
+; $DE6: Packed pointers (182 bytes = 91 patterns × 2)
+; $E9C: Packed pattern data
 ;
 ; Global wavetable (163 bytes) is stored in player, shared across all songs.
 ; Instrument wave indices point directly into global_wavetable.
@@ -72,9 +72,9 @@ zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 
 ; Pattern packing constants
 ROW_DICT_OFF        = $99F
-ROW_DICT_SIZE       = 396
-PACKED_PTRS_OFF     = $E43
-PACKED_DATA_OFF     = $EF9
+ROW_DICT_SIZE       = 365
+PACKED_PTRS_OFF     = $DE6
+PACKED_DATA_OFF     = $E9C
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0

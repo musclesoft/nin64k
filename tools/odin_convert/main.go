@@ -16,7 +16,6 @@ import (
 
 var projectRoot string
 var disableEquivSong int
-var equivtestMode bool
 
 func init() {
 	projectRoot = findProjectRoot()
@@ -380,6 +379,117 @@ func countEffectParams(raw []byte) map[int]map[int]int {
 		}
 	}
 	return result
+}
+
+// loadAllSongData loads all 9 song files into a slice.
+func loadAllSongData() [][]byte {
+	songData := make([][]byte, 9)
+	for sn := 1; sn <= 9; sn++ {
+		path := projectPath(filepath.Join("uncompressed", fmt.Sprintf("d%dp.raw", sn)))
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		songData[sn-1] = raw
+	}
+	return songData
+}
+
+// buildEffectRemap analyzes all songs and builds the frequency-sorted effect remapping.
+// Returns effectRemap for regular effects and fSubRemap for F sub-effects.
+func buildEffectRemap(songData [][]byte) ([16]byte, map[int]byte) {
+	var allEffects uint16
+	var allEffectCounts [16]int
+	fSubCounts := make(map[string]int)
+
+	for _, raw := range songData {
+		if raw == nil {
+			continue
+		}
+		effects, _ := analyzeEffects(raw)
+		allEffects |= effects
+		songCounts := countEffectUsage(raw)
+		for i := 0; i < 16; i++ {
+			allEffectCounts[i] += songCounts[i]
+		}
+		params := countEffectParams(raw)
+		for p, c := range params[0xF] {
+			switch {
+			case p < 0x80:
+				fSubCounts["speed"] += c
+			case p >= 0x80 && p < 0x90:
+				fSubCounts["globalvol"] += c
+			case p >= 0x90 && p < 0xA0:
+				fSubCounts["filtmode"] += c
+			case p >= 0xB0 && p < 0xC0:
+				fSubCounts["fineslide"] += c
+			case p >= 0xE0 && p < 0xF0:
+				fSubCounts["filttrig"] += c
+			case p >= 0xF0:
+				fSubCounts["hrdrest"] += c
+			}
+		}
+	}
+
+	type effectFreq struct {
+		name  string
+		code  int
+		count int
+	}
+	var usedEffects []effectFreq
+
+	for i := 1; i < 16; i++ {
+		if i == 4 || i == 0xD || i == 0xF {
+			continue
+		}
+		if allEffects&(1<<i) != 0 {
+			usedEffects = append(usedEffects, effectFreq{
+				name:  fmt.Sprintf("%X", i),
+				code:  i,
+				count: allEffectCounts[i],
+			})
+		}
+	}
+
+	fSubNames := []struct {
+		name string
+		code int
+	}{
+		{"speed", 0x10},
+		{"hrdrest", 0x11},
+		{"filttrig", 0x12},
+		{"globalvol", 0x13},
+		{"filtmode", 0x14},
+	}
+	for _, fs := range fSubNames {
+		if c := fSubCounts[fs.name]; c > 0 {
+			usedEffects = append(usedEffects, effectFreq{
+				name:  "F/" + fs.name,
+				code:  fs.code,
+				count: c,
+			})
+		}
+	}
+
+	sort.Slice(usedEffects, func(i, j int) bool {
+		return usedEffects[i].count > usedEffects[j].count
+	})
+
+	effectRemap := [16]byte{}
+	fSubRemap := make(map[int]byte)
+	for newIdx, ef := range usedEffects {
+		newEffect := byte(newIdx + 1)
+		if ef.code < 0x10 {
+			effectRemap[ef.code] = newEffect
+		} else {
+			fSubRemap[ef.code] = newEffect
+		}
+	}
+	effectRemap[4] = 0
+	effectRemap[0xD] = 0
+	effectRemap[0xF] = 0
+
+	return effectRemap, fSubRemap
 }
 
 // analyzeTableDupes checks for duplicate ranges in wave/arp tables
@@ -906,17 +1016,17 @@ func findReachableOrders(raw []byte, baseAddr, startOrder, numOrders int,
 
 // ConversionStats holds before/after statistics
 type ConversionStats struct {
-	OrigOrders        int
-	NewOrders         int
-	OrigPatterns      int
-	UniquePatterns    int
-	OrigWaveSize      int
-	NewWaveSize       int
-	OrigArpSize       int
-	NewArpSize        int
-	NewFilterSize     int
-	PatternDictSize   int
-	PatternPackedSize int
+	OrigOrders          int
+	NewOrders           int
+	OrigPatterns        int
+	UniquePatterns      int
+	OrigWaveSize        int
+	NewWaveSize         int
+	OrigArpSize         int
+	NewArpSize          int
+	NewFilterSize       int
+	PatternDictSize     int
+	PatternPackedSize   int
 	PrimaryIndices      int
 	ExtendedIndices     int
 	ExtendedBeforeEquiv int
@@ -929,7 +1039,7 @@ type PrevSongTables struct {
 	RowDict []byte
 }
 
-func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte, fSubRemap map[int]byte, globalWave *GlobalWaveTable) ([]byte, ConversionStats) {
+func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, effectRemap [16]byte, fSubRemap map[int]byte, globalWave *GlobalWaveTable, excludeEquiv map[int]bool) ([]byte, ConversionStats, error) {
 	var stats ConversionStats
 	// Detect base address from entry point JMP (offset 0: 4c xx yy -> base is $yy00)
 	baseAddr := int(raw[2]) << 8
@@ -1528,9 +1638,9 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	trackptr2Off := 0x700
 	filterOff := 0x800         // Filter at $800 (227 bytes max)
 	arpOff := 0x8E3            // Arp at $8E3 (188 bytes max)
-	rowDictOff := 0x99F        // Row dict0 (notes), dict1 at +396, dict2 at +792
-	packedPtrsOff := 0xE43     // Packed pointers (182 bytes = 91 patterns × 2)
-	packedDataOff := 0xEF9     // Packed pattern data
+	rowDictOff := 0x99F        // Row dict0 (notes), dict1 at +365, dict2 at +730
+	packedPtrsOff := 0xDE6     // Packed pointers (182 bytes = 91 patterns × 2)
+	packedDataOff := 0xE9C     // Packed pattern data
 
 	// Extract patterns to slice for packing (do effect/order remapping first)
 	patternData := make([][]byte, numPatterns)
@@ -1613,10 +1723,19 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	// Build without prevDict - cross-song matching happens after compaction
 	dict, _ := buildPatternDict(allPatternData, nil)
 
+
+
 	// Optimize equiv map for smallest dict (fast, no packing needed)
+	// disableEquivSong: 0=apply all, -1=disable all, N=disable song N only
 	var equivMap map[int]int
-	if !equivtestMode && (disableEquivSong == 0 || songNum != disableEquivSong) {
-		equivMap = optimizeEquivMapMinDict(songNum, dict, patternData)
+	if disableEquivSong == 0 || (disableEquivSong > 0 && songNum != disableEquivSong) {
+		equivMap = optimizeEquivMapMinDict(songNum, dict, patternData, effectRemap, fSubRemap)
+		// Remove excluded mappings
+		if excludeEquiv != nil {
+			for idx := range excludeEquiv {
+				delete(equivMap, idx)
+			}
+		}
 	}
 
 	// Pack patterns with optimized equiv map
@@ -1627,19 +1746,19 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	stats.ExtendedBeforeEquiv = extendedBeforeEquiv
 
 	// Fixed layout:
-	// $99F: row dictionary (1188 bytes = 396 entries × 3, split format)
-	// $E43: packed pointers (182 bytes = 91 patterns × 2)
-	// $EF9: packed data
+	// $99F: row dictionary (1095 bytes = 365 entries × 3, split format)
+	// $DE6: packed pointers (182 bytes = 91 patterns × 2)
+	// $E9C: packed data
 	packedSize := len(packed)
 	totalSize := packedDataOff + packedSize
 
-	// Validate limits (skip in equivtest mode - we're just building the cache)
-	if !equivtestMode {
+	// Validate limits (skip when equiv disabled for all songs - equivtest mode)
+	if disableEquivSong != -1 {
 		if numPatterns > 91 {
-			panic(fmt.Sprintf("too many patterns: %d (max 91)", numPatterns))
+			return nil, stats, fmt.Errorf("too many patterns: %d (max 91)", numPatterns)
 		}
-		if len(dict)/3 > 397 {
-			panic(fmt.Sprintf("dictionary too large: %d entries (max 397)", len(dict)/3))
+		if len(dict)/3 > 366 {
+			return nil, stats, fmt.Errorf("dictionary too large: %d entries (max 366)", len(dict)/3)
 		}
 	}
 
@@ -1748,14 +1867,14 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	copy(out[arpOff:], newArpTable)
 
 	// Write pattern packing data
-	// Row dictionary in split format: 3 arrays of 396 bytes each (dict[0] implicit)
+	// Row dictionary in split format: 3 arrays of 365 bytes each (dict[0] implicit)
 	// dict0 (notes), dict1 (inst|effect), dict2 (params)
 	// dict[0] is always [0,0,0], not stored - dict[1] starts at offset 0
 	numEntries := len(dict) / 3
 	for i := 1; i < numEntries; i++ {
 		out[rowDictOff+i-1] = dict[i*3]         // note (dict[i] at offset i-1)
-		out[rowDictOff+396+i-1] = dict[i*3+1]   // inst|effect
-		out[rowDictOff+792+i-1] = dict[i*3+2]   // param
+		out[rowDictOff+365+i-1] = dict[i*3+1]   // inst|effect
+		out[rowDictOff+730+i-1] = dict[i*3+2]   // param
 	}
 	// Packed pointers (offset into packed data per pattern)
 	for i, pOff := range patOffsets {
@@ -1768,141 +1887,125 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	stats.PatternDictSize = len(dict) / 3
 	stats.PatternPackedSize = len(packed)
 
-	return out, stats
+	return out, stats, nil
+}
+
+// remapRowBytes transforms a single row's bytes using the effect remapping rules.
+// This is the single source of truth for all row format transformations.
+func remapRowBytes(b0, b1, b2 byte, remap [16]byte, fSubRemap map[int]byte) (byte, byte, byte) {
+	oldEffect := (b1 >> 5) | ((b0 >> 4) & 8)
+	var newEffect byte
+	var newParam byte = b2
+
+	switch oldEffect {
+	case 0:
+		newEffect = 0
+		newParam = 0
+	case 1:
+		newEffect = remap[1]
+		if b2&0x80 != 0 {
+			newParam = 0
+		} else {
+			newParam = 1
+		}
+	case 2:
+		newEffect = remap[2]
+		if b2 == 0x80 {
+			newParam = 1
+		} else {
+			newParam = 0
+		}
+	case 3:
+		newEffect = remap[3]
+		newParam = ((b2 & 0x0F) << 4) | ((b2 & 0xF0) >> 4)
+	case 4:
+		newEffect = 0
+		newParam = 1
+	case 7:
+		newEffect = remap[7]
+		newParam = b2
+	case 8:
+		newEffect = remap[8]
+		newParam = b2
+	case 9:
+		newEffect = remap[9]
+		newParam = b2
+	case 0xA:
+		newEffect = remap[0xA]
+		newParam = b2
+	case 0xB:
+		newEffect = remap[0xB]
+		newParam = b2
+	case 0xD:
+		newEffect = 0
+		newParam = 2
+	case 0xE:
+		newEffect = remap[0xE]
+		newParam = b2
+	case 0xF:
+		if b2 < 0x80 {
+			newEffect = fSubRemap[0x10]
+			newParam = b2
+		} else {
+			hiNib := b2 & 0xF0
+			loNib := b2 & 0x0F
+			switch hiNib {
+			case 0xB0:
+				newEffect = 0
+				newParam = 3
+			case 0xF0:
+				newEffect = fSubRemap[0x11]
+				newParam = loNib
+			case 0xE0:
+				newEffect = fSubRemap[0x12]
+				newParam = loNib << 4
+			case 0x80:
+				newEffect = fSubRemap[0x13]
+				newParam = loNib
+			case 0x90:
+				newEffect = fSubRemap[0x14]
+				newParam = loNib << 4
+			default:
+				newEffect = 0
+				newParam = 0
+			}
+		}
+	default:
+		newEffect = remap[oldEffect]
+		newParam = b2
+	}
+
+	newB0 := (b0 & 0x7F) | ((newEffect & 8) << 4)
+	newB1 := (b1 & 0x1F) | ((newEffect & 7) << 5)
+	return newB0, newB1, newParam
 }
 
 // remapPatternEffects remaps effect numbers and parameters in pattern data
-// New encoding:
-// - Effect 0: param 0=none, 1=vib, 2=break, 3=fineslide (no-param effects)
-// - Effects 1-E: the 14 variable-param effects (regular + F sub-effects)
 func remapPatternEffects(pattern []byte, remap [16]byte, fSubRemap map[int]byte) {
 	for row := 0; row < 64; row++ {
 		off := row * 3
-		byte0 := pattern[off]
-		byte1 := pattern[off+1]
-		byte2 := pattern[off+2]
-		// Extract old effect: (byte1 >> 5) | ((byte0 >> 4) & 8)
-		oldEffect := (byte1 >> 5) | ((byte0 >> 4) & 8)
-
-		var newEffect byte
-		var newParam byte = byte2
-
-		switch oldEffect {
-		case 0:
-			// No effect -> effect 0, param 0
-			newEffect = 0
-			newParam = 0
-
-		case 4:
-			// Vib (always param $00) -> effect 0, param 1
-			newEffect = 0
-			newParam = 1
-
-		case 0xD:
-			// Break (always param $00) -> effect 0, param 2
-			newEffect = 0
-			newParam = 2
-
-		case 0xF:
-			// Extended effects - split into separate effects or effect 0
-			if byte2 < 0x80 {
-				// Speed ($00-$7F) -> separate effect
-				newEffect = fSubRemap[0x10] // speed
-				newParam = byte2
-			} else {
-				hiNib := byte2 & 0xF0
-				loNib := byte2 & 0x0F
-				switch hiNib {
-				case 0xB0:
-					// Fineslide (always param $B1) -> effect 0, param 3
-					newEffect = 0
-					newParam = 3
-				case 0xF0:
-					// Hard restart -> separate effect
-					newEffect = fSubRemap[0x11]
-					newParam = loNib
-				case 0xE0:
-					// Filter trigger -> separate effect (pre-shifted *16 for player)
-					newEffect = fSubRemap[0x12]
-					newParam = loNib << 4
-				case 0x80:
-					// Global volume -> separate effect
-					newEffect = fSubRemap[0x13]
-					newParam = loNib
-				case 0x90:
-					// Filter mode -> separate effect (pre-shifted for player)
-					newEffect = fSubRemap[0x14]
-					newParam = loNib << 4
-				default:
-					newEffect = 0
-					newParam = 0
-				}
-			}
-
-		case 1:
-			// Slide: $80/$81 -> 0 (up), $00 -> 1 (down)
-			newEffect = remap[1]
-			if byte2&0x80 != 0 {
-				newParam = 0 // up
-			} else {
-				newParam = 1 // down
-			}
-
-		case 2:
-			// Pulse width: $00 -> 0, $80 -> 1
-			newEffect = remap[2]
-			if byte2 == 0x80 {
-				newParam = 1
-			} else {
-				newParam = 0
-			}
-
-		case 7:
-			// AD: keep literal value
-			newEffect = remap[7]
-			newParam = byte2
-
-		case 8:
-			// SR: keep literal value
-			newEffect = remap[8]
-			newParam = byte2
-
-		case 9:
-			// Wave: keep literal value
-			newEffect = remap[9]
-			newParam = byte2
-
-		case 0xE:
-			// Reso: keep literal value
-			newEffect = remap[0xE]
-			newParam = byte2
-
-		case 3:
-			// Porta: swap nibbles for faster player processing
-			newEffect = remap[3]
-			newParam = ((byte2 & 0x0F) << 4) | ((byte2 & 0xF0) >> 4)
-
-		default:
-			// Other effects (A=arp, B=jump) - just remap effect number
-			newEffect = remap[oldEffect]
-			newParam = byte2
-		}
-
-		// Encode new effect: byte0 bit 7 = effect bit 3, byte1 bits 5-7 = effect bits 0-2
-		byte0 = (byte0 & 0x7F) | ((newEffect & 8) << 4)
-		byte1 = (byte1 & 0x1F) | ((newEffect & 7) << 5)
-		pattern[off] = byte0
-		pattern[off+1] = byte1
-		pattern[off+2] = newParam
+		pattern[off], pattern[off+1], pattern[off+2] = remapRowBytes(
+			pattern[off], pattern[off+1], pattern[off+2], remap, fSubRemap)
 	}
 }
 
+// translateRowHex translates a hex-encoded row from original to converted format
+func translateRowHex(origHex string, remap [16]byte, fSubRemap map[int]byte) string {
+	if len(origHex) != 6 {
+		return origHex
+	}
+	var b0, b1, b2 byte
+	fmt.Sscanf(origHex, "%02x%02x%02x", &b0, &b1, &b2)
+	newB0, newB1, newParam := remapRowBytes(b0, b1, b2, remap, fSubRemap)
+	return fmt.Sprintf("%02x%02x%02x", newB0, newB1, newParam)
+}
 
 // Global caches loaded once
 // NOTE: Delete tools/odin_convert/equiv_cache.json when changing the pattern format
 // (e.g., effect parameter encoding, row dictionary structure)
 var globalEquivCache []EquivResult
 var equivCacheLoaded bool
+var globalExcludedOrig map[string]bool // temporary exclusions for validation pass
 
 // loadEquivCache loads the equivalence cache from disk
 func loadEquivCache() []EquivResult {
@@ -1923,187 +2026,8 @@ func loadEquivCache() []EquivResult {
 	return results
 }
 
-// loadSongEquivMap returns equivalence map for a specific song
-// Uses verified equivalences from equiv_cache (row hex -> row hex)
-// Comprehensive optimization:
-// 1. Strongly prefer index 0 (zero row) - row disappears, uses zero-RLE encoding
-// 2. Analyze patterns for RLE opportunities - map consecutive rows to same target
-// 3. Allow primary row elimination - free up dict space for extended rows
-// 4. Prefer already-used targets - no new dict entries needed
-func loadSongEquivMap(songNum int, dict []byte, patterns [][]byte) map[int]int {
-	if songNum < 1 || songNum > 9 {
-		return nil
-	}
-
-	equivCache := loadEquivCache()
-	if equivCache == nil {
-		return nil
-	}
-
-	songEquiv := equivCache[songNum-1].Equiv
-	if len(songEquiv) == 0 {
-		return nil
-	}
-
-	// Build row hex -> index map from dict
-	numEntries := len(dict) / 3
-	rowToIdx := make(map[string]int)
-	idxToHex := make(map[int]string)
-	rowToIdx["000000"] = 0
-	idxToHex[0] = "000000"
-	for idx := 1; idx < numEntries; idx++ {
-		rowHex := fmt.Sprintf("%02x%02x%02x", dict[idx*3], dict[idx*3+1], dict[idx*3+2])
-		rowToIdx[rowHex] = idx
-		idxToHex[idx] = rowHex
-	}
-
-	// Collect rows used in patterns and count consecutive pairs
-	// consecutivePairs[hexA][hexB] = count of times A is followed by B (after RLE)
-	usedHex := make(map[string]bool)
-	usedHex["000000"] = true
-	consecutivePairs := make(map[string]map[string]int)
-	for _, pat := range patterns {
-		var prevRow [3]byte
-		var prevHex string
-		numRows := len(pat) / 3
-		for row := 0; row < numRows; row++ {
-			off := row * 3
-			curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
-			if curRow != prevRow {
-				curHex := fmt.Sprintf("%02x%02x%02x", curRow[0], curRow[1], curRow[2])
-				usedHex[curHex] = true
-				if prevHex != "" && prevHex != curHex {
-					if consecutivePairs[prevHex] == nil {
-						consecutivePairs[prevHex] = make(map[string]int)
-					}
-					consecutivePairs[prevHex][curHex]++
-				}
-				prevHex = curHex
-			}
-			prevRow = curRow
-		}
-	}
-
-	// Build equiv options for ALL used rows (not just extended)
-	// This allows primary rows to be eliminated too
-	type equivRow struct {
-		idx     int
-		hex     string
-		options []int // indices this row can map to (must be < idx)
-	}
-	var equivRows []equivRow
-	for rowHex, optionHexList := range songEquiv {
-		idx, idxOk := rowToIdx[rowHex]
-		if !idxOk || !usedHex[rowHex] {
-			continue
-		}
-		var options []int
-		for _, optHex := range optionHexList {
-			if optIdx, ok := rowToIdx[optHex]; ok && optIdx < idx {
-				options = append(options, optIdx)
-			}
-		}
-		if len(options) > 0 {
-			equivRows = append(equivRows, equivRow{idx: idx, hex: rowHex, options: options})
-		}
-	}
-
-	// Sort: rows that can map to 0 first, then by fewest options
-	for i := 0; i < len(equivRows)-1; i++ {
-		for j := i + 1; j < len(equivRows); j++ {
-			iHasZero := false
-			jHasZero := false
-			for _, opt := range equivRows[i].options {
-				if opt == 0 {
-					iHasZero = true
-					break
-				}
-			}
-			for _, opt := range equivRows[j].options {
-				if opt == 0 {
-					jHasZero = true
-					break
-				}
-			}
-			swap := false
-			if jHasZero && !iHasZero {
-				swap = true
-			} else if jHasZero == iHasZero && len(equivRows[j].options) < len(equivRows[i].options) {
-				swap = true
-			}
-			if swap {
-				equivRows[i], equivRows[j] = equivRows[j], equivRows[i]
-			}
-		}
-	}
-
-	// Build equiv map with comprehensive scoring
-	const primaryMax = 225
-	equivMap := make(map[int]int)
-
-	// Track what each row maps to (for RLE analysis)
-	effectiveIdx := make(map[string]int)
-	for hex, idx := range rowToIdx {
-		effectiveIdx[hex] = idx
-	}
-
-	for _, er := range equivRows {
-		bestTarget := -1
-		bestScore := -1
-
-		for _, targetIdx := range er.options {
-			targetHex := idxToHex[targetIdx]
-			score := 0
-
-			// Huge bonus for index 0 - row disappears, uses zero-RLE
-			if targetIdx == 0 {
-				score += 1000000
-			}
-
-			// Big bonus if target is already used (no new dict entry)
-			if usedHex[targetHex] {
-				score += 100000
-			}
-
-			// Bonus for RLE opportunities: if this row is consecutive with another
-			// row that maps to the same target, we create RLE
-			for neighborHex, count := range consecutivePairs[er.hex] {
-				if effectiveIdx[neighborHex] == targetIdx {
-					score += count * 5000
-				}
-			}
-			for neighborHex, pairs := range consecutivePairs {
-				if pairs[er.hex] > 0 && effectiveIdx[neighborHex] == targetIdx {
-					score += pairs[er.hex] * 5000
-				}
-			}
-
-			// Bonus for primary index (1-byte encoding)
-			if targetIdx < primaryMax {
-				score += 10000
-			}
-
-			// Small bonus for lower index
-			score += (1000 - targetIdx)
-
-			if score > bestScore {
-				bestScore = score
-				bestTarget = targetIdx
-			}
-		}
-
-		if bestTarget >= 0 {
-			equivMap[er.idx] = bestTarget
-			effectiveIdx[er.hex] = bestTarget
-			usedHex[idxToHex[bestTarget]] = true
-		}
-	}
-
-	return equivMap
-}
-
 // optimizeEquivMapMinDict minimizes dictionary size by mapping rows to already-used targets or idx 0
-func optimizeEquivMapMinDict(songNum int, dict []byte, patterns [][]byte) map[int]int {
+func optimizeEquivMapMinDict(songNum int, dict []byte, patterns [][]byte, effectRemap [16]byte, fSubRemap map[int]byte) map[int]int {
 	if songNum < 1 || songNum > 9 {
 		return nil
 	}
@@ -2115,6 +2039,30 @@ func optimizeEquivMapMinDict(songNum int, dict []byte, patterns [][]byte) map[in
 	songEquiv := equivCache[songNum-1].Equiv
 	if len(songEquiv) == 0 {
 		return nil
+	}
+
+	// Build set of excluded original rows
+	excludedOrig := make(map[string]bool)
+	for _, origHex := range equivCache[songNum-1].ExcludedOrig {
+		excludedOrig[origHex] = true
+	}
+	// Also check global exclusion set for validation pass
+	for origHex := range globalExcludedOrig {
+		excludedOrig[origHex] = true
+	}
+
+	// Translate equiv cache from original format to converted format
+	translatedEquiv := make(map[string][]string)
+	for origSrc, origDsts := range songEquiv {
+		if excludedOrig[origSrc] {
+			continue // Skip excluded original mappings
+		}
+		convSrc := translateRowHex(origSrc, effectRemap, fSubRemap)
+		var convDsts []string
+		for _, origDst := range origDsts {
+			convDsts = append(convDsts, translateRowHex(origDst, effectRemap, fSubRemap))
+		}
+		translatedEquiv[convSrc] = convDsts
 	}
 
 	// Build row hex -> index map
@@ -2128,7 +2076,6 @@ func optimizeEquivMapMinDict(songNum int, dict []byte, patterns [][]byte) map[in
 		rowToIdx[rowHex] = idx
 		idxToHex[idx] = rowHex
 	}
-
 	// Collect rows used in patterns (these form the initial "needed" set)
 	usedInPatterns := make(map[int]bool)
 	usedInPatterns[0] = true
@@ -2156,19 +2103,18 @@ func optimizeEquivMapMinDict(songNum int, dict []byte, patterns [][]byte) map[in
 		hasZero bool
 	}
 	var rows []equivRow
-	for rowHex, optionHexList := range songEquiv {
+	for rowHex, optionHexList := range translatedEquiv {
 		idx, ok := rowToIdx[rowHex]
-		if !ok || !usedInPatterns[idx] {
+		if !ok {
+			continue
+		}
+		if !usedInPatterns[idx] || idx == 0 {
 			continue
 		}
 		var options []int
 		hasZero := false
 		for _, optHex := range optionHexList {
-			if optIdx, ok := rowToIdx[optHex]; ok && optIdx < idx {
-				// Song 2 workaround: extended can only map to extended (bad cache entry)
-				if songNum == 2 && idx >= primaryMax && optIdx < primaryMax {
-					continue
-				}
+			if optIdx, ok := rowToIdx[optHex]; ok && optIdx != idx {
 				options = append(options, optIdx)
 				if optIdx == 0 {
 					hasZero = true
@@ -2719,78 +2665,6 @@ func optimizePackedOverlap(patterns [][]byte) (packed []byte, offsets []uint16) 
 }
 
 // packPatterns packs pattern data using per-song row dictionary + RLE (no equivalence)
-func packPatterns(patterns [][]byte, prevDict []byte) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int, extendedBeforeEquiv int) {
-	inputDict, _ := buildPatternDict(patterns, nil)
-	return packPatternsWithEquiv(patterns, inputDict, nil, prevDict, nil)
-}
-
-// decodePattern simulates the 6502 decode routine for verification
-// Format: $00-$0E = dict[0]+RLE 0-14, $0F-$EE = dict[1-224], $EF-$FE = RLE 1-16, $FF = extended 225+
-// dict[0] is implicit [0,0,0], dict[1] starts at offset 0 in the dict array
-func decodePattern(dict, packed []byte, offset uint16) []byte {
-	const primaryMax = 225
-	const rleBase = 0xEF
-	const dictZeroRleMax = 0x0E
-	const dictOffsetBase = 0x0F
-
-	decoded := make([]byte, 192)
-	srcOff := int(offset)
-	dstOff := 0
-	prevRow := [3]byte{0, 0, 0}
-
-	for dstOff < 192 {
-		b := packed[srcOff]
-		srcOff++
-
-		if b <= dictZeroRleMax {
-			// $00-$0E: dict[0] with RLE 0-14 (dict[0] is implicit [0,0,0])
-			decoded[dstOff] = 0
-			decoded[dstOff+1] = 0
-			decoded[dstOff+2] = 0
-			prevRow = [3]byte{0, 0, 0}
-			dstOff += 3
-			for j := 0; j < int(b) && dstOff < 192; j++ {
-				copy(decoded[dstOff:], prevRow[:])
-				dstOff += 3
-			}
-		} else if b < rleBase {
-			// $0F-$EE: dict[1-224] (dict[1] at offset 0)
-			idx := int(b) - dictOffsetBase + 1 // $0F->1, $10->2, etc.
-			off := (idx - 1) * 3               // dict[1] at offset 0
-			copy(decoded[dstOff:], dict[off:off+3])
-			copy(prevRow[:], dict[off:off+3])
-			dstOff += 3
-		} else if b < 0xFF {
-			// $EF-$FE: RLE 1-16
-			count := int(b - rleBase + 1)
-			for j := 0; j < count; j++ {
-				copy(decoded[dstOff:], prevRow[:])
-				dstOff += 3
-			}
-		} else {
-			// $FF + byte: Extended dict index 225+
-			extIdx := int(packed[srcOff])
-			srcOff++
-			idx := primaryMax + extIdx
-			off := (idx - 1) * 3 // dict[1] at offset 0
-			copy(decoded[dstOff:], dict[off:off+3])
-			copy(prevRow[:], dict[off:off+3])
-			dstOff += 3
-		}
-	}
-
-	return decoded
-}
-
-func findFirstDiff(a, b []byte) int {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return i
-		}
-	}
-	return -1
-}
-
 // SIDWrite represents a single write to a SID register
 type SIDWrite struct {
 	Addr  uint16
@@ -3896,9 +3770,10 @@ func printUsage() {
 	fmt.Println("Usage: odin_convert [options]")
 	fmt.Println()
 	fmt.Println("Options:")
-	fmt.Println("  (none)       Convert songs and run verification tests")
-	fmt.Println("  -equivtest   Rebuild equivalence cache (slow, tests all pairs)")
-	fmt.Println("  -h, --help   Show this help message")
+	fmt.Println("  (none)            Convert songs and run verification tests")
+	fmt.Println("  -equivtest [N]    Rebuild equivalence cache (slow, tests all pairs)")
+	fmt.Println("  -equivvalidate N  Validate cached equiv pairs for song N, find bad combos")
+	fmt.Println("  -h, --help        Show this help message")
 }
 
 func main() {
@@ -3906,10 +3781,28 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "-equivtest":
-			equivtestMode = true
+			// Standalone equiv test - completely independent from conversion
+			var onlySong int
 			if len(os.Args) > 2 {
-				fmt.Sscanf(os.Args[2], "%d", &disableEquivSong)
+				fmt.Sscanf(os.Args[2], "%d", &onlySong)
 			}
+			runStandaloneEquivTest(onlySong)
+			return
+		case "-equivvalidate":
+			// Validate cached equiv pairs for a specific song
+			if len(os.Args) < 3 {
+				fmt.Fprintf(os.Stderr, "Error: -equivvalidate requires a song number\n\n")
+				printUsage()
+				os.Exit(1)
+			}
+			var songNum int
+			fmt.Sscanf(os.Args[2], "%d", &songNum)
+			if songNum < 1 || songNum > 9 {
+				fmt.Fprintf(os.Stderr, "Error: song number must be 1-9\n")
+				os.Exit(1)
+			}
+			runEquivValidate(songNum)
+			return
 		case "-h", "-help", "--help":
 			printUsage()
 			return
@@ -4300,12 +4193,17 @@ func main() {
 	// Each song's tables are passed to the next song for dedup
 	convertedSongs := make([][]byte, 9)
 	convertedStats := make([]ConversionStats, 9)
+	conversionErrors := make(map[int]string)
 	var prevTables *PrevSongTables
 	for songNum := 1; songNum <= 9; songNum++ {
 		if songData[songNum-1] == nil {
 			continue
 		}
-		convertedData, stats := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap, fSubRemap, globalWave)
+		convertedData, stats, err := convertToNewFormat(songData[songNum-1], songNum, prevTables, effectRemap, fSubRemap, globalWave, nil)
+		if err != nil {
+			conversionErrors[songNum] = err.Error()
+			continue
+		}
 		convertedSongs[songNum-1] = convertedData
 		convertedStats[songNum-1] = stats
 
@@ -4322,8 +4220,8 @@ func main() {
 		// dict[0] = [0,0,0] (implicit, already zero in fresh slice)
 		for i := 1; i < numEntries; i++ {
 			prevDict[i*3] = convertedData[rowDictOff+i-1]       // note (dict[i] at file offset i-1)
-			prevDict[i*3+1] = convertedData[rowDictOff+396+i-1] // inst|effect
-			prevDict[i*3+2] = convertedData[rowDictOff+792+i-1] // param
+			prevDict[i*3+1] = convertedData[rowDictOff+365+i-1] // inst|effect
+			prevDict[i*3+2] = convertedData[rowDictOff+730+i-1] // param
 		}
 		prevTables = &PrevSongTables{
 			Arp:     append([]byte{}, convertedData[arpOff:arpOff+stats.NewArpSize]...),
@@ -4363,8 +4261,8 @@ func main() {
 		data := convertedSongs[songNum-1]
 		for i := 0; i < numEntries; i++ {
 			interleavedDict[i*3] = data[rowDictOffAnalysis+i]
-			interleavedDict[i*3+1] = data[rowDictOffAnalysis+396+i]
-			interleavedDict[i*3+2] = data[rowDictOffAnalysis+792+i]
+			interleavedDict[i*3+1] = data[rowDictOffAnalysis+365+i]
+			interleavedDict[i*3+2] = data[rowDictOffAnalysis+730+i]
 		}
 		combos := analyzeRowDictCombinations(interleavedDict)
 		for i := 0; i < 8; i++ {
@@ -4386,6 +4284,10 @@ func main() {
 
 	for songNum := 1; songNum <= 9; songNum++ {
 		if songData[songNum-1] == nil {
+			continue
+		}
+		if errMsg, hasErr := conversionErrors[songNum]; hasErr {
+			results <- result{songNum: songNum, err: errMsg}
 			continue
 		}
 		wg.Add(1)
@@ -4575,22 +4477,17 @@ func main() {
 			fmt.Printf("\nSlowest checkpoint: %s cycles (from $%04X to $%04X)\n", commas(worstGapVal), worstGapFrom, worstGapTo)
 		}
 
-	} else if !equivtestMode {
+	} else {
 		os.Exit(1)
-	}
-
-	// Equiv test if requested
-	if equivtestMode {
-		fmt.Println("\n=== Equivalence Test ===")
-		runEquivTest(convertedSongs, convertedStats, playerData, disableEquivSong)
 	}
 }
 
 // EquivResult stores equivalence cache results
 // Uses row values (hex) instead of indices for position-independent caching
 type EquivResult struct {
-	SongNum int                 `json:"song"`
-	Equiv   map[string][]string `json:"equiv"` // extended row hex -> list of valid replacements
+	SongNum      int                 `json:"song"`
+	Equiv        map[string][]string `json:"equiv"`                    // original row hex -> list of valid replacements
+	ExcludedOrig []string            `json:"excluded_orig,omitempty"`  // original row hex values to exclude from equiv
 }
 
 
@@ -5113,10 +5010,229 @@ func findInstructionStarts(data []byte, base uint16) []uint16 {
 	return starts
 }
 
-// runEquivTest tests all pairs to build the equivalence cache
+// runStandaloneEquivTest runs equiv testing independently from conversion
+func runStandaloneEquivTest(onlySong int) {
+	fmt.Println("=== Standalone Equivalence Test ===")
+	fmt.Println("Testing equiv pairs against ORIGINAL audio...")
+
+	// Disable equiv for all songs during this run
+	disableEquivSong = -1 // Special value meaning "disable for all"
+
+	songData := loadAllSongData()
+	runEquivTest(songData, onlySong)
+}
+
+// runEquivValidate validates cached equiv pairs for a specific song
+// Tests if applying all cached pairs causes audio failure, then binary searches to find bad combos
+func runEquivValidate(songNum int) {
+	fmt.Printf("=== Equiv Validation for Song %d ===\n", songNum)
+
+	// Initialize global exclusion set
+	globalExcludedOrig = make(map[string]bool)
+
+	// Load all song data
+	songData := loadAllSongData()
+	rawData := songData[songNum-1]
+	if rawData == nil {
+		fmt.Printf("Error loading song %d\n", songNum)
+		os.Exit(1)
+	}
+
+	// Build effect remapping
+	effectRemap, fSubRemap := buildEffectRemap(songData)
+
+	// Build global wavetable and write it (needed for player build)
+	globalWave := buildGlobalWaveTable(songData)
+	waveTablePath := projectPath("tools/odin_convert/wavetable.inc")
+	if err := writeGlobalWaveTable(globalWave, waveTablePath); err != nil {
+		fmt.Printf("Error writing wavetable: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Build and load player
+	if err := rebuildPlayer(); err != nil {
+		fmt.Printf("Error building player: %v\n", err)
+		os.Exit(1)
+	}
+	playerPath := projectPath("build/player.bin")
+	playerData, err := os.ReadFile(playerPath)
+	if err != nil {
+		fmt.Printf("Error loading player: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Load equiv cache and get original source hexes
+	cache := loadEquivCache()
+	if cache == nil || len(cache) < songNum {
+		fmt.Println("No equiv cache found")
+		os.Exit(1)
+	}
+	songEquiv := cache[songNum-1].Equiv
+	if len(songEquiv) == 0 {
+		fmt.Println("No equiv entries for this song")
+		return
+	}
+
+	var origSources []string
+	for origSrc := range songEquiv {
+		origSources = append(origSources, origSrc)
+	}
+	sort.Strings(origSources)
+	fmt.Printf("Found %d equiv sources to test\n", len(origSources))
+
+	// Helper to convert and test
+	testWithExclusions := func() bool {
+		// Clear cache to force reload
+		equivCacheLoaded = false
+		globalEquivCache = nil
+
+		// Convert song
+		convData, convStats, err := convertToNewFormat(rawData, songNum, nil, effectRemap, fSubRemap, globalWave, nil)
+		if err != nil {
+			return false
+		}
+
+		// Test
+		result := testSong(songNum, rawData, convData, convStats, playerData)
+		return result.passed
+	}
+
+	// First test with all equiv applied
+	fmt.Printf("Testing with all %d equiv sources...\n", len(origSources))
+	if testWithExclusions() {
+		fmt.Println("PASS - All equiv pairs work together")
+		return
+	}
+	fmt.Println("FAIL - Some equiv pairs cause issues when combined")
+
+	// Verify that excluding ALL sources passes
+	for _, src := range origSources {
+		globalExcludedOrig[src] = true
+	}
+	if !testWithExclusions() {
+		fmt.Println("ERROR - Song still fails without any equiv (other issue)")
+		os.Exit(1)
+	}
+	fmt.Println("Confirmed: excluding all equiv passes")
+
+	// Binary search for bad sources
+	badSources := make(map[string]bool)
+
+	var findBadSources func(sources []string)
+	findBadSources = func(sources []string) {
+		if len(sources) == 0 {
+			return
+		}
+		if len(sources) == 1 {
+			// Single source - test if excluding it helps
+			globalExcludedOrig = make(map[string]bool)
+			for s := range badSources {
+				globalExcludedOrig[s] = true
+			}
+			globalExcludedOrig[sources[0]] = true
+			if testWithExclusions() {
+				badSources[sources[0]] = true
+				fmt.Printf("  Found bad source: %s\n", sources[0])
+			}
+			return
+		}
+
+		// Test first half
+		mid := len(sources) / 2
+		firstHalf := sources[:mid]
+		secondHalf := sources[mid:]
+
+		// Exclude first half + known bad, keep second half
+		globalExcludedOrig = make(map[string]bool)
+		for s := range badSources {
+			globalExcludedOrig[s] = true
+		}
+		for _, s := range firstHalf {
+			globalExcludedOrig[s] = true
+		}
+
+		if testWithExclusions() {
+			// Bad source is in first half
+			findBadSources(firstHalf)
+		} else {
+			// Check second half
+			globalExcludedOrig = make(map[string]bool)
+			for s := range badSources {
+				globalExcludedOrig[s] = true
+			}
+			for _, s := range secondHalf {
+				globalExcludedOrig[s] = true
+			}
+			if testWithExclusions() {
+				// Bad source is in second half
+				findBadSources(secondHalf)
+			} else {
+				// Bad sources in both halves
+				findBadSources(firstHalf)
+				findBadSources(secondHalf)
+			}
+		}
+	}
+
+	// Start search with all sources included except known bad
+	globalExcludedOrig = make(map[string]bool)
+	findBadSources(origSources)
+
+	if len(badSources) == 0 {
+		fmt.Println("No individual bad sources found (might be interaction between multiple)")
+		return
+	}
+
+	// Verify final result
+	globalExcludedOrig = make(map[string]bool)
+	for s := range badSources {
+		globalExcludedOrig[s] = true
+	}
+	if testWithExclusions() {
+		fmt.Printf("PASS with %d excluded sources\n", len(badSources))
+	} else {
+		fmt.Printf("WARNING: Still fails with %d exclusions\n", len(badSources))
+	}
+
+	// Update cache with bad sources
+	cacheFile := projectPath("tools/odin_convert/equiv_cache.json")
+	cacheData, err := os.ReadFile(cacheFile)
+	if err != nil {
+		fmt.Printf("Error reading cache: %v\n", err)
+		return
+	}
+	var fullCache []EquivResult
+	if json.Unmarshal(cacheData, &fullCache) != nil || len(fullCache) < songNum {
+		fmt.Println("Error parsing cache")
+		return
+	}
+
+	// Add new exclusions (avoid duplicates)
+	existingExcluded := make(map[string]bool)
+	for _, s := range fullCache[songNum-1].ExcludedOrig {
+		existingExcluded[s] = true
+	}
+	for s := range badSources {
+		if !existingExcluded[s] {
+			fullCache[songNum-1].ExcludedOrig = append(fullCache[songNum-1].ExcludedOrig, s)
+		}
+	}
+	sort.Strings(fullCache[songNum-1].ExcludedOrig)
+
+	newData, _ := json.MarshalIndent(fullCache, "", "  ")
+	os.WriteFile(cacheFile, newData, 0644)
+	fmt.Printf("Updated cache with %d total excluded sources for song %d\n",
+		len(fullCache[songNum-1].ExcludedOrig), songNum)
+
+	// Clean up
+	globalExcludedOrig = nil
+}
+
+// runEquivTest tests all pairs against ORIGINAL song audio to build the equivalence cache
+// Uses original row values (not converted format)
 // If onlySong > 0, only test that song
-func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, playerData []byte, onlySong int) {
-	fmt.Println("Testing ALL pairs with full song duration (highly parallel)...")
+func runEquivTest(songData [][]byte, onlySong int) {
+	fmt.Println("Testing ALL pairs against ORIGINAL audio...")
 	if onlySong > 0 {
 		fmt.Printf("Filtering to song %d only\n", onlySong)
 	}
@@ -5142,22 +5258,84 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 		}
 	}
 
-	var totalPairs int64
-	songPairs := make([]int64, 9)
+	// Extract unique rows from each song's patterns
+	type rowInfo struct {
+		hex       string
+		locations []int // offsets in raw data where this row appears
+	}
+	songRows := make([]map[string]*rowInfo, 9)
+
 	for songNum := 1; songNum <= 9; songNum++ {
 		if onlySong > 0 && songNum != onlySong {
 			continue
 		}
-		if convertedSongs[songNum-1] == nil {
+		raw := songData[songNum-1]
+		if raw == nil {
 			continue
 		}
-		dictSize := convertedStats[songNum-1].PatternDictSize
-		pairs := int64(dictSize) * int64(dictSize-1) / 2
-		songPairs[songNum-1] = pairs
-		totalPairs += pairs
-		fmt.Printf("Song %d: %d dict entries = %d pairs\n", songNum, dictSize, pairs)
+
+		// Extract pattern addresses from reachable orders only (same as conversion)
+		baseAddr := 0x1000
+		if songNum%2 == 0 {
+			baseAddr = 0x7000
+		}
+		// Read track table offsets from embedded player code (same as conversion)
+		trackLoOff := []int{
+			int(readWord(raw, codeTrackLo0)) - baseAddr,
+			int(readWord(raw, codeTrackLo1)) - baseAddr,
+			int(readWord(raw, codeTrackLo2)) - baseAddr,
+		}
+		trackHiOff := []int{
+			int(readWord(raw, codeTrackHi0)) - baseAddr,
+			int(readWord(raw, codeTrackHi1)) - baseAddr,
+			int(readWord(raw, codeTrackHi2)) - baseAddr,
+		}
+		// Calculate numOrders from table layout gap (same as conversion)
+		srcTranspose0Off := int(readWord(raw, codeTranspose0)) - baseAddr
+		trackLo0Off := int(readWord(raw, codeTrackLo0)) - baseAddr
+		numOrders := trackLo0Off - srcTranspose0Off
+		if numOrders <= 0 || numOrders > 255 {
+			numOrders = 255
+		}
+		songStartOff := int(readWord(raw, codeSongStart)) - baseAddr
+		startOrder := int(raw[songStartOff])
+		reachableOrders, _ := findReachableOrders(raw, baseAddr, startOrder, numOrders, trackLoOff, trackHiOff)
+
+		patternAddrs := make(map[uint16]bool)
+		for _, order := range reachableOrders {
+			for ch := 0; ch < 3; ch++ {
+				lo := raw[trackLoOff[ch]+order]
+				hi := raw[trackHiOff[ch]+order]
+				addr := uint16(lo) | uint16(hi)<<8
+				srcOff := int(addr) - baseAddr
+				if srcOff >= 0 && srcOff+192 <= len(raw) {
+					patternAddrs[addr] = true
+				}
+			}
+		}
+
+		// Collect unique rows and their locations from reachable patterns
+		rows := make(map[string]*rowInfo)
+		for addr := range patternAddrs {
+			srcOff := int(addr) - baseAddr
+			for row := 0; row < 64; row++ {
+				off := srcOff + row*3
+				rowBytes := [3]byte{raw[off], raw[off+1], raw[off+2]}
+				hex := fmt.Sprintf("%02x%02x%02x", rowBytes[0], rowBytes[1], rowBytes[2])
+				if rows[hex] == nil {
+					rows[hex] = &rowInfo{hex: hex}
+				}
+				rows[hex].locations = append(rows[hex].locations, off)
+			}
+		}
+		songRows[songNum-1] = rows
+
+		numRows := len(rows)
+		fmt.Printf("Song %d: %d unique rows\n", songNum, numRows)
 	}
-	fmt.Printf("Total pairs to test: %d\n\n", totalPairs)
+
+	// Count actual tests (done during work generation, updated via atomic)
+	var totalTests int64
 
 	// Shared progress counters
 	var testsCompleted int64
@@ -5179,14 +5357,22 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 				completed := atomic.LoadInt64(&testsCompleted)
 				matches := atomic.LoadInt64(&matchesFound)
 				songs := atomic.LoadInt32(&songsComplete)
+				total := atomic.LoadInt64(&totalTests)
 				elapsed := time.Since(startTime)
-				pct := float64(completed) / float64(totalPairs) * 100
 				rate := float64(completed) / elapsed.Seconds()
-				eta := time.Duration(float64(totalPairs-completed)/rate) * time.Second
 
 				fmt.Printf("\n=== Progress at %s ===\n", time.Now().Format("15:04:05"))
-				fmt.Printf("Tested: %d / %d (%.1f%%) - Songs complete: %d/9\n", completed, totalPairs, pct, songs)
-				fmt.Printf("Speed: %.0f tests/sec - ETA: %v\n", rate, eta.Round(time.Second))
+				if total > 0 && songs == 9 {
+					// All songs queued, show accurate progress
+					pct := float64(completed) / float64(total) * 100
+					eta := time.Duration(float64(total-completed)/rate) * time.Second
+					fmt.Printf("Tested: %d / %d (%.1f%%) - Songs complete: %d/9\n", completed, total, pct, songs)
+					fmt.Printf("Speed: %.0f tests/sec - ETA: %v\n", rate, eta.Round(time.Second))
+				} else {
+					// Still queueing, show progress without percentage
+					fmt.Printf("Tested: %d (queueing songs %d/9)\n", completed, songs)
+					fmt.Printf("Speed: %.0f tests/sec\n", rate)
+				}
 				fmt.Printf("Matches found: %d (%.4f%%)\n", matches, float64(matches)/float64(completed)*100)
 
 				// Save current results
@@ -5212,8 +5398,8 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 	// Create work items for all songs
 	type workItem struct {
 		songNum int
-		idx1    int
-		idx2    int
+		row1Hex string
+		row2Hex string
 	}
 	work := make(chan workItem, 10000)
 
@@ -5224,19 +5410,19 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Each worker has its own CPU per song for isolation
+			// Each worker has its own CPU and song data copy per song for isolation
 			cpus := make([]*CPU6502, 9)
-			snapshots := make([]CPUSnapshot, 9)
-			snapshotInit := make([]bool, 9)
+			songDataCopies := make([][]byte, 9)
 			baselines := make([][]SIDWrite, 9)
+			snapshotInit := make([]bool, 9)
 
 			for item := range work {
 				sn := item.songNum
-				idx1, idx2 := item.idx1, item.idx2
+				row1Hex, row2Hex := item.row1Hex, item.row2Hex
 
-				// Lazy init CPU for this song
+				// Lazy init CPU for this song (baseline from ORIGINAL audio)
 				if !snapshotInit[sn-1] {
-					convertedData := convertedSongs[sn-1]
+					raw := songData[sn-1]
 					testFrames := int(partTimes[sn-1])
 					var bufferBase uint16
 					if sn%2 == 1 {
@@ -5244,26 +5430,42 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 					} else {
 						bufferBase = 0x7000
 					}
-					playerBase := uint16(0xF000)
 
+					// Create baseline from original song
 					cpu := NewCPU()
-					copy(cpu.Memory[bufferBase:], convertedData)
-					copy(cpu.Memory[playerBase:], playerData)
+					copy(cpu.Memory[bufferBase:], raw)
 					cpu.A = 0
-					cpu.X = byte(bufferBase >> 8)
-					cpu.Call(playerBase)
+					cpu.Call(bufferBase)
 					cpu.SIDWrites = nil
 					cpu.Cycles = 0
-					snapshots[sn-1] = cpu.Snapshot()
-					baselines[sn-1], _ = cpu.RunFrames(playerBase+3, testFrames, 0, 0, 0)
+					baselines[sn-1], _ = cpu.RunFrames(bufferBase+3, testFrames, 0, 0, 0)
 					cpus[sn-1] = cpu
+					songDataCopies[sn-1] = make([]byte, len(raw))
 					snapshotInit[sn-1] = true
 				}
 
-				cpu := cpus[sn-1]
-				snapshot := snapshots[sn-1]
-				baseline := baselines[sn-1]
-				convertedData := convertedSongs[sn-1]
+				// Test substitution: replace all occurrences of row2 with row1
+				raw := songData[sn-1]
+				dataCopy := songDataCopies[sn-1]
+				copy(dataCopy, raw)
+
+				// Decode row hex values
+				row1Bytes := make([]byte, 3)
+				row2Bytes := make([]byte, 3)
+				fmt.Sscanf(row1Hex, "%02x%02x%02x", &row1Bytes[0], &row1Bytes[1], &row1Bytes[2])
+				fmt.Sscanf(row2Hex, "%02x%02x%02x", &row2Bytes[0], &row2Bytes[1], &row2Bytes[2])
+
+				// Replace row2 with row1 at all locations
+				rows := songRows[sn-1]
+				if rows[row2Hex] != nil {
+					for _, off := range rows[row2Hex].locations {
+						dataCopy[off] = row1Bytes[0]
+						dataCopy[off+1] = row1Bytes[1]
+						dataCopy[off+2] = row1Bytes[2]
+					}
+				}
+
+				// Test modified song against baseline using fresh CPU
 				testFrames := int(partTimes[sn-1])
 				var bufferBase uint16
 				if sn%2 == 1 {
@@ -5271,51 +5473,91 @@ func runEquivTest(convertedSongs [][]byte, convertedStats []ConversionStats, pla
 				} else {
 					bufferBase = 0x7000
 				}
-				playerBase := uint16(0xF000)
 
-				cpu.Restore(snapshot)
-				off2 := uint16(idx2 - 1)
-				if idx1 == 0 {
-					cpu.Memory[bufferBase+0x99F+off2] = 0
-					cpu.Memory[bufferBase+0x99F+396+off2] = 0
-					cpu.Memory[bufferBase+0x99F+792+off2] = 0
-				} else {
-					off1 := uint16(idx1 - 1)
-					cpu.Memory[bufferBase+0x99F+off2] = cpu.Memory[bufferBase+0x99F+off1]
-					cpu.Memory[bufferBase+0x99F+396+off2] = cpu.Memory[bufferBase+0x99F+396+off1]
-					cpu.Memory[bufferBase+0x99F+792+off2] = cpu.Memory[bufferBase+0x99F+792+off1]
-				}
+				// Use func to allow recover from panic (invalid substitutions may cause infinite loops)
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							// Invalid substitution - treat as no match
+						}
+					}()
 
-				if cpu.RunFramesMatch(playerBase+3, testFrames, baseline) {
-					row2 := rowHexFromData(convertedData, idx2)
-					row1 := rowHexFromData(convertedData, idx1)
-					songMu[sn-1].Lock()
-					results[sn-1].Equiv[row2] = append(results[sn-1].Equiv[row2], row1)
-					songMu[sn-1].Unlock()
-					atomic.AddInt64(&matchesFound, 1)
-				}
+					testCpu := NewCPU()
+					copy(testCpu.Memory[bufferBase:], dataCopy)
+					testCpu.A = 0
+					testCpu.Call(bufferBase)
+					testCpu.SIDWrites = nil
+					testCpu.Cycles = 0
+
+					if testCpu.RunFramesMatch(bufferBase+3, testFrames, baselines[sn-1]) {
+						// row2 can be replaced by row1
+						songMu[sn-1].Lock()
+						results[sn-1].Equiv[row2Hex] = append(results[sn-1].Equiv[row2Hex], row1Hex)
+						songMu[sn-1].Unlock()
+						atomic.AddInt64(&matchesFound, 1)
+					}
+				}()
 				atomic.AddInt64(&testsCompleted, 1)
 			}
 		}()
 	}
 
 	// Generate work items
+	// Generate work items from row pairs
 	go func() {
 		for songNum := 1; songNum <= 9; songNum++ {
 			if onlySong > 0 && songNum != onlySong {
 				continue
 			}
-			if convertedSongs[songNum-1] == nil {
+			rows := songRows[songNum-1]
+			if rows == nil {
 				continue
 			}
-			dictSize := convertedStats[songNum-1].PatternDictSize
-			for idx1 := 0; idx1 < dictSize; idx1++ {
-				for idx2 := idx1 + 1; idx2 < dictSize; idx2++ {
-					work <- workItem{songNum, idx1, idx2}
+			// Get sorted list of row hex values
+			var rowList []string
+			for hex := range rows {
+				rowList = append(rowList, hex)
+			}
+			sort.Strings(rowList)
+
+			// Helper to get effect from row hex
+			getEffect := func(hex string) byte {
+				if len(hex) != 6 {
+					return 0
+				}
+				var b0, b1 byte
+				fmt.Sscanf(hex, "%02x%02x", &b0, &b1)
+				return (b1 >> 5) | ((b0 >> 4) & 8)
+			}
+
+			// Helper to check if effect will convert to effect 0
+			isEffectZeroAfterConvert := func(effect byte) bool {
+				return effect == 0 || effect == 4 || effect == 0xD
+			}
+
+			// Generate all pairs (row1, row2) where row1 != row2
+			// Skip pairs where BOTH rows have effect 0 after conversion (trivial equiv)
+			for i, row1 := range rowList {
+				eff1 := getEffect(row1)
+				isZero1 := isEffectZeroAfterConvert(eff1)
+				for j := i + 1; j < len(rowList); j++ {
+					row2 := rowList[j]
+					eff2 := getEffect(row2)
+					isZero2 := isEffectZeroAfterConvert(eff2)
+
+					// Skip if both convert to effect 0 - these are trivial
+					if isZero1 && isZero2 {
+						continue
+					}
+
+					// Test both directions: row2 -> row1 and row1 -> row2
+					work <- workItem{songNum, row1, row2}
+					work <- workItem{songNum, row2, row1}
+					atomic.AddInt64(&totalTests, 2)
 				}
 			}
 			atomic.AddInt32(&songsComplete, 1)
-			fmt.Printf("Song %d work items queued\n", songNum)
+			fmt.Printf("Song %d: %d tests queued\n", songNum, atomic.LoadInt64(&totalTests))
 		}
 		close(work)
 	}()
@@ -5344,5 +5586,5 @@ func rowHexFromData(convertedData []byte, idx int) string {
 	if idx == 0 {
 		return "000000"
 	}
-	return fmt.Sprintf("%02x%02x%02x", convertedData[0x99F+idx-1], convertedData[0x99F+396+idx-1], convertedData[0x99F+792+idx-1])
+	return fmt.Sprintf("%02x%02x%02x", convertedData[0x99F+idx-1], convertedData[0x99F+365+idx-1], convertedData[0x99F+730+idx-1])
 }

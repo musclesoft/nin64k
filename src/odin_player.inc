@@ -42,11 +42,13 @@ zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 ;
 ; Pattern packing format:
 ;   Row dictionary: 3 bytes per entry [note, inst|effect, param], sorted by frequency
+;     dict[0] is implicit (always [0,0,0]), not stored - dict starts at index 1
 ;   Packed pointers: 2-byte offset into packed data for each pattern
 ;   Packed data encoding:
-;     $00-$DF: dictionary index 0-223
-;     $E0-$FE: RLE repeat previous row 1-31 times
-;     $FF + byte: extended dictionary index (224 + byte)
+;     $00-$0E: dict[0] with RLE 0-14 (1 byte encodes 1-15 rows of [0,0,0])
+;     $0F-$EE: dictionary index 1-224 (subtract $0E to get actual index)
+;     $EF-$FE: RLE repeat previous row 1-16 times
+;     $FF + byte: extended dictionary index (225 + byte)
 ;   Each pattern decodes to 64 rows × 3 bytes = 192 bytes
 ;
 ; Row format (3 bytes):
@@ -1148,39 +1150,58 @@ dar_not_rle:
 @dar_no_carry:
         jsr     checkpoint
         ; Read encoded byte
+        ; Format: $00-$0E = dict[0]+RLE, $0F-$EE = dict[1-224], $EF-$FE = RLE, $FF = extended
         ldy     #0
         lda     (zp_temp0),y
-        cmp     #$E0
-        bcs     dar_check_rle
-        ; 0x00-0xDF: primary dict index
+        cmp     #$0F
+        bcc     dar_dict_zero_rle   ; $00-$0E: dict[0] with RLE 0-14
+        cmp     #$EF
+        bcs     dar_check_rle       ; $EF-$FF: RLE or extended
+        ; $0F-$EE: dict[1-224] - subtract $0E to get actual index
+        sec
+        sbc     #$0E                ; $0F->1, $10->2, etc.
         jmp     dar_copy_dict_entry
+dar_dict_zero_rle:
+        ; $00-$0E: dict[0] with RLE 0-14
+        ; A = RLE count (0 = just dict[0], 1 = dict[0] + 1 repeat, etc.)
+        ; dict[0] is always [0,0,0], not stored in memory
+        sta     chn_rle_count,x     ; store RLE count for subsequent calls
+        lda     #0
+        sta     chn_prev_row_0,x
+        sta     chn_prev_row_1,x
+        sta     chn_prev_row_2,x
+        inc     chn_src_off,x       ; advance past the byte
+        rts
 dar_check_rle:
         cmp     #$FF
         beq     dar_extended
-        ; 0xE0-0xFE: RLE 1-31 (repeat prev row)
+        ; $EF-$FE: RLE 1-16 (repeat prev row)
         sec
-        sbc     #$DF                ; count = byte - 0xDF (1-31)
+        sbc     #$EE                ; count = byte - 0xEE (1-16)
         sta     chn_rle_count,x
         inc     chn_src_off,x       ; advance past RLE byte
         dec     chn_rle_count,x     ; consume one repeat for this row
         rts                         ; prev_row unchanged
 dar_extended:
-        ; 0xFF + byte: extended dict index = 224 + next byte
+        ; $FF + byte: extended dict index = 225 + next byte
+        ; dict[0] implicit, so offset = (225 + byte) - 1 = 224 + byte
         inc     chn_src_off,x       ; skip 0xFF marker
         ldy     #1
-        lda     (zp_temp0),y   ; get extended byte
+        lda     (zp_temp0),y        ; get extended byte
         clc
-        adc     #224                ; index lo = 224 + byte
+        adc     #224                ; offset = 224 + byte (dict[225] at offset 224)
         sta     dar_dict_idx
         lda     #0
         rol                         ; index hi = carry
         sta     dar_dict_idx_hi
         jmp     dar_copy_dict_entry_16
 
-; Copy dict entry A to prev_row (primary index 0-223)
+; Copy dict entry A to prev_row (primary index 1-224)
 ; Split dict format: 3 separate arrays indexed by Y
+; dict[0] is implicit (always 0), so dict[1] is at offset 0
 dar_copy_dict_entry:
-        tay                         ; Y = index
+        tay
+        dey                         ; Y = index - 1 (dict[1] at offset 0)
         lda     (zp_dict0),y
         sta     chn_prev_row_0,x
         lda     (zp_dict1),y
@@ -1190,7 +1211,7 @@ dar_copy_dict_entry:
         inc     chn_src_off,x       ; advance past dict index byte
         rts
 
-; Copy dict entry for extended index (224 + byte, indices 224-409)
+; Copy dict entry for extended index (offset 224 + byte, dict indices 225-409)
 dar_copy_dict_entry_16:
         ldy     dar_dict_idx        ; Y = index_lo
         lda     dar_dict_idx_hi

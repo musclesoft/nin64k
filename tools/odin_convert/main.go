@@ -1736,13 +1736,14 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	copy(out[arpOff:], newArpTable)
 
 	// Write pattern packing data
-	// Row dictionary in split format: 3 arrays of 410 bytes each
+	// Row dictionary in split format: 3 arrays of 409 bytes each (dict[0] implicit)
 	// dict0 (notes), dict1 (inst|effect), dict2 (params)
+	// dict[0] is always [0,0,0], not stored - dict[1] starts at offset 0
 	numEntries := len(dict) / 3
-	for i := 0; i < numEntries; i++ {
-		out[rowDictOff+i] = dict[i*3]           // note
-		out[rowDictOff+410+i] = dict[i*3+1]     // inst|effect
-		out[rowDictOff+820+i] = dict[i*3+2]     // param
+	for i := 1; i < numEntries; i++ {
+		out[rowDictOff+i-1] = dict[i*3]         // note (dict[i] at offset i-1)
+		out[rowDictOff+410+i-1] = dict[i*3+1]   // inst|effect
+		out[rowDictOff+820+i-1] = dict[i*3+2]   // param
 	}
 	// Packed pointers (offset into packed data per pattern)
 	for i, pOff := range patOffsets {
@@ -1979,6 +1980,12 @@ func buildPatternDict(patterns [][]byte, prevDict []byte) (dict []byte, rowToIdx
 	dict = make([]byte, maxEntries*3)
 	placed := make([]bool, maxEntries)
 
+	// Index 0 is always reserved for [0,0,0] (implicit, not stored)
+	zeroRow := string([]byte{0, 0, 0})
+	rowToIdx[zeroRow] = 0
+	placed[0] = true
+	// dict[0:3] stays zero (not stored in output anyway)
+
 	// Build map of previous dictionary rows to their indices
 	prevRowToIdx := make(map[string]int)
 	if prevDict != nil {
@@ -1988,10 +1995,13 @@ func buildPatternDict(patterns [][]byte, prevDict []byte) (dict []byte, rowToIdx
 		}
 	}
 
-	// First pass: place shared rows at their previous positions
+	// First pass: place shared rows at their previous positions (skip index 0)
 	remaining := make([]rowEntry, 0, len(sortedRows))
 	for _, entry := range sortedRows {
-		if prevIdx, ok := prevRowToIdx[entry.row]; ok && prevIdx < maxEntries && !placed[prevIdx] {
+		if entry.row == zeroRow {
+			continue // already placed at index 0
+		}
+		if prevIdx, ok := prevRowToIdx[entry.row]; ok && prevIdx < maxEntries && prevIdx > 0 && !placed[prevIdx] {
 			rowToIdx[entry.row] = prevIdx
 			copy(dict[prevIdx*3:], entry.row)
 			placed[prevIdx] = true
@@ -2000,8 +2010,8 @@ func buildPatternDict(patterns [][]byte, prevDict []byte) (dict []byte, rowToIdx
 		}
 	}
 
-	// Second pass: fill remaining slots with non-shared rows by frequency
-	nextSlot := 0
+	// Second pass: fill remaining slots with non-shared rows by frequency (skip index 0)
+	nextSlot := 1
 	for _, entry := range remaining {
 		for nextSlot < maxEntries && placed[nextSlot] {
 			nextSlot++
@@ -2024,10 +2034,13 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 	dict, rowToIdx := buildPatternDict(patterns, prevDict)
 
 	// Pack each pattern individually first
-	const primaryMax = 224
-	const rleMax = 31
-	const rleBase = 0xE0
+	// Format: $00-$0E = dict[0]+RLE 0-14, $0F-$EE = dict[1-224], $EF-$FE = RLE 1-16, $FF = extended
+	const primaryMax = 225
+	const rleMax = 16
+	const rleBase = 0xEF
 	const extMarker = 0xFF
+	const dictZeroRleMax = 14   // $00-$0E for dict[0] with RLE 0-14
+	const dictOffsetBase = 0x0F // dict[1] = $0F, dict[2] = $10, etc.
 
 	patternPacked := make([][]byte, len(patterns))
 	for i, pat := range patterns {
@@ -2036,10 +2049,40 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 		repeatCount := 0
 		numRows := len(pat) / 3
 
+		// Track if last emitted was dict[0] (for combining with RLE)
+		lastWasDictZero := false
+		lastDictZeroPos := -1
+
 		// Use cross-channel truncation limit if provided, otherwise use pattern length
 		truncateAfter := numRows
 		if truncateLimits != nil && i < len(truncateLimits) && truncateLimits[i] > 0 && truncateLimits[i] < truncateAfter {
 			truncateAfter = truncateLimits[i]
+		}
+
+		// Helper to emit pending RLE
+		emitRLE := func() {
+			if repeatCount == 0 {
+				return
+			}
+			if lastWasDictZero && lastDictZeroPos >= 0 && repeatCount <= dictZeroRleMax {
+				// Combine dict[0] with RLE into single byte $00-$0E
+				patPacked[lastDictZeroPos] = byte(repeatCount)
+				lastWasDictZero = false
+			} else {
+				// Emit separate RLE byte(s)
+				if lastWasDictZero {
+					lastWasDictZero = false
+				}
+				for repeatCount > 0 {
+					emit := repeatCount
+					if emit > rleMax {
+						emit = rleMax
+					}
+					patPacked = append(patPacked, byte(rleBase+emit-1))
+					repeatCount -= emit
+				}
+			}
+			repeatCount = 0
 		}
 
 		for row := 0; row < truncateAfter; row++ {
@@ -2048,15 +2091,16 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 
 			if curRow == prevRow {
 				repeatCount++
-				if repeatCount == rleMax || row == truncateAfter-1 {
-					patPacked = append(patPacked, byte(rleBase+repeatCount-1))
-					repeatCount = 0
+				// Check if we need to flush: hit max RLE, or dict[0]+RLE limit
+				maxAllowed := rleMax
+				if lastWasDictZero && lastDictZeroPos >= 0 {
+					maxAllowed = dictZeroRleMax
+				}
+				if repeatCount == maxAllowed || row == truncateAfter-1 {
+					emitRLE()
 				}
 			} else {
-				if repeatCount > 0 {
-					patPacked = append(patPacked, byte(rleBase+repeatCount-1))
-					repeatCount = 0
-				}
+				emitRLE()
 				idx := rowToIdx[string(curRow[:])]
 
 				// Apply equivalence: if this is an extended index with a primary equivalent, use it
@@ -2066,19 +2110,26 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 					}
 				}
 
-				if idx < primaryMax {
-					patPacked = append(patPacked, byte(idx))
+				if idx == 0 {
+					// Dict[0]: emit $00, might be combined with following RLE
+					lastDictZeroPos = len(patPacked)
+					patPacked = append(patPacked, 0x00)
+					lastWasDictZero = true
+					primaryCount++
+				} else if idx < primaryMax {
+					// Dict[1-224]: emit $0F-$EE (offset by $0E)
+					patPacked = append(patPacked, byte(dictOffsetBase+idx-1))
+					lastWasDictZero = false
 					primaryCount++
 				} else {
 					patPacked = append(patPacked, extMarker, byte(idx-primaryMax))
+					lastWasDictZero = false
 					extendedCount++
 				}
 			}
 			prevRow = curRow
 		}
-		if repeatCount > 0 {
-			patPacked = append(patPacked, byte(rleBase+repeatCount-1))
-		}
+		emitRLE()
 		patternPacked[i] = patPacked
 	}
 
@@ -2243,9 +2294,13 @@ func packPatterns(patterns [][]byte, prevDict []byte) (dict []byte, packed []byt
 }
 
 // decodePattern simulates the 6502 decode routine for verification
+// Format: $00-$0E = dict[0]+RLE 0-14, $0F-$EE = dict[1-224], $EF-$FE = RLE 1-16, $FF = extended 225+
+// dict[0] is implicit [0,0,0], dict[1] starts at offset 0 in the dict array
 func decodePattern(dict, packed []byte, offset uint16) []byte {
-	const primaryMax = 224
-	const rleBase = 0xE0
+	const primaryMax = 225
+	const rleBase = 0xEF
+	const dictZeroRleMax = 0x0E
+	const dictOffsetBase = 0x0F
 
 	decoded := make([]byte, 192)
 	srcOff := int(offset)
@@ -2256,26 +2311,39 @@ func decodePattern(dict, packed []byte, offset uint16) []byte {
 		b := packed[srcOff]
 		srcOff++
 
-		if b < rleBase {
-			// Primary dict index
-			idx := int(b)
-			copy(decoded[dstOff:], dict[idx*3:idx*3+3])
-			copy(prevRow[:], dict[idx*3:idx*3+3])
+		if b <= dictZeroRleMax {
+			// $00-$0E: dict[0] with RLE 0-14 (dict[0] is implicit [0,0,0])
+			decoded[dstOff] = 0
+			decoded[dstOff+1] = 0
+			decoded[dstOff+2] = 0
+			prevRow = [3]byte{0, 0, 0}
+			dstOff += 3
+			for j := 0; j < int(b) && dstOff < 192; j++ {
+				copy(decoded[dstOff:], prevRow[:])
+				dstOff += 3
+			}
+		} else if b < rleBase {
+			// $0F-$EE: dict[1-224] (dict[1] at offset 0)
+			idx := int(b) - dictOffsetBase + 1 // $0F->1, $10->2, etc.
+			off := (idx - 1) * 3               // dict[1] at offset 0
+			copy(decoded[dstOff:], dict[off:off+3])
+			copy(prevRow[:], dict[off:off+3])
 			dstOff += 3
 		} else if b < 0xFF {
-			// RLE
+			// $EF-$FE: RLE 1-16
 			count := int(b - rleBase + 1)
 			for j := 0; j < count; j++ {
 				copy(decoded[dstOff:], prevRow[:])
 				dstOff += 3
 			}
 		} else {
-			// Extended dict index
+			// $FF + byte: Extended dict index 225+
 			extIdx := int(packed[srcOff])
 			srcOff++
 			idx := primaryMax + extIdx
-			copy(decoded[dstOff:], dict[idx*3:idx*3+3])
-			copy(prevRow[:], dict[idx*3:idx*3+3])
+			off := (idx - 1) * 3 // dict[1] at offset 0
+			copy(decoded[dstOff:], dict[off:off+3])
+			copy(prevRow[:], dict[off:off+3])
 			dstOff += 3
 		}
 	}
@@ -3366,7 +3434,31 @@ func rebuildPlayer() error {
 	return nil
 }
 
+func printUsage() {
+	fmt.Println("Usage: odin_convert [options]")
+	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  (none)       Convert songs and run verification tests")
+	fmt.Println("  -equivtest   Rebuild equivalence cache (slow, tests all candidates)")
+	fmt.Println("  -h, --help   Show this help message")
+}
+
 func main() {
+	// Parse command line arguments
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-equivtest":
+			// Handled at end of main
+		case "-h", "-help", "--help":
+			printUsage()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown option: %s\n\n", os.Args[1])
+			printUsage()
+			os.Exit(1)
+		}
+	}
+
 	// First pass: analyze all songs and print statistics
 	fmt.Println("=== Song Analysis ===")
 	songData := make([][]byte, 9)
@@ -3763,12 +3855,14 @@ func main() {
 			rowDictOff = 0x99F
 		)
 		// Read split dict back into interleaved format for dedup comparison
+		// dict[0] is implicit [0,0,0] (not stored), dict[1] starts at file offset 0
 		numEntries := stats.PatternDictSize
 		prevDict := make([]byte, numEntries*3)
-		for i := 0; i < numEntries; i++ {
-			prevDict[i*3] = convertedData[rowDictOff+i]         // note
-			prevDict[i*3+1] = convertedData[rowDictOff+410+i]   // inst|effect
-			prevDict[i*3+2] = convertedData[rowDictOff+820+i]   // param
+		// dict[0] = [0,0,0] (implicit, already zero in fresh slice)
+		for i := 1; i < numEntries; i++ {
+			prevDict[i*3] = convertedData[rowDictOff+i-1]       // note (dict[i] at file offset i-1)
+			prevDict[i*3+1] = convertedData[rowDictOff+410+i-1] // inst|effect
+			prevDict[i*3+2] = convertedData[rowDictOff+820+i-1] // param
 		}
 		prevTables = &PrevSongTables{
 			Arp:     append([]byte{}, convertedData[arpOff:arpOff+stats.NewArpSize]...),
@@ -4149,7 +4243,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 		ne := noteEff{note, instEffect}
 		noteEffGroups[ne] = append(noteEffGroups[ne], idx)
 
-		if idx < 224 {
+		if idx < 225 {
 			// [0,0,0] NOP
 			if note == 0 && instEffect == 0 && param == 0 {
 				nopIdx = idx
@@ -4179,7 +4273,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	tested := 0
 	found := 0
 
-	for extIdx := 224; extIdx < dictSize; extIdx++ {
+	for extIdx := 225; extIdx < dictSize; extIdx++ {
 		// Split dict format: note at +idx, instEffect at +410+idx, param at +820+idx
 		extNote := convertedData[0x99F+extIdx]
 		extInstEffect := convertedData[0x99F+410+extIdx]
@@ -4203,7 +4297,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 
 		// 2. Same effect [x,y,*] - same note and inst/effect, any param
 		for _, idx := range noteEffGroups[extNE] {
-			if idx < 224 && !seen[idx] {
+			if idx < 225 && !seen[idx] {
 				candidates = append(candidates, candidate{idx, EquivSameEff})
 				seen[idx] = true
 			}
@@ -4211,7 +4305,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 
 		// 3. Same signature [*,y,z]
 		for _, idx := range sigGroups[extSig] {
-			if idx < 224 && !seen[idx] {
+			if idx < 225 && !seen[idx] {
 				candidates = append(candidates, candidate{idx, EquivSameSig})
 				seen[idx] = true
 			}
@@ -4219,7 +4313,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 
 		// 4. Same note [x,*,*]
 		for _, idx := range noteGroups[extNote] {
-			if idx < 224 && !seen[idx] {
+			if idx < 225 && !seen[idx] {
 				candidates = append(candidates, candidate{idx, EquivSameNote})
 				seen[idx] = true
 			}
@@ -4426,7 +4520,7 @@ func analyzeTransposePatterns(songData [][]byte) {
 }
 
 // analyzeSharedRowDict analyzes encoding with a shared row dictionary across all songs
-// Encoding: $00-$DF: dict index 0-223, $E0-$FE: RLE 1-31, $FF + 2 bytes: extended index
+// Encoding: $00-$0E: dict[0]+RLE, $0F-$EE: dict[1-224], $EF-$FE: RLE 1-16, $FF + byte: extended
 func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte, fSubRemap map[int]byte) {
 	fmt.Println("\n=== Shared Row Dictionary Analysis ===")
 
@@ -4678,10 +4772,10 @@ func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte, fSubRemap map
 		}
 	}
 
-	// Pack all patterns with encoding
-	const primaryMax = 224
-	const rleMax = 31
-	const rleBase = 0xE0
+	// Pack all patterns with encoding (analysis only)
+	const primaryMax = 225
+	const rleMax = 16
+	const rleBase = 0xEF
 
 	totalBytes := 0
 	primaryCount := 0
@@ -4714,7 +4808,7 @@ func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte, fSubRemap map
 					totalBytes++
 					primaryCount++
 				} else {
-					totalBytes += 3
+					totalBytes += 2
 					extendedCount++
 				}
 			}
@@ -4731,11 +4825,11 @@ func analyzeSharedRowDict(songData [][]byte, effectRemap [16]byte, fSubRemap map
 	fmt.Printf("\nDict size: %d entries = %d bytes\n", len(sortedRows), dictBytes)
 	fmt.Printf("Packed data: %d bytes\n", totalBytes)
 	fmt.Printf("  Primary (1-byte): %d\n", primaryCount)
-	fmt.Printf("  Extended (3-byte): %d = %d extra bytes\n", extendedCount, extendedCount*2)
+	fmt.Printf("  Extended (2-byte): %d = %d extra bytes\n", extendedCount, extendedCount)
 	fmt.Printf("  RLE: %d\n", rleCount)
 	fmt.Printf("Total: %d bytes (dict) + %d bytes (data) = %d bytes\n", dictBytes, totalBytes, dictBytes+totalBytes)
-	fmt.Printf("Index distribution: %d < 224 (primary), %d >= 224 (extended)\n",
-		min(224, len(sortedRows)), max(0, len(sortedRows)-224))
+	fmt.Printf("Index distribution: %d < 225 (primary), %d >= 225 (extended)\n",
+		min(225, len(sortedRows)), max(0, len(sortedRows)-225))
 }
 
 func serializeWrites(writes []SIDWrite) []byte {

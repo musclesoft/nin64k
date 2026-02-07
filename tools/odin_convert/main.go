@@ -913,8 +913,9 @@ type ConversionStats struct {
 	NewFilterSize     int
 	PatternDictSize   int
 	PatternPackedSize int
-	PrimaryIndices    int
-	ExtendedIndices   int
+	PrimaryIndices      int
+	ExtendedIndices     int
+	ExtendedBeforeEquiv int
 }
 
 // PrevSongTables holds table data from previous song for cross-song deduplication
@@ -1605,16 +1606,19 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	}
 
 	// Build dictionary first to find NOP entry for dead entry mapping
-	dict, _ := buildPatternDict(allPatternData, prevDict)
+	// Build without prevDict - cross-song matching happens after compaction
+	dict, _ := buildPatternDict(allPatternData, nil)
 
-	// Load equivalence map for this song (needs dict to find NOP)
+	// Load equivalence map for this song (row-based, position-independent)
 	equivMap := loadSongEquivMap(songNum, dict)
 
 	// Pack patterns with per-song dictionary + RLE
-	dict, packed, patOffsets, primaryCount, extendedCount := packPatternsWithEquiv(patternData, equivMap, prevDict, patternTruncate)
+	// Pass the already-built dict for consistency with equivMap lookup
+	dict, packed, patOffsets, primaryCount, extendedCount, extendedBeforeEquiv := packPatternsWithEquiv(patternData, dict, equivMap, prevDict, patternTruncate)
 
 	stats.PrimaryIndices = primaryCount
 	stats.ExtendedIndices = extendedCount
+	stats.ExtendedBeforeEquiv = extendedBeforeEquiv
 
 	// Fixed layout:
 	// $9D9: row dictionary (1236 bytes = 412 entries × 3)
@@ -1912,7 +1916,8 @@ func loadEquivCache() []EquivResult {
 }
 
 // loadSongEquivMap returns equivalence map for a specific song
-// Uses verified equivalences from equiv_cache (extended -> primary with identical output)
+// Uses verified equivalences from equiv_cache (row hex -> row hex)
+// Converts to index -> index map using the provided dict
 func loadSongEquivMap(songNum int, dict []byte) map[int]int {
 	if songNum < 1 || songNum > 9 {
 		return nil
@@ -1928,11 +1933,23 @@ func loadSongEquivMap(songNum int, dict []byte) map[int]int {
 		return nil
 	}
 
+	// Build row hex -> index map from dict
+	// Dict format: entry i at offset i*3 (dict[0] implicit)
+	numEntries := len(dict) / 3
+	rowToIdx := make(map[string]int)
+	for idx := 1; idx < numEntries; idx++ {
+		rowHex := fmt.Sprintf("%02x%02x%02x", dict[idx*3], dict[idx*3+1], dict[idx*3+2])
+		rowToIdx[rowHex] = idx
+	}
+
+	// Convert row hex equiv to index equiv
 	equivMap := make(map[int]int)
-	for extIdxStr, priIdx := range songEquiv {
-		var extIdx int
-		fmt.Sscanf(extIdxStr, "%d", &extIdx)
-		equivMap[extIdx] = priIdx
+	for extRowHex, priRowHex := range songEquiv {
+		extIdx, extOk := rowToIdx[extRowHex]
+		priIdx, priOk := rowToIdx[priRowHex]
+		if extOk && priOk {
+			equivMap[extIdx] = priIdx
+		}
 	}
 
 	return equivMap
@@ -2030,46 +2047,151 @@ func buildPatternDict(patterns [][]byte, prevDict []byte) (dict []byte, rowToIdx
 
 // packPatternsWithEquiv packs pattern data, using equivalences to reduce extended indices
 // truncateLimits provides cross-channel truncation limits (max reachable row+1 for each pattern)
-func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []byte, truncateLimits []int) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int) {
-	dict, rowToIdx := buildPatternDict(patterns, prevDict)
+// Returns compressed dict (unused entries removed after equiv, reordered to match prevDict)
+func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int]int, prevDict []byte, truncateLimits []int) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int, extendedBeforeEquiv int) {
+	// Use provided dict (already built from all patterns including transpose equivalents)
+	fullDict := inputDict
+	numFullEntries := len(fullDict) / 3
 
-	// Pack each pattern individually first
-	// Format: $00-$0E = dict[0]+RLE 0-14, $0F-$EE = dict[1-224], $EF-$FE = RLE 1-16, $FF = extended
+	// Build row -> index map
+	rowToIdx := make(map[string]int)
+	rowToIdx[string([]byte{0, 0, 0})] = 0 // implicit zero row
+	for idx := 1; idx < numFullEntries; idx++ {
+		row := string(fullDict[idx*3 : idx*3+3])
+		rowToIdx[row] = idx
+	}
+
 	const primaryMax = 225
 	const rleMax = 16
 	const rleBase = 0xEF
 	const extMarker = 0xFF
-	const dictZeroRleMax = 14   // $00-$0E for dict[0] with RLE 0-14
-	const dictOffsetBase = 0x0F // dict[1] = $0F, dict[2] = $10, etc.
+	const dictZeroRleMax = 14
+	const dictOffsetBase = 0x0F
 
+	// First pass: collect which dict indices are actually used after equiv
+	usedIdx := make(map[int]bool)
+	usedIdx[0] = true
+	equivSubstitutions := 0
+	for i, pat := range patterns {
+		var prevRow [3]byte
+		numRows := len(pat) / 3
+		truncateAfter := numRows
+		if truncateLimits != nil && i < len(truncateLimits) && truncateLimits[i] > 0 && truncateLimits[i] < truncateAfter {
+			truncateAfter = truncateLimits[i]
+		}
+		for row := 0; row < truncateAfter; row++ {
+			off := row * 3
+			curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
+			if curRow != prevRow {
+				idx := rowToIdx[string(curRow[:])]
+				if idx >= primaryMax && equivMap != nil {
+					if priIdx, ok := equivMap[idx]; ok {
+						idx = priIdx
+						equivSubstitutions++
+					}
+				}
+				usedIdx[idx] = true
+			}
+			prevRow = curRow
+		}
+	}
+	extendedBeforeEquiv = equivSubstitutions
+
+	// Build compacted dict with only used entries
+	numCompacted := 0
+	for idx := 1; idx < numFullEntries; idx++ {
+		if usedIdx[idx] {
+			numCompacted++
+		}
+	}
+
+	// Create compacted dict entries (not yet in final order)
+	type dictEntry struct {
+		row      [3]byte
+		oldIdx   int
+		finalIdx int
+	}
+	compactedEntries := make([]dictEntry, 0, numCompacted)
+	for idx := 1; idx < numFullEntries; idx++ {
+		if usedIdx[idx] {
+			var row [3]byte
+			copy(row[:], fullDict[idx*3:idx*3+3])
+			compactedEntries = append(compactedEntries, dictEntry{row: row, oldIdx: idx})
+		}
+	}
+
+	// Build prevDict row->position map for cross-song matching
+	prevRowToPos := make(map[[3]byte]int)
+	if prevDict != nil {
+		numPrevEntries := len(prevDict) / 3
+		for i := 1; i < numPrevEntries; i++ {
+			var row [3]byte
+			copy(row[:], prevDict[i*3:i*3+3])
+			if row != [3]byte{} { // skip zero rows
+				prevRowToPos[row] = i
+			}
+		}
+	}
+
+	// Assign final positions: match prevDict positions where possible
+	finalDict := make([]byte, (numCompacted+1)*3)
+	placed := make([]bool, numCompacted+1)
+	placed[0] = true // dict[0] is implicit
+	oldToNew := make(map[int]int)
+	oldToNew[0] = 0
+
+	// First pass: place entries at matching prevDict positions
+	remaining := make([]int, 0)
+	for i := range compactedEntries {
+		if prevPos, ok := prevRowToPos[compactedEntries[i].row]; ok && prevPos > 0 && prevPos <= numCompacted && !placed[prevPos] {
+			compactedEntries[i].finalIdx = prevPos
+			placed[prevPos] = true
+			copy(finalDict[prevPos*3:], compactedEntries[i].row[:])
+			oldToNew[compactedEntries[i].oldIdx] = prevPos
+		} else {
+			remaining = append(remaining, i)
+		}
+	}
+
+	// Second pass: fill remaining slots
+	nextSlot := 1
+	for _, i := range remaining {
+		for nextSlot <= numCompacted && placed[nextSlot] {
+			nextSlot++
+		}
+		if nextSlot <= numCompacted {
+			compactedEntries[i].finalIdx = nextSlot
+			placed[nextSlot] = true
+			copy(finalDict[nextSlot*3:], compactedEntries[i].row[:])
+			oldToNew[compactedEntries[i].oldIdx] = nextSlot
+			nextSlot++
+		}
+	}
+
+	dict = finalDict
+
+	// Second pass: pack patterns using remapped indices
 	patternPacked := make([][]byte, len(patterns))
 	for i, pat := range patterns {
 		var patPacked []byte
 		var prevRow [3]byte
 		repeatCount := 0
 		numRows := len(pat) / 3
-
-		// Track if last emitted was dict[0] (for combining with RLE)
 		lastWasDictZero := false
 		lastDictZeroPos := -1
-
-		// Use cross-channel truncation limit if provided, otherwise use pattern length
 		truncateAfter := numRows
 		if truncateLimits != nil && i < len(truncateLimits) && truncateLimits[i] > 0 && truncateLimits[i] < truncateAfter {
 			truncateAfter = truncateLimits[i]
 		}
 
-		// Helper to emit pending RLE
 		emitRLE := func() {
 			if repeatCount == 0 {
 				return
 			}
 			if lastWasDictZero && lastDictZeroPos >= 0 && repeatCount <= dictZeroRleMax {
-				// Combine dict[0] with RLE into single byte $00-$0E
 				patPacked[lastDictZeroPos] = byte(repeatCount)
 				lastWasDictZero = false
 			} else {
-				// Emit separate RLE byte(s)
 				if lastWasDictZero {
 					lastWasDictZero = false
 				}
@@ -2091,7 +2213,6 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 
 			if curRow == prevRow {
 				repeatCount++
-				// Check if we need to flush: hit max RLE, or dict[0]+RLE limit
 				maxAllowed := rleMax
 				if lastWasDictZero && lastDictZeroPos >= 0 {
 					maxAllowed = dictZeroRleMax
@@ -2103,21 +2224,22 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 				emitRLE()
 				idx := rowToIdx[string(curRow[:])]
 
-				// Apply equivalence: if this is an extended index with a primary equivalent, use it
+				// Apply equivalence
 				if idx >= primaryMax && equivMap != nil {
 					if priIdx, ok := equivMap[idx]; ok {
 						idx = priIdx
 					}
 				}
 
+				// Map to compacted index
+				idx = oldToNew[idx]
+
 				if idx == 0 {
-					// Dict[0]: emit $00, might be combined with following RLE
 					lastDictZeroPos = len(patPacked)
 					patPacked = append(patPacked, 0x00)
 					lastWasDictZero = true
 					primaryCount++
 				} else if idx < primaryMax {
-					// Dict[1-224]: emit $0F-$EE (offset by $0E)
 					patPacked = append(patPacked, byte(dictOffsetBase+idx-1))
 					lastWasDictZero = false
 					primaryCount++
@@ -2133,10 +2255,9 @@ func packPatternsWithEquiv(patterns [][]byte, equivMap map[int]int, prevDict []b
 		patternPacked[i] = patPacked
 	}
 
-	// Optimize packing using suffix/prefix overlap (greedy superstring)
 	packed, offsets = optimizePackedOverlap(patternPacked)
 
-	return dict, packed, offsets, primaryCount, extendedCount
+	return dict, packed, offsets, primaryCount, extendedCount, extendedBeforeEquiv
 }
 
 // optimizePackedOverlap uses greedy superstring algorithm to find optimal overlapping
@@ -2289,8 +2410,9 @@ func optimizePackedOverlap(patterns [][]byte) (packed []byte, offsets []uint16) 
 }
 
 // packPatterns packs pattern data using per-song row dictionary + RLE (no equivalence)
-func packPatterns(patterns [][]byte, prevDict []byte) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int) {
-	return packPatternsWithEquiv(patterns, nil, prevDict, nil)
+func packPatterns(patterns [][]byte, prevDict []byte) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int, extendedBeforeEquiv int) {
+	inputDict, _ := buildPatternDict(patterns, nil)
+	return packPatternsWithEquiv(patterns, inputDict, nil, prevDict, nil)
 }
 
 // decodePattern simulates the 6502 decode routine for verification
@@ -3975,7 +4097,7 @@ func main() {
 			cycleRatio := float64(r.newCycles) / float64(r.builtinCycles)
 			maxCycleRatio := float64(r.newMaxCycles) / float64(r.builtinMaxCycles)
 			sizeRatio := float64(r.newSize) / float64(r.origSize)
-			fmt.Printf("Song %d: cycles: %.2fx, max: %.2fx, size: %.2fx\n", r.songNum, cycleRatio, maxCycleRatio, sizeRatio)
+			fmt.Printf("Song %d: cycles: %.2fx, max: %.2fx, size: %.2fx, dict: %d, eq: %d\n", r.songNum, cycleRatio, maxCycleRatio, sizeRatio, s.PatternDictSize, s.ExtendedBeforeEquiv)
 			if s.NewWaveSize > maxWave {
 				maxWave = s.NewWaveSize
 			}
@@ -4134,13 +4256,14 @@ const (
 )
 
 // EquivResult stores equivalence test results
+// Uses row values (hex) instead of indices for position-independent caching
 type EquivResult struct {
-	SongNum    int            `json:"song"`
-	Equiv      map[string]int `json:"equiv"`       // extended idx -> best primary idx
-	EquivTypes map[string]string `json:"equiv_types"` // extended idx -> type of match
-	Tested     int            `json:"tested"`
-	Found      int            `json:"found"`
-	TypeCounts map[string]int `json:"type_counts"` // count per type
+	SongNum    int               `json:"song"`
+	Equiv      map[string]string `json:"equiv"`       // extended row hex -> primary row hex
+	EquivTypes map[string]string `json:"equiv_types"` // extended row hex -> type of match
+	Tested     int               `json:"tested"`
+	Found      int               `json:"found"`
+	TypeCounts map[string]int    `json:"type_counts"` // count per type
 }
 
 // testEquivalence tests all candidate types:
@@ -4267,11 +4390,19 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 	baseline := serializeWrites(baselineWrites)
 
 	// Test equivalences for each extended entry
-	equiv := make(map[string]int)
+	equiv := make(map[string]string)
 	equivTypes := make(map[string]string)
 	typeCounts := make(map[string]int)
 	tested := 0
 	found := 0
+
+	// Helper to get row hex from dict index
+	rowHex := func(idx int) string {
+		note := convertedData[0x99F+idx]
+		instEff := convertedData[0x99F+410+idx]
+		param := convertedData[0x99F+820+idx]
+		return fmt.Sprintf("%02x%02x%02x", note, instEff, param)
+	}
 
 	for extIdx := 225; extIdx < dictSize; extIdx++ {
 		// Split dict format: note at +idx, instEffect at +410+idx, param at +820+idx
@@ -4280,6 +4411,7 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 		extParam := convertedData[0x99F+820+extIdx]
 		extSig := signature{extInstEffect, extParam}
 		extNE := noteEff{extNote, extInstEffect}
+		extRowHex := rowHex(extIdx)
 
 		// Build ordered candidate list with types (test in priority order)
 		type candidate struct {
@@ -4335,9 +4467,8 @@ func testEquivalenceSong(songNum int, convertedData []byte, dictSize int, player
 			testResult := serializeWrites(testWrites)
 
 			if bytes.Equal(baseline, testResult) {
-				key := fmt.Sprintf("%d", extIdx)
-				equiv[key] = cand.idx
-				equivTypes[key] = cand.equivTyp
+				equiv[extRowHex] = rowHex(cand.idx)
+				equivTypes[extRowHex] = cand.equivTyp
 				typeCounts[cand.equivTyp]++
 				found++
 				break

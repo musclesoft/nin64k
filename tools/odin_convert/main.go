@@ -16,6 +16,7 @@ import (
 
 var projectRoot string
 var disableEquivSong int
+var disableCrossSongDedup bool
 
 func init() {
 	projectRoot = findProjectRoot()
@@ -1636,11 +1637,10 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	trackptr0Off := 0x500
 	trackptr1Off := 0x600
 	trackptr2Off := 0x700
-	filterOff := 0x800         // Filter at $800 (227 bytes max)
-	arpOff := 0x8E3            // Arp at $8E3 (188 bytes max)
-	rowDictOff := 0x99F        // Row dict0 (notes), dict1 at +365, dict2 at +730
-	packedPtrsOff := 0xDE6     // Packed pointers (182 bytes = 91 patterns × 2)
-	packedDataOff := 0xE9C     // Packed pattern data
+	filterOff := 0x800     // Filter at $800 (227 bytes max)
+	arpOff := 0x8E3        // Arp at $8E3 (188 bytes max)
+	rowDictOff := 0x99F    // Row dict0 (notes), dict1 at +365, dict2 at +730
+	packedPtrsOff := 0xDE6 // Packed pointers (fixed location)
 
 	// Extract patterns to slice for packing (do effect/order remapping first)
 	patternData := make([][]byte, numPatterns)
@@ -1701,7 +1701,7 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 
 	// Extract previous row dictionary for cross-song deduplication
 	var prevDict []byte
-	if prevTables != nil && len(prevTables.RowDict) > 0 {
+	if !disableCrossSongDedup && prevTables != nil && len(prevTables.RowDict) > 0 {
 		prevDict = prevTables.RowDict
 	}
 
@@ -1739,17 +1739,155 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 	}
 
 	// Pack patterns with optimized equiv map
-	dict, packed, patOffsets, primaryCount, extendedCount, extendedBeforeEquiv := packPatternsWithEquiv(patternData, dict, equivMap, prevDict, patternTruncate)
+	dict, packed, patOffsets, primaryCount, extendedCount, extendedBeforeEquiv, individualPacked := packPatternsWithEquiv(patternData, dict, equivMap, prevDict, patternTruncate)
 
 	stats.PrimaryIndices = primaryCount
 	stats.ExtendedIndices = extendedCount
 	stats.ExtendedBeforeEquiv = extendedBeforeEquiv
 
-	// Fixed layout:
-	// $99F: row dictionary (1095 bytes = 365 entries × 3, split format)
-	// $DE6: packed pointers (182 bytes = 91 patterns × 2)
-	// $E9C: packed data
+	// Calculate all available gaps for pattern placement
+	// Gap 1: after filter, before arp
+	filterGapStart := filterOff + newFilterSize
+	filterGapSize := arpOff - filterGapStart
+	if filterGapSize < 0 {
+		filterGapSize = 0
+	}
+	// Gap 2: after arp, before dict
+	arpGapStart := arpOff + newArpSize
+	arpGapSize := rowDictOff - arpGapStart
+	if arpGapSize < 0 {
+		arpGapSize = 0
+	}
+	// Gap 3: after dict, before packed pointers
+	numDictEntries := len(dict) / 3
+	dictEndOff := rowDictOff + 730 + (numDictEntries - 1)
+	dictGapStart := dictEndOff
+	dictGapSize := packedPtrsOff - dictGapStart
+	if dictGapSize < 0 {
+		dictGapSize = 0
+	}
+
+	// Collect all gaps (filter, arp, dict) for pattern placement
+	type gap struct {
+		start int
+		size  int
+		used  int
+	}
+	gaps := []*gap{
+		{filterGapStart, filterGapSize, 0},
+		{arpGapStart, arpGapSize, 0},
+		{dictGapStart, dictGapSize, 0},
+	}
+
+	// Compute overlap potential for each pattern
+	// For each pattern, find max overlap as suffix (its suffix matches another's prefix)
+	// and max overlap as prefix (its prefix matches another's suffix)
+	// Patterns with low overlap potential should go in gaps
+	overlapPotential := make([]int, len(individualPacked))
+	for i, pi := range individualPacked {
+		maxOverlap := 0
+		for j, pj := range individualPacked {
+			if i == j {
+				continue
+			}
+			// Check pi's suffix vs pj's prefix (pi could precede pj)
+			maxLen := len(pi)
+			if len(pj) < maxLen {
+				maxLen = len(pj)
+			}
+			for l := maxLen; l >= 1; l-- {
+				if string(pi[len(pi)-l:]) == string(pj[:l]) {
+					if l > maxOverlap {
+						maxOverlap = l
+					}
+					break
+				}
+			}
+			// Check pj's suffix vs pi's prefix (pj could precede pi)
+			for l := maxLen; l >= 1; l-- {
+				if string(pj[len(pj)-l:]) == string(pi[:l]) {
+					if l > maxOverlap {
+						maxOverlap = l
+					}
+					break
+				}
+			}
+		}
+		overlapPotential[i] = maxOverlap
+	}
+
+	// Find patterns that fit in any gap (prioritize low overlap potential)
+	type gapPattern struct {
+		idx     int
+		size    int
+		overlap int
+	}
+	var candidates []gapPattern
+	for i, p := range individualPacked {
+		candidates = append(candidates, gapPattern{i, len(p), overlapPotential[i]})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		// Primary: low overlap first (don't benefit from blob)
+		// Secondary: large size first (fill gaps efficiently)
+		if candidates[i].overlap != candidates[j].overlap {
+			return candidates[i].overlap < candidates[j].overlap
+		}
+		return candidates[i].size > candidates[j].size
+	})
+
+	// Place patterns in gaps (best fit)
+	inGap := make(map[int]int) // pattern index -> absolute offset
+	for _, c := range candidates {
+		// Find smallest gap that fits this pattern
+		bestGap := -1
+		bestRemaining := int(^uint(0) >> 1)
+		for gi, g := range gaps {
+			remaining := g.size - g.used
+			if c.size <= remaining && remaining < bestRemaining {
+				bestGap = gi
+				bestRemaining = remaining
+			}
+		}
+		if bestGap >= 0 {
+			g := gaps[bestGap]
+			inGap[c.idx] = g.start + g.used
+			g.used += c.size
+		}
+	}
+
+	// Build remaining patterns for overlap optimization (exclude gap patterns)
+	var remainingPacked [][]byte
+	remainingIdx := make(map[int]int) // original index -> remaining index
+	for i, p := range individualPacked {
+		if _, ok := inGap[i]; !ok {
+			remainingIdx[i] = len(remainingPacked)
+			remainingPacked = append(remainingPacked, p)
+		}
+	}
+
+	// Re-run overlap on remaining patterns
+	packedPtrsEnd := packedPtrsOff + numPatterns*2
+	var packedRemaining []byte
+	var offsetsRemaining []uint16
+	if len(remainingPacked) > 0 {
+		packedRemaining, offsetsRemaining = optimizePackedOverlap(remainingPacked)
+	}
+
+	// Build final offsets: gap patterns use gap offset, others use remaining blob offset
+	finalOffsets := make([]uint16, numPatterns)
+	for i := range individualPacked {
+		if gapOff, ok := inGap[i]; ok {
+			finalOffsets[i] = uint16(gapOff)
+		} else {
+			remIdx := remainingIdx[i]
+			finalOffsets[i] = uint16(packedPtrsEnd + int(offsetsRemaining[remIdx]))
+		}
+	}
+	patOffsets = finalOffsets
+	packed = packedRemaining
+
 	packedSize := len(packed)
+	packedDataOff := packedPtrsEnd
 	totalSize := packedDataOff + packedSize
 
 	// Validate limits (skip when equiv disabled for all songs - equivtest mode)
@@ -1876,13 +2014,19 @@ func convertToNewFormat(raw []byte, songNum int, prevTables *PrevSongTables, eff
 		out[rowDictOff+365+i-1] = dict[i*3+1]   // inst|effect
 		out[rowDictOff+730+i-1] = dict[i*3+2]   // param
 	}
-	// Packed pointers (offset into packed data per pattern)
+	// Packed pointers (absolute song-base offsets, already computed)
 	for i, pOff := range patOffsets {
 		out[packedPtrsOff+i*2] = byte(pOff & 0xFF)
 		out[packedPtrsOff+i*2+1] = byte(pOff >> 8)
 	}
-	// Packed pattern data
-	copy(out[packedDataOff:], packed)
+	// Write gap patterns
+	for i, gapOff := range inGap {
+		copy(out[gapOff:], individualPacked[i])
+	}
+	// Packed pattern data (remaining patterns after overlap)
+	if len(packed) > 0 {
+		copy(out[packedDataOff:], packed)
+	}
 
 	stats.PatternDictSize = len(dict) / 3
 	stats.PatternPackedSize = len(packed)
@@ -2303,7 +2447,7 @@ func buildPatternDict(patterns [][]byte, prevDict []byte) (dict []byte, rowToIdx
 // packPatternsWithEquiv packs pattern data, using equivalences to reduce extended indices
 // truncateLimits provides cross-channel truncation limits (max reachable row+1 for each pattern)
 // Returns compressed dict (unused entries removed after equiv, reordered to match prevDict)
-func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int]int, prevDict []byte, truncateLimits []int) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int, extendedBeforeEquiv int) {
+func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int]int, prevDict []byte, truncateLimits []int) (dict []byte, packed []byte, offsets []uint16, primaryCount int, extendedCount int, extendedBeforeEquiv int, individualPacked [][]byte) {
 	// Use provided dict (already built from all patterns including transpose equivalents)
 	fullDict := inputDict
 	numFullEntries := len(fullDict) / 3
@@ -2323,8 +2467,9 @@ func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int
 	const dictZeroRleMax = 14
 	const dictOffsetBase = 0x0F
 
-	// First pass: collect which dict indices are actually used after equiv
+	// First pass: collect which dict indices are actually used after equiv AND count usage
 	usedIdx := make(map[int]bool)
+	idxUsageCount := make(map[int]int)
 	usedIdx[0] = true
 	equivSubstitutions := 0
 	for i, pat := range patterns {
@@ -2346,6 +2491,7 @@ func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int
 					}
 				}
 				usedIdx[idx] = true
+				idxUsageCount[idx]++
 			}
 			prevRow = curRow
 		}
@@ -2388,7 +2534,7 @@ func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int
 		}
 	}
 
-	// Assign final positions: match prevDict positions where possible
+	// Assign final positions: prev-matching first, then freq-sort remaining
 	finalDict := make([]byte, (numCompacted+1)*3)
 	placed := make([]bool, numCompacted+1)
 	placed[0] = true // dict[0] is implicit
@@ -2408,7 +2554,13 @@ func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int
 		}
 	}
 
-	// Second pass: fill remaining slots
+	// Second pass: sort remaining by frequency (descending), fill lowest slots first
+	sort.Slice(remaining, func(i, j int) bool {
+		iIdx := compactedEntries[remaining[i]].oldIdx
+		jIdx := compactedEntries[remaining[j]].oldIdx
+		return idxUsageCount[iIdx] > idxUsageCount[jIdx]
+	})
+
 	nextSlot := 1
 	for _, i := range remaining {
 		for nextSlot <= numCompacted && placed[nextSlot] {
@@ -2512,7 +2664,7 @@ func packPatternsWithEquiv(patterns [][]byte, inputDict []byte, equivMap map[int
 
 	packed, offsets = optimizePackedOverlap(patternPacked)
 
-	return dict, packed, offsets, primaryCount, extendedCount, extendedBeforeEquiv
+	return dict, packed, offsets, primaryCount, extendedCount, extendedBeforeEquiv, patternPacked
 }
 
 // optimizePackedOverlap uses greedy superstring algorithm to find optimal overlapping
@@ -4338,7 +4490,7 @@ func main() {
 			cycleRatio := float64(r.newCycles) / float64(r.builtinCycles)
 			maxCycleRatio := float64(r.newMaxCycles) / float64(r.builtinMaxCycles)
 			sizeRatio := float64(r.newSize) / float64(r.origSize)
-			fmt.Printf("Song %d: cycles: %.2fx, max: %.2fx, size: %.2fx, dict: %d, len: $%X, eq: %d\n", r.songNum, cycleRatio, maxCycleRatio, sizeRatio, s.PatternDictSize, r.newSize, s.ExtendedBeforeEquiv)
+			fmt.Printf("Song %d: cycles: %.2fx, max: %.2fx, size: %.2fx, dict: %d, len: $%X, eq: %d, ext: %d\n", r.songNum, cycleRatio, maxCycleRatio, sizeRatio, s.PatternDictSize, r.newSize, s.ExtendedBeforeEquiv, s.ExtendedIndices)
 			if s.NewWaveSize > maxWave {
 				maxWave = s.NewWaveSize
 			}

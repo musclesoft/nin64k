@@ -19,23 +19,21 @@ zp_song_base     = $10          ; 2 bytes: base address of current song data
 zp_ptr           = $12          ; 2 bytes: temp pointer / temp values
 zp_trackptr      = $14          ; 2 bytes: track pointer
 zp_dict0         = $16          ; 2 bytes: dict0 (note bytes)
-zp_packed_data   = $18          ; 2 bytes: packed data address
 zp_temp0         = $1A          ; 2 bytes: temp (decode src / instrument processing)
 zp_temp1         = $1C          ; 2 bytes: temp (decode dst)
 zp_dict1         = $1E          ; 2 bytes: dict1 (inst|effect bytes)
 zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 
 ; Song format: fixed offsets (all tables deduplicated)
-; $000: Instruments (512 bytes) - interleaved: inst N at offset N*16
+; $000: Instruments (512 bytes) - 16 bytes each, inst N at offset N*16
 ; $200: Transpose ch0-2 (256 bytes each)
 ; $500: Trackptr ch0-2 (256 bytes each)
 ; $800: Filtertable (227 bytes max)
 ; $8E3: Arptable (188 bytes max)
 ; $99F: Row dict0 (365 bytes) - note bytes
-; $B04: Row dict1 (365 bytes) - inst|effect bytes
+; $B0C: Row dict1 (365 bytes) - inst|effect bytes
 ; $C79: Row dict2 (365 bytes) - param bytes
-; $DE6: Packed pointers (182 bytes = 91 patterns × 2)
-; $E9C: Packed pattern data
+; $DE6: Packed pattern data pointers (dynamic length) - 2 bytes per pattern
 ;
 ; Global wavetable (163 bytes) is stored in player, shared across all songs.
 ; Instrument wave indices point directly into global_wavetable.
@@ -73,8 +71,7 @@ zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 ; Pattern packing constants
 ROW_DICT_OFF        = $99F
 ROW_DICT_SIZE       = 365
-PACKED_PTRS_OFF     = $DE6
-PACKED_DATA_OFF     = $E9C
+PACKED_PTRS_OFF     = $DE6          ; Pointers are absolute song-base offsets
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0
@@ -195,14 +192,6 @@ player_init:
         lda     zp_song_base+1
         adc     #>PACKED_PTRS_OFF
         sta     packed_ptrs_addr+1
-        ; Set packed_data = song_base + PACKED_DATA_OFF
-        lda     zp_song_base
-        clc
-        adc     #<PACKED_DATA_OFF
-        sta     zp_packed_data
-        lda     zp_song_base+1
-        adc     #>PACKED_DATA_OFF
-        sta     zp_packed_data+1
         rts
 
 ; ============================================================================
@@ -1125,7 +1114,7 @@ decode_advance_row:
         rts
 dar_not_rle:
         ; Set up source pointer from pattern index
-        ; Calculate source: packed_data + packed_ptrs[pattern_idx]
+        ; Calculate source: song_base + packed_ptrs[pattern_idx]
         lda     chn_decoded_pat,x
         asl     a                   ; pattern index * 2
         tay
@@ -1133,13 +1122,13 @@ dar_not_rle:
         sta     zp_ptr
         lda     packed_ptrs_addr+1
         sta     zp_ptr+1
-        lda     (zp_ptr),y          ; ptr lo
+        lda     (zp_ptr),y          ; ptr lo (absolute song-base offset)
         ; (C already 0: ASL of index < 128 never sets carry)
-        adc     zp_packed_data
+        adc     zp_song_base
         sta     zp_temp0
         iny
         lda     (zp_ptr),y          ; ptr hi
-        adc     zp_packed_data+1
+        adc     zp_song_base+1
         sta     zp_temp0+1
         ; Add current source offset
         lda     chn_src_off,x

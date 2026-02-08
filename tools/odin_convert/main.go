@@ -1629,6 +1629,79 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		}
 	}
 
+	// Find patterns that are equiv-equivalent (same index sequence after equiv mapping)
+	// Build row hex → dict index map
+	numDictEntries := len(dict) / 3
+	rowHexToIdx := make(map[string]int)
+	rowHexToIdx["000000"] = 0
+	for idx := 1; idx < numDictEntries; idx++ {
+		rowHex := fmt.Sprintf("%02x%02x%02x", dict[idx*3], dict[idx*3+1], dict[idx*3+2])
+		rowHexToIdx[rowHex] = idx
+	}
+
+	// Compute equiv signature for each pattern (sequence of indices after equiv mapping)
+	getEquivSignature := func(pat []byte) string {
+		var sig strings.Builder
+		for row := 0; row < len(pat)/3; row++ {
+			off := row * 3
+			rowHex := fmt.Sprintf("%02x%02x%02x", pat[off], pat[off+1], pat[off+2])
+			idx := rowHexToIdx[rowHex]
+			if equivMap != nil {
+				if mappedIdx, ok := equivMap[idx]; ok {
+					idx = mappedIdx
+				}
+			}
+			sig.WriteString(fmt.Sprintf("%d,", idx))
+		}
+		return sig.String()
+	}
+
+	// Find duplicate patterns by equiv signature
+	sigToCanon := make(map[string]int)
+	patternToCanon := make(map[int]int) // pattern index → canonical index
+	equivDedupCount := 0
+	for i, pat := range patternData {
+		sig := getEquivSignature(pat)
+		if canon, exists := sigToCanon[sig]; exists {
+			patternToCanon[i] = canon
+			equivDedupCount++
+		} else {
+			sigToCanon[sig] = i
+			patternToCanon[i] = i
+		}
+	}
+	if equivDedupCount > 0 {
+		fmt.Printf("  Equiv pattern dedup: %d patterns\n", equivDedupCount)
+	}
+
+	// Update patternIndex to use canonical patterns
+	for addr, idx := range patternIndex {
+		patternIndex[addr] = byte(patternToCanon[int(idx)])
+	}
+
+	// Build list of canonical patterns only
+	canonPatternData := make([][]byte, 0, len(patternData)-equivDedupCount)
+	canonTruncate := make([]int, 0, len(patternData)-equivDedupCount)
+	oldToNew := make(map[int]int)
+	for i, pat := range patternData {
+		if patternToCanon[i] == i {
+			oldToNew[i] = len(canonPatternData)
+			canonPatternData = append(canonPatternData, pat)
+			canonTruncate = append(canonTruncate, patternTruncate[i])
+		}
+	}
+
+	// Update patternIndex with new indices
+	for addr, idx := range patternIndex {
+		canonIdx := patternToCanon[int(idx)]
+		patternIndex[addr] = byte(oldToNew[canonIdx])
+	}
+
+	// Use canonical patterns for packing
+	patternData = canonPatternData
+	patternTruncate = canonTruncate
+	numPatterns = len(patternData)
+
 	// Pack patterns with optimized equiv map
 	dict, packed, patOffsets, primaryCount, extendedCount, extendedBeforeEquiv, individualPacked := packPatternsWithEquiv(patternData, dict, equivMap, patternTruncate)
 
@@ -1657,7 +1730,7 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		arpGapSize = 0
 	}
 	// Gap 3: after dict, before packed pointers
-	numDictEntries := len(dict) / 3
+	numDictEntries = len(dict) / 3
 	dictEndOff := rowDictOff + 730 + (numDictEntries - 1)
 	dictGapStart := dictEndOff
 	dictGapSize := packedPtrsOff - dictGapStart

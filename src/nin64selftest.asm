@@ -77,7 +77,7 @@ IRQ_RETURN      = $EA31
 ; Buffer destinations (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
 ; Note: selftest code extends to ~$1A00, so buffers must start after that
 TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $3C00         ; Even songs (2,4,6,8)
+TUNE2_BASE      = $3B00         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801

@@ -17,7 +17,7 @@ zp_out_hi       = $06
 
 ; Buffer addresses (must match DECOMP_BUF1_HI/DECOMP_BUF2_HI in decompress.asm)
 TUNE1_BASE      = $2000         ; Odd songs (1,3,5,7,9)
-TUNE2_BASE      = $3C00         ; Even songs (2,4,6,8)
+TUNE2_BASE      = $3B00         ; Even songs (2,4,6,8)
 
 .segment "LOADADDR"
         .word   $0801

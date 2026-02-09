@@ -19,7 +19,7 @@ const (
 	addrHigh   = DecompBuf2Hi << 8 // Even songs (S2, S4, S6, S8)
 
 	// Buffer size - both max song length and distance between buffer starts
-	bufferSize = DecompBufSize << 8 // $1C00 = 7168 bytes
+	bufferSize = DecompBufSize << 8 // $1B00 = 6912 bytes
 )
 
 var (

@@ -1729,16 +1729,23 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	if arpGapSize < 0 {
 		arpGapSize = 0
 	}
-	// Gap 3: after dict, before packed pointers
+	// Gaps 3-5: free slots in each of the 3 row dict arrays
+	// Each dict array is 365 bytes max; dict[0] is implicit, entries 1-N stored at indices 0-(N-1)
+	// Free slots start at index (numDictEntries - 1) in each array
 	numDictEntries = len(dict) / 3
-	dictEndOff := rowDictOff + 730 + (numDictEntries - 1)
-	dictGapStart := dictEndOff
-	dictGapSize := packedPtrsOff - dictGapStart
-	if dictGapSize < 0 {
-		dictGapSize = 0
+	dictFreeStart := numDictEntries - 1 // first free index in each array
+	dictFreeSize := 365 - dictFreeStart
+	if dictFreeSize < 0 {
+		dictFreeSize = 0
 	}
+	// Gap 3: free slots in dict0 (notes)
+	dict0GapStart := rowDictOff + dictFreeStart
+	// Gap 4: free slots in dict1 (inst|effect)
+	dict1GapStart := rowDictOff + 365 + dictFreeStart
+	// Gap 5: free slots in dict2 (params)
+	dict2GapStart := rowDictOff + 730 + dictFreeStart
 
-	// Collect all gaps (inst, filter, arp, dict) for pattern placement
+	// Collect all gaps for pattern placement
 	type gap struct {
 		start int
 		size  int
@@ -1748,7 +1755,9 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		{instGapStart, instGapSize, 0},
 		{filterGapStart, filterGapSize, 0},
 		{arpGapStart, arpGapSize, 0},
-		{dictGapStart, dictGapSize, 0},
+		{dict0GapStart, dictFreeSize, 0},
+		{dict1GapStart, dictFreeSize, 0},
+		{dict2GapStart, dictFreeSize, 0},
 	}
 
 	// Compute overlap potential for each pattern
@@ -1807,10 +1816,16 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		return candidates[i].size > candidates[j].size
 	})
 
-	// Place patterns in gaps (best fit)
-	inGap := make(map[int]int) // pattern index -> absolute offset
+	// Place patterns in gaps with overlap optimization
+	// First pass: assign patterns to gaps (greedy, low-overlap patterns first)
+	gapAssign := make([]int, len(individualPacked)) // pattern index -> gap index (-1 = not in gap)
+	for i := range gapAssign {
+		gapAssign[i] = -1
+	}
+	gapPatterns := make([][]int, len(gaps)) // gap index -> list of pattern indices
+
 	for _, c := range candidates {
-		// Find smallest gap that fits this pattern
+		// Find smallest gap that could fit this pattern
 		bestGap := -1
 		bestRemaining := int(^uint(0) >> 1)
 		for gi, g := range gaps {
@@ -1821,9 +1836,60 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 			}
 		}
 		if bestGap >= 0 {
-			g := gaps[bestGap]
-			inGap[c.idx] = g.start + g.used
-			g.used += c.size
+			gapAssign[c.idx] = bestGap
+			gapPatterns[bestGap] = append(gapPatterns[bestGap], c.idx)
+			gaps[bestGap].used += c.size // Reserve space (will be refined with overlap)
+		}
+	}
+
+	// Second pass: optimize overlap within each gap
+	// Note: In practice, gap patterns have minimal overlap since we assign
+	// low-overlap-potential patterns to gaps. But we still run the optimization
+	// to handle any cases where overlap exists.
+	type gapResult struct {
+		blob    []byte
+		offsets map[int]uint16 // pattern index -> offset within blob
+	}
+	gapResults := make([]gapResult, len(gaps))
+
+	for gi, patIdxs := range gapPatterns {
+		if len(patIdxs) == 0 {
+			continue
+		}
+		// Collect patterns for this gap
+		gapPats := make([][]byte, len(patIdxs))
+		for i, idx := range patIdxs {
+			gapPats[i] = individualPacked[idx]
+		}
+		// Run overlap optimization
+		blob, offsets := optimizePackedOverlap(gapPats)
+		// Check if overlapped blob fits
+		if len(blob) <= gaps[gi].size {
+			gapResults[gi].blob = blob
+			gapResults[gi].offsets = make(map[int]uint16)
+			for i, idx := range patIdxs {
+				gapResults[gi].offsets[idx] = offsets[i]
+			}
+			gaps[gi].used = len(blob)
+		} else {
+			// Overlap didn't help enough, fall back to sequential
+			// (shouldn't happen since we reserved space for full sizes)
+			gapResults[gi].blob = nil
+			for _, idx := range patIdxs {
+				gapAssign[idx] = -1 // Remove from gap
+			}
+		}
+	}
+
+	// Build inGap map with final offsets
+	inGap := make(map[int]int) // pattern index -> absolute offset
+	for gi, res := range gapResults {
+		if res.blob == nil {
+			continue
+		}
+		gapStart := gaps[gi].start
+		for idx, off := range res.offsets {
+			inGap[idx] = gapStart + int(off)
 		}
 	}
 
@@ -2006,9 +2072,11 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		out[packedPtrsOff+i*2] = byte(pOff & 0xFF)
 		out[packedPtrsOff+i*2+1] = byte(pOff>>8) | (patGapCodes[i] << 5)
 	}
-	// Write gap patterns
-	for i, gapOff := range inGap {
-		copy(out[gapOff:], individualPacked[i])
+	// Write optimized gap blobs
+	for gi, res := range gapResults {
+		if res.blob != nil {
+			copy(out[gaps[gi].start:], res.blob)
+		}
 	}
 	// Packed pattern data (remaining patterns after overlap)
 	if len(packed) > 0 {

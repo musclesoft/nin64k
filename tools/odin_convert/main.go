@@ -461,6 +461,29 @@ func solveTransposeTable(songSets [9][]int8) TransposeTableResult {
 	return TransposeTableResult{Table: table, Bases: deltaResult.Bases}
 }
 
+// packOrderBitstream packs transpose (4-bit) and trackptr (5-bit) indices into a bitstream.
+// Layout per order (4 bytes, 27 bits used, 5 bits unused):
+//   Byte 0: [ch1_tr:4][ch0_tr:4]     - nibble packed transposes
+//   Byte 1: [ch0_tp_lo:4][ch2_tr:4]  - ch2 transpose + low 4 bits of ch0 trackptr
+//   Byte 2: [ch1_tp:5][ch0_tp_hi:1][ch2_tp_lo:2]
+//   Byte 3: [unused:5][ch2_tp_hi:3]
+func packOrderBitstream(numOrders int, transpose [3][]byte, trackptr [3][]byte) []byte {
+	out := make([]byte, numOrders*4)
+	for i := 0; i < numOrders; i++ {
+		ch0_tr := transpose[0][i] & 0x0F
+		ch1_tr := transpose[1][i] & 0x0F
+		ch2_tr := transpose[2][i] & 0x0F
+		ch0_tp := trackptr[0][i] & 0x1F
+		ch1_tp := trackptr[1][i] & 0x1F
+		ch2_tp := trackptr[2][i] & 0x1F
+
+		out[i*4+0] = ch0_tr | (ch1_tr << 4)
+		out[i*4+1] = ch2_tr | ((ch0_tp & 0x0F) << 4)
+		out[i*4+2] = (ch0_tp >> 4) | (ch1_tp << 1) | ((ch2_tp & 0x03) << 6)
+		out[i*4+3] = ch2_tp >> 2
+	}
+	return out
+}
 
 func init() {
 	projectRoot = findProjectRoot()
@@ -1468,6 +1491,8 @@ type ConversionStats struct {
 	ExtendedBeforeEquiv int
 	DeltaSet            []int
 	TrackStarts         [3]byte
+	TempTranspose       [3][]byte // Temp arrays for relative index conversion
+	TempTrackptr        [3][]byte
 }
 
 func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap map[int]byte, globalWave *GlobalWaveTable, excludeEquiv map[int]bool, instRemap []int, maxUsedSlot int) ([]byte, ConversionStats, error) {
@@ -1953,25 +1978,22 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 
 
 	// Build new format (packed, exact sizes, all tables deduplicated)
-	// $000: Transpose ch0 (256 bytes)
-	// $100: Transpose ch1 (256 bytes)
-	// $200: Transpose ch2 (256 bytes)
-	// $300: Trackptr ch0 (256 bytes)
-	// $400: Trackptr ch1 (256 bytes)
-	// $500: Trackptr ch2 (256 bytes)
+	// $000: Order bitstream (4 bytes per order: transpose+trackptr packed)
+	//       Layout per order: [ch1_tr:4][ch0_tr:4] [ch0_tp_lo:4][ch2_tr:4] [ch1_tp:5][ch0_tp_hi:1][ch2_tp_lo:2] [unused:5][ch2_tp_hi:3]
+	//       Max 255 orders = 1020 bytes ($3FC)
+	// $3FC to $600: gap (available for pattern data)
 	// $600: Instruments 1-31 (496 bytes, inst 0 not stored)
 	// $7F0: Filtertable (227 bytes max deduped)
 	// $8D3: Arptable (188 bytes max deduped)
 	// $98F: Row dictionary + packed pattern data
 	// Player uses inst_base = $5F0 (actual - 16) so inst N is at $5F0 + N*16
 
-	transpose0Off := 0x000 // Transpose at start (page-aligned)
-	transpose1Off := 0x100
-	transpose2Off := 0x200
-	trackptr0Off := 0x300
-	trackptr1Off := 0x400
-	trackptr2Off := 0x500
-	newInstOff := 0x600    // Instruments 1-31 start here (inst 0 not stored)
+	bitstreamOff := 0x000
+	maxOrders := 255                    // Max possible orders (order index is 1 byte)
+	bitstreamMaxSize := maxOrders * 4   // 1020 bytes = $3FC
+	bitstreamSize := newNumOrders * 4   // Actual size for this song
+	_ = bitstreamMaxSize                // Used for format documentation
+	newInstOff := 0x600                 // Instruments 1-31 start here (inst 0 not stored)
 	filterOff := 0x7F0     // Filter at $7F0 (227 bytes max)
 	arpOff := 0x8D3        // Arp at $8D3 (188 bytes max)
 	rowDictOff := 0x991    // Row dict0 (notes), dict1 at +365, dict2 at +730 (2 byte gap after arp for bases)
@@ -2454,10 +2476,11 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	// Gap 5: free slots in dict2 (params)
 	dict2GapStart := rowDictOff + 730 + dictFreeStart
 
-	// Gaps 6-11: unused order table slots (bytes newNumOrders..255 in each table)
-	orderGapSize := 256 - newNumOrders
-	if orderGapSize < 0 {
-		orderGapSize = 0
+	// Gap 6: unused space after order bitstream (bitstreamSize to $600)
+	bitstreamGapStart := bitstreamOff + bitstreamSize
+	bitstreamGapSize := newInstOff - bitstreamGapStart
+	if bitstreamGapSize < 0 {
+		bitstreamGapSize = 0
 	}
 
 	// Collect all gaps for pattern placement
@@ -2473,12 +2496,7 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		{dict0GapStart, dictFreeSize, 0},
 		{dict1GapStart, dictFreeSize, 0},
 		{dict2GapStart, dictFreeSize, 0},
-		{transpose0Off + newNumOrders, orderGapSize, 0}, // Gap 6: transpose0
-		{transpose1Off + newNumOrders, orderGapSize, 0}, // Gap 7: transpose1
-		{transpose2Off + newNumOrders, orderGapSize, 0}, // Gap 8: transpose2
-		{trackptr0Off + newNumOrders, orderGapSize, 0},  // Gap 9: trackptr0
-		{trackptr1Off + newNumOrders, orderGapSize, 0},  // Gap 10: trackptr1
-		{trackptr2Off + newNumOrders, orderGapSize, 0},  // Gap 11: trackptr2
+		{bitstreamGapStart, bitstreamGapSize, 0}, // Gap 6: after order bitstream
 	}
 
 	// Compute overlap potential for each pattern
@@ -2668,25 +2686,21 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 
 	out := make([]byte, totalSize)
 
-	// Write transpose tables (only reachable orders, remapped to 0..n-1)
+	// Collect transpose and trackptr values into temp arrays for later packing
+	// These will be converted to relative indices and then packed into bitstream
 	srcTransposeOff := []int{srcTranspose0Off, srcTranspose1Off, srcTranspose2Off}
-	dstTransposeOff := []int{transpose0Off, transpose1Off, transpose2Off}
 	for ch := 0; ch < 3; ch++ {
+		stats.TempTranspose[ch] = make([]byte, newNumOrders)
+		stats.TempTrackptr[ch] = make([]byte, newNumOrders)
 		for newIdx, oldIdx := range reachableOrders {
-			out[dstTransposeOff[ch]+newIdx] = raw[srcTransposeOff[ch]+oldIdx]
-		}
-	}
-	// Write track pointers (only reachable orders, remapped)
-	dstTrackptrOff := []int{trackptr0Off, trackptr1Off, trackptr2Off}
-	for ch := 0; ch < 3; ch++ {
-		for newIdx, oldIdx := range reachableOrders {
+			stats.TempTranspose[ch][newIdx] = raw[srcTransposeOff[ch]+oldIdx]
 			lo := raw[trackLoOff[ch]+oldIdx]
 			hi := raw[trackHiOff[ch]+oldIdx]
 			addr := uint16(lo) | uint16(hi)<<8
-			out[dstTrackptrOff[ch]+newIdx] = patternIndex[addr]
+			stats.TempTrackptr[ch][newIdx] = patternIndex[addr]
 		}
 		if len(reachableOrders) > 0 {
-			stats.TrackStarts[ch] = out[dstTrackptrOff[ch]]
+			stats.TrackStarts[ch] = stats.TempTrackptr[ch][0]
 		}
 	}
 
@@ -2826,8 +2840,8 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 		}
 		// Deltas between consecutive trackptr values
 		for i := 1; i < len(reachableOrders); i++ {
-			prev := int(out[dstTrackptrOff[ch]+i-1])
-			curr := int(out[dstTrackptrOff[ch]+i])
+			prev := int(stats.TempTrackptr[ch][i-1])
+			curr := int(stats.TempTrackptr[ch][i])
 			d := curr - prev
 			if d > 127 {
 				d -= 256
@@ -5564,16 +5578,18 @@ func main() {
 	}
 
 	// Collect transpose values from each song and build transpose table
+	// Use TempTranspose arrays (raw values) from stats, not convertedSongs offsets
 	var transposeSets [9][]int8
 	for songNum := 1; songNum <= 9; songNum++ {
 		if convertedSongs[songNum-1] == nil {
 			continue
 		}
-		numOrders := convertedStats[songNum-1].NewOrders
+		stats := &convertedStats[songNum-1]
+		numOrders := stats.NewOrders
 		unique := make(map[int8]bool)
 		for order := 0; order < numOrders; order++ {
 			for ch := 0; ch < 3; ch++ {
-				t := int8(convertedSongs[songNum-1][ch*0x100+order])
+				t := int8(stats.TempTranspose[ch][order])
 				unique[t] = true
 			}
 		}
@@ -5649,53 +5665,59 @@ func main() {
 		}
 	}
 
-	// Build delta value -> index lookup
-	deltaToIndex := make(map[int8]byte)
-	for i, d := range deltaResult.Table {
-		deltaToIndex[d] = byte(i)
+	// Build per-song delta value -> relative index lookup
+	// Each song has a 32-entry window in the delta table
+	var songDeltaToRelIdx [9]map[int8]byte
+	for songIdx := 0; songIdx < 9; songIdx++ {
+		base := deltaResult.Bases[songIdx]
+		songDeltaToRelIdx[songIdx] = make(map[int8]byte)
+		for i := 0; i < 32 && base+i < len(deltaResult.Table); i++ {
+			d := deltaResult.Table[base+i]
+			songDeltaToRelIdx[songIdx][d] = byte(i)
+		}
 	}
 
-	// Convert trackptr tables from absolute to delta table indices (must happen before tests)
-	// Also convert transpose tables to indices
-	trackptrOffsets := []int{0x300, 0x400, 0x500}
-	transposeOffsets := []int{0x000, 0x100, 0x200}
+	// Convert trackptr/transpose to relative indices and pack into bitstream
 	for songNum := 1; songNum <= 9; songNum++ {
 		if convertedSongs[songNum-1] == nil {
 			continue
 		}
+		stats := &convertedStats[songNum-1]
 		// Set transpose base at 0x98F, delta base at 0x990
 		convertedSongs[songNum-1][0x98F] = byte(transposeResult.Bases[songNum-1])
 		convertedSongs[songNum-1][0x990] = byte(deltaResult.Bases[songNum-1])
-		// Convert absolute trackptr values to delta table indices
-		numOrders := convertedStats[songNum-1].NewOrders
+		// Convert absolute trackptr values to relative delta indices (0-31)
+		numOrders := stats.NewOrders
+		deltaMap := songDeltaToRelIdx[songNum-1]
 		for ch := 0; ch < 3; ch++ {
 			prev := bestConst // TRACKPTR_START
 			for i := 0; i < numOrders; i++ {
-				off := trackptrOffsets[ch] + i
-				curr := int(convertedSongs[songNum-1][off])
+				curr := int(stats.TempTrackptr[ch][i])
 				delta := int8(curr - prev)
-				idx, ok := deltaToIndex[delta]
+				relIdx, ok := deltaMap[delta]
 				if !ok {
-					fmt.Printf("WARNING: Song %d ch%d order %d: delta %d not in table\n", songNum, ch, i, delta)
-					idx = 0
+					fmt.Printf("WARNING: Song %d ch%d order %d: delta %d not in song's window\n", songNum, ch, i, delta)
+					relIdx = 0
 				}
-				convertedSongs[songNum-1][off] = idx
+				stats.TempTrackptr[ch][i] = relIdx
 				prev = curr
 			}
 		}
-		// Convert transpose values to relative table indices (0-15)
+		// Convert transpose values to relative table indices (0-15, in temp array)
 		for ch := 0; ch < 3; ch++ {
 			for i := 0; i < numOrders; i++ {
-				off := transposeOffsets[ch] + i
-				val := int8(convertedSongs[songNum-1][off])
+				val := int8(stats.TempTranspose[ch][i])
 				idx, ok := transposeToRelIdx[songNum-1][val]
 				if !ok {
 					fmt.Printf("WARNING: Song %d ch%d order %d: transpose %d not in window\n", songNum, ch, i, val)
 					idx = 0
 				}
-				convertedSongs[songNum-1][off] = idx
+				stats.TempTranspose[ch][i] = idx
 			}
 		}
+		// Pack into bitstream at offset 0x000
+		bitstream := packOrderBitstream(numOrders, stats.TempTranspose, stats.TempTrackptr)
+		copy(convertedSongs[songNum-1][0x000:], bitstream)
 	}
 
 	// Second pass: run tests

@@ -26,8 +26,10 @@ zp_dict1         = $1E          ; 2 bytes: dict1 (inst|effect bytes)
 zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 
 ; Song format: fixed offsets (all tables deduplicated)
-; $000: Transpose ch0-2 (256 bytes each)
-; $300: Trackptr ch0-2 (256 bytes each)
+; $000: Order bitstream (4 bytes per order, max 255 orders = 1020 bytes)
+;       Layout per order: [ch1_tr:4][ch0_tr:4] [ch0_tp_lo:4][ch2_tr:4] [ch1_tp:5][ch0_tp_hi:1][ch2_tp_lo:2] [unused:5][ch2_tp_hi:3]
+;       ch*_tr = transpose relative index (0-15), ch*_tp = trackptr delta index (0-31)
+; $3FC: gap (available for pattern data, up to $600)
 ; $600: Instruments 1-31 (496 bytes) - 16 bytes each, inst 0 not stored
 ;       Virtual base is $5F0, so inst N is at $5F0 + N*16
 ; $7F0: Filtertable (227 bytes max)
@@ -100,30 +102,24 @@ INST_FILTLOOP    = 15
 ; ============================================================================
 player_init:
         stx     zp_song_base+1
-        ; Calculate transpose table pages ($000, $100, $200 from base)
-        stx     transpose_page+0        ; X = base + 0
-        inx                             ; X = base + 1
-        stx     transpose_page+1
-        inx                             ; X = base + 2
-        stx     transpose_page+2
-        ; Calculate trackptr table pages ($300, $400, $500 from base)
-        inx                             ; X = base + 3
-        stx     trackptr_page+0
-        stx     upd_tp_ch0+1            ; SMC: patch high byte
-        inx                             ; X = base + 4
-        stx     trackptr_page+1
-        stx     upd_tp_ch1+1            ; SMC: patch high byte
-        inx                             ; X = base + 5
-        stx     trackptr_page+2
-        stx     upd_tp_ch2+1            ; SMC: patch high byte
+        ; Set up bitstream address (order data at song_base + $000)
+        stx     bitstream_addr+1
+        lda     #0
+        sta     bitstream_addr
+        ; Mark order decode as invalid (will be decoded on first use)
+        lda     #$FF
+        sta     decoded_order
         ; Patch table addresses (SMC)
-        inx
-        inx                             ; X = base + 7
-        stx     filter_load+2           ; $7F0 high byte
+        txa
+        clc
+        adc     #7                      ; A = base + 7
+        sta     filter_load+2           ; $7F0 high byte
         lda     #$f0
         sta     filter_load+1           ; $7F0 low byte
-        inx                             ; X = base + 8
-        stx     arp_load_addr+1         ; $8D3 high byte
+        lda     zp_song_base+1
+        clc
+        adc     #8                      ; A = base + 8
+        sta     arp_load_addr+1         ; $8D3 high byte
         lda     #$d3
         sta     arp_load_addr           ; $8D3 low byte
         lda     #$00
@@ -186,6 +182,9 @@ player_init:
         ldy     #0
         lda     (zp_ptr),y
         sta     transpose_base
+        iny                         ; Y = 1, read from $990
+        lda     (zp_ptr),y
+        sta     delta_base
         jsr     checkpoint
         ; Set up split dictionary pointers (3 arrays of ROW_DICT_SIZE bytes each)
         ; dict0 (notes) at ROW_DICT_OFF
@@ -303,25 +302,31 @@ newpattern:
         lda     nextordernumber
         sta     ordernumber
         inc     nextordernumber
-        ; Update trackptr: cur += delta_table[song_index[ordernumber]]
-        tay                             ; Y = ordernumber
-upd_tp_ch0 = *+1
-        lda     $FF00,y                 ; SMC: patched during init
+        ; Decode bitstream for this order and update trackptr
+        ldx     ordernumber
+        jsr     decode_order_bitstream
+        jsr     checkpoint
+        ; Update trackptr: cur += delta_table[delta_base + decoded_trackptr_idx[ch]]
+        lda     decoded_trackptr_idx+0
+        clc
+        adc     delta_base
         tax
         lda     delta_table,x
         clc
         adc     chn_trackptr_cur+0
         sta     chn_trackptr_cur+0
-        jsr     checkpoint
-upd_tp_ch1 = *+1
-        lda     $FF00,y                 ; SMC: patched during init
+        lda     decoded_trackptr_idx+1
+        clc
+        adc     delta_base
         tax
         lda     delta_table,x
         clc
         adc     chn_trackptr_cur+1
         sta     chn_trackptr_cur+1
-upd_tp_ch2 = *+1
-        lda     $FF00,y                 ; SMC: patched during init
+        jsr     checkpoint
+        lda     decoded_trackptr_idx+2
+        clc
+        adc     delta_base
         tax
         lda     delta_table,x
         clc
@@ -1060,17 +1065,119 @@ check_hardrestart:
 ; Data access routines for new format
 ; ============================================================================
 
+; decode_order_bitstream - Decode bitstream data for order in X
+; Sets decoded_order, decoded_transpose[0-2], decoded_trackptr_idx[0-2]
+; Preserves X
+decode_order_bitstream:
+        cpx     decoded_order
+        bne     @need_decode
+        rts
+@need_decode:
+        stx     decoded_order
+        stx     dob_save_x+1        ; SMC: save X for later restore
+        ; Calculate zp_ptr = bitstream_addr + order * 4
+        txa
+        asl     a                   ; A = order * 2, carry into high byte
+        sta     zp_ptr              ; temp store low * 2
+        lda     #0
+        rol     a                   ; A = high byte so far
+        sta     zp_ptr+1
+        asl     zp_ptr              ; low * 4
+        rol     zp_ptr+1            ; high byte (0, 1, 2, or 3 depending on order)
+        jsr     checkpoint
+        lda     zp_ptr
+        clc
+        adc     bitstream_addr
+        sta     zp_ptr
+        lda     zp_ptr+1
+        adc     bitstream_addr+1
+        sta     zp_ptr+1
+        ; Read 4 bytes from bitstream
+        ldy     #0
+        lda     (zp_ptr),y
+        sta     bs_byte0
+        iny
+        lda     (zp_ptr),y
+        sta     bs_byte1
+        iny
+        lda     (zp_ptr),y
+        sta     bs_byte2
+        iny
+        lda     (zp_ptr),y
+        sta     bs_byte3
+        jsr     checkpoint
+        ; Extract transpose values (4 bits each)
+        ; ch0_tr = byte0 & $0F
+        lda     bs_byte0
+        and     #$0F
+        sta     decoded_transpose+0
+        ; ch1_tr = byte0 >> 4
+        lda     bs_byte0
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     decoded_transpose+1
+        ; ch2_tr = byte1 & $0F
+        lda     bs_byte1
+        and     #$0F
+        sta     decoded_transpose+2
+        jsr     checkpoint
+        ; Extract trackptr indices (5 bits each)
+        ; ch0_tp = (byte1 >> 4) | ((byte2 & 1) << 4)
+        lda     bs_byte1
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     decoded_trackptr_idx+0
+        lda     bs_byte2
+        and     #$01
+        beq     @ch0_tp_done
+        lda     decoded_trackptr_idx+0
+        ora     #$10
+        sta     decoded_trackptr_idx+0
+@ch0_tp_done:
+        ; ch1_tp = (byte2 >> 1) & $1F
+        lda     bs_byte2
+        lsr     a
+        and     #$1F
+        sta     decoded_trackptr_idx+1
+        jsr     checkpoint
+        ; ch2_tp = (byte2 >> 6) | ((byte3 & 7) << 2)
+        lda     bs_byte2
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a                   ; bits 6-7 now in bits 0-1
+        sta     decoded_trackptr_idx+2
+        lda     bs_byte3
+        and     #$07
+        asl     a
+        asl     a
+        ora     decoded_trackptr_idx+2
+        sta     decoded_trackptr_idx+2
+dob_save_x:
+        ldx     #0                  ; SMC: restore original X
+        rts
+
+; Temp storage for bitstream decoding
+bs_byte0:               .byte   0
+bs_byte1:               .byte   0
+bs_byte2:               .byte   0
+bs_byte3:               .byte   0
+
 ; get_transpose_order - Get transpose for channel Y at order X
 ; Returns: A = transpose value (from transpose_table lookup)
-; Transpose tables store relative indices (0-15), add base to get absolute
+; Bitstream stores relative indices (0-15), add base to get absolute
 get_transpose_order:
-        lda     transpose_page,y
-        sta     zp_ptr+1
-        lda     #0
-        sta     zp_ptr
-        txa
-        tay
-        lda     (zp_ptr),y          ; load relative index (0-15)
+        sty     gto_save_y+1        ; SMC: save channel
+        jsr     decode_order_bitstream  ; ensure order X is decoded
+gto_save_y:
+        ldy     #0                  ; SMC: restored channel
+        lda     decoded_transpose,y ; load relative index (0-15)
         clc
         adc     transpose_base      ; add base to get absolute index
         tay
@@ -1083,17 +1190,14 @@ get_trackptr_order:
         sty     gto_channel+1       ; SMC: save channel
         cpx     ordernumber
         beq     @use_cur
-        ; X = nextordernumber: compute cur + delta_table[song_index]
-        lda     trackptr_page,y
-        sta     zp_ptr+1
-        lda     #0
-        sta     zp_ptr
-        txa
-        tay                         ; Y = order
-        lda     (zp_ptr),y          ; load delta index from song
+        ; X = nextordernumber: decode bitstream and compute cur + delta_table[index]
+        jsr     decode_order_bitstream
+        ldy     gto_channel+1       ; restore Y = channel
+        lda     decoded_trackptr_idx,y
+        clc
+        adc     delta_base          ; convert relative to absolute index
         tax
         lda     delta_table,x       ; look up actual delta
-        ldy     gto_channel+1       ; restore Y = channel
         clc
         adc     chn_trackptr_cur,y
         jmp     gto_have_pattern
@@ -1420,10 +1524,15 @@ chn_trackptr_cur:       .byte   0, 0, 0        ; Pattern index for current order
 chn_trackptr_tmp:       .byte   0              ; Temp storage for get_trackptr_order
 
 ; Values computed from song base during init
-transpose_page:         .byte   0, 0, 0
-transpose_base:         .byte   0               ; Base index into transpose_table
-trackptr_page:          .byte   0, 0, 0
+bitstream_addr:         .word   0       ; Address of order bitstream (song_base + 0)
+transpose_base:         .byte   0       ; Base index into transpose_table
+delta_base:             .byte   0       ; Base index into delta_table
 packed_ptrs_addr:       .word   0       ; Address of packed pointers table
+
+; Bitstream decode state
+decoded_order:          .byte   $FF     ; Order for which we have decoded data ($FF = invalid)
+decoded_transpose:      .byte   0, 0, 0 ; Decoded transpose indices (0-15) for each channel
+decoded_trackptr_idx:   .byte   0, 0, 0 ; Decoded trackptr delta indices (0-31) for each channel
 
 ; Pattern decode state (row-by-row streaming)
 chn_decoded_pat:        .byte   $FF, $FF, $FF  ; Pattern index in each channel's decode buffer

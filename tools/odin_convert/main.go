@@ -17,6 +17,394 @@ import (
 var projectRoot string
 var disableEquivSong int
 
+// Delta table solver
+type DeltaTableResult struct {
+	Table      []int8
+	Bases      [9]int
+	SongSets   [9][]int
+	StartConst int
+}
+
+const deltaEmpty int8 = -128
+
+type deltaSolverState struct {
+	sorted [9][]int
+	needs  [9][256]bool
+}
+
+func newDeltaSolver(songSets [9][]int) *deltaSolverState {
+	s := &deltaSolverState{}
+	for i, set := range songSets {
+		if len(set) == 0 {
+			continue
+		}
+		s.sorted[i] = make([]int, len(set))
+		copy(s.sorted[i], set)
+		sort.Ints(s.sorted[i])
+		for _, e := range set {
+			s.needs[i][e+128] = true
+		}
+	}
+	return s
+}
+
+// buildWithLimit returns length only, -1 if exceeds maxLen (for fast rejection)
+func (s *deltaSolverState) buildLen(order []int, maxLen int) int {
+	var arr [512]int8
+	for i := range arr {
+		arr[i] = deltaEmpty
+	}
+	elems := s.sorted[order[0]]
+	for i, e := range elems {
+		arr[i] = int8(e)
+	}
+	arrLen := 32
+	for orderIdx := 1; orderIdx < 9; orderIdx++ {
+		song := order[orderIdx]
+		elems := s.sorted[song]
+		if len(elems) == 0 {
+			continue
+		}
+		needs := &s.needs[song]
+		songSize := len(elems)
+		bestBase, bestCost := arrLen, 32
+		var covCount [256]int8
+		emptySlots := 0
+		for i := 0; i < 32 && i < arrLen; i++ {
+			if arr[i] == deltaEmpty {
+				emptySlots++
+			} else {
+				covCount[int(arr[i])+128]++
+			}
+		}
+		if 32 > arrLen {
+			emptySlots += 32 - arrLen
+		}
+		missing := songSize
+		for i := range covCount {
+			if needs[i] && covCount[i] > 0 {
+				missing--
+			}
+		}
+		if missing <= emptySlots {
+			cost := 32 - arrLen
+			if cost < 0 {
+				cost = 0
+			}
+			if cost < bestCost {
+				bestCost, bestBase = cost, 0
+			}
+		}
+		for base := 1; base <= arrLen; base++ {
+			oldPos, newPos := base-1, base+31
+			if arr[oldPos] == deltaEmpty {
+				emptySlots--
+			} else {
+				idx := int(arr[oldPos]) + 128
+				covCount[idx]--
+				if needs[idx] && covCount[idx] == 0 {
+					missing++
+				}
+			}
+			if newPos < arrLen {
+				if arr[newPos] == deltaEmpty {
+					emptySlots++
+				} else {
+					idx := int(arr[newPos]) + 128
+					if needs[idx] && covCount[idx] == 0 {
+						missing--
+					}
+					covCount[idx]++
+				}
+			} else {
+				emptySlots++
+			}
+			if missing <= emptySlots {
+				cost := base + 32 - arrLen
+				if cost < 0 {
+					cost = 0
+				}
+				if cost < bestCost {
+					bestCost, bestBase = cost, base
+				}
+			}
+		}
+		newLen := bestBase + 32
+		if newLen > arrLen {
+			arrLen = newLen
+		}
+		// Early exit if already too long
+		if arrLen >= maxLen {
+			return -1
+		}
+		var covered [256]bool
+		for i := bestBase; i < bestBase+32; i++ {
+			if arr[i] != deltaEmpty {
+				covered[int(arr[i])+128] = true
+			}
+		}
+		slot := bestBase
+		for _, e := range elems {
+			if !covered[e+128] {
+				for arr[slot] != deltaEmpty {
+					slot++
+				}
+				arr[slot] = int8(e)
+				slot++
+			}
+		}
+	}
+	return arrLen
+}
+
+func (s *deltaSolverState) build(order []int) DeltaTableResult {
+	var arr [512]int8
+	for i := range arr {
+		arr[i] = deltaEmpty
+	}
+	var bases [9]int
+	elems := s.sorted[order[0]]
+	for i, e := range elems {
+		arr[i] = int8(e)
+	}
+	arrLen := 32
+	bases[order[0]] = 0
+	for orderIdx := 1; orderIdx < 9; orderIdx++ {
+		song := order[orderIdx]
+		elems := s.sorted[song]
+		if len(elems) == 0 {
+			continue
+		}
+		needs := &s.needs[song]
+		songSize := len(elems)
+		bestBase, bestCost := arrLen, 32
+		var covCount [256]int8
+		emptySlots := 0
+		for i := 0; i < 32 && i < arrLen; i++ {
+			if arr[i] == deltaEmpty {
+				emptySlots++
+			} else {
+				covCount[int(arr[i])+128]++
+			}
+		}
+		if 32 > arrLen {
+			emptySlots += 32 - arrLen
+		}
+		missing := songSize
+		for i := range covCount {
+			if needs[i] && covCount[i] > 0 {
+				missing--
+			}
+		}
+		if missing <= emptySlots {
+			cost := 32 - arrLen
+			if cost < 0 {
+				cost = 0
+			}
+			if cost < bestCost {
+				bestCost, bestBase = cost, 0
+			}
+		}
+		for base := 1; base <= arrLen; base++ {
+			oldPos, newPos := base-1, base+31
+			if arr[oldPos] == deltaEmpty {
+				emptySlots--
+			} else {
+				idx := int(arr[oldPos]) + 128
+				covCount[idx]--
+				if needs[idx] && covCount[idx] == 0 {
+					missing++
+				}
+			}
+			if newPos < arrLen {
+				if arr[newPos] == deltaEmpty {
+					emptySlots++
+				} else {
+					idx := int(arr[newPos]) + 128
+					if needs[idx] && covCount[idx] == 0 {
+						missing--
+					}
+					covCount[idx]++
+				}
+			} else {
+				emptySlots++
+			}
+			if missing <= emptySlots {
+				cost := base + 32 - arrLen
+				if cost < 0 {
+					cost = 0
+				}
+				if cost < bestCost {
+					bestCost, bestBase = cost, base
+				}
+			}
+		}
+		if bestBase+32 > arrLen {
+			arrLen = bestBase + 32
+		}
+		bases[song] = bestBase
+		var covered [256]bool
+		for i := bestBase; i < bestBase+32; i++ {
+			if arr[i] != deltaEmpty {
+				covered[int(arr[i])+128] = true
+			}
+		}
+		slot := bestBase
+		for _, e := range elems {
+			if !covered[e+128] {
+				for arr[slot] != deltaEmpty {
+					slot++
+				}
+				arr[slot] = int8(e)
+				slot++
+			}
+		}
+	}
+	return DeltaTableResult{Table: append([]int8{}, arr[:arrLen]...), Bases: bases}
+}
+
+// Brute force: try all 8! permutations with given first song
+func (s *deltaSolverState) searchWithFirst(first int, globalBest *int32) DeltaTableResult {
+	var bestResult DeltaTableResult
+	perm := [9]int{}
+	j := 0
+	for i := 0; i < 9; i++ {
+		if i == first {
+			continue
+		}
+		perm[j+1] = i
+		j++
+	}
+	perm[0] = first
+	var c [8]int
+	// First permutation
+	maxLen := int(atomic.LoadInt32(globalBest))
+	l := s.buildLen(perm[:], maxLen)
+	if l > 0 && l < maxLen {
+		bestResult = s.build(perm[:])
+		for {
+			old := atomic.LoadInt32(globalBest)
+			if int32(l) >= old || atomic.CompareAndSwapInt32(globalBest, old, int32(l)) {
+				break
+			}
+		}
+	}
+	i := 0
+	for i < 8 {
+		if c[i] < i {
+			if i&1 == 0 {
+				perm[1], perm[i+1] = perm[i+1], perm[1]
+			} else {
+				perm[c[i]+1], perm[i+1] = perm[i+1], perm[c[i]+1]
+			}
+			maxLen := int(atomic.LoadInt32(globalBest))
+			l := s.buildLen(perm[:], maxLen)
+			if l > 0 && l < maxLen {
+				bestResult = s.build(perm[:])
+				for {
+					old := atomic.LoadInt32(globalBest)
+					if int32(l) >= old || atomic.CompareAndSwapInt32(globalBest, old, int32(l)) {
+						break
+					}
+				}
+			}
+			c[i]++
+			i = 0
+		} else {
+			c[i] = 0
+			i++
+		}
+	}
+	return bestResult
+}
+
+func solveDeltaTable(songSets [9][]int) DeltaTableResult {
+	s := newDeltaSolver(songSets)
+	results := make(chan DeltaTableResult, 9)
+	var globalBest int32 = 9999
+	var wg sync.WaitGroup
+	for first := 0; first < 9; first++ {
+		if len(songSets[first]) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(f int) {
+			defer wg.Done()
+			results <- s.searchWithFirst(f, &globalBest)
+		}(first)
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	bestLen := 9999
+	var bestResult DeltaTableResult
+	for r := range results {
+		if len(r.Table) > 0 && len(r.Table) < bestLen {
+			bestLen = len(r.Table)
+			bestResult = r
+		}
+	}
+	bestResult.SongSets = songSets
+	return bestResult
+}
+
+func writeDeltaTableInc(result DeltaTableResult, path string) error {
+	var buf bytes.Buffer
+	buf.WriteString("; Auto-generated delta table - DO NOT EDIT\n")
+	buf.WriteString(fmt.Sprintf("; %d bytes\n\n", len(result.Table)))
+	buf.WriteString("delta_table:\n")
+	for i := 0; i < len(result.Table); i += 16 {
+		buf.WriteString("\t.byte\t")
+		end := i + 16
+		if end > len(result.Table) {
+			end = len(result.Table)
+		}
+		for j := i; j < end; j++ {
+			v := result.Table[j]
+			if v == deltaEmpty {
+				v = 0
+			}
+			buf.WriteString(fmt.Sprintf("$%02X", byte(v)))
+			if j < end-1 {
+				buf.WriteString(", ")
+			}
+		}
+		buf.WriteString(fmt.Sprintf("\t; %d\n", i))
+	}
+	buf.WriteString("\n; Song delta bases (9 bytes)\n")
+	buf.WriteString("song_delta_bases:\n\t.byte\t")
+	for i := 0; i < 9; i++ {
+		buf.WriteString(fmt.Sprintf("%d", result.Bases[i]))
+		if i < 8 {
+			buf.WriteString(", ")
+		}
+	}
+	buf.WriteString(fmt.Sprintf("\n\nTRACKPTR_START = %d\n\n", result.StartConst))
+	return os.WriteFile(path, buf.Bytes(), 0644)
+}
+
+func verifyDeltaTable(result DeltaTableResult) bool {
+	for songIdx := 0; songIdx < 9; songIdx++ {
+		if len(result.SongSets[songIdx]) == 0 {
+			continue
+		}
+		base := result.Bases[songIdx]
+		found := make(map[int]bool)
+		for i := base; i < base+32 && i < len(result.Table); i++ {
+			if result.Table[i] != deltaEmpty {
+				found[int(result.Table[i])] = true
+			}
+		}
+		for _, e := range result.SongSets[songIdx] {
+			if !found[e] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func init() {
 	projectRoot = findProjectRoot()
 }
@@ -1030,6 +1418,8 @@ type ConversionStats struct {
 	PrimaryIndices      int
 	ExtendedIndices     int
 	ExtendedBeforeEquiv int
+	DeltaSet            []int
+	TrackStarts         [3]byte
 }
 
 func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap map[int]byte, globalWave *GlobalWaveTable, excludeEquiv map[int]bool, instRemap []int, maxUsedSlot int) ([]byte, ConversionStats, error) {
@@ -1702,6 +2092,277 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	patternTruncate = canonTruncate
 	numPatterns = len(patternData)
 
+	// Optimize pattern indices to minimize trackptr deltas (Cuthill-McKee)
+	// Build adjacency graph: patterns that appear consecutively in track sequences
+	adjSet := make(map[[2]int]bool)
+	trackSeqs := [3][]int{}
+	for ch := 0; ch < 3; ch++ {
+		trackSeqs[ch] = make([]int, len(reachableOrders))
+		for newIdx, oldIdx := range reachableOrders {
+			lo := raw[trackLoOff[ch]+oldIdx]
+			hi := raw[trackHiOff[ch]+oldIdx]
+			addr := uint16(lo) | uint16(hi)<<8
+			trackSeqs[ch][newIdx] = int(patternIndex[addr])
+		}
+		for i := 1; i < len(trackSeqs[ch]); i++ {
+			a, b := trackSeqs[ch][i-1], trackSeqs[ch][i]
+			if a > b {
+				a, b = b, a
+			}
+			if a != b {
+				adjSet[[2]int{a, b}] = true
+			}
+		}
+	}
+
+	// Build adjacency lists and compute degrees (deterministic order)
+	degree := make([]int, numPatterns)
+	adj := make([][]int, numPatterns)
+	for i := range adj {
+		adj[i] = []int{}
+	}
+	pairs := make([][2]int, 0, len(adjSet))
+	for pair := range adjSet {
+		pairs = append(pairs, pair)
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i][0] != pairs[j][0] {
+			return pairs[i][0] < pairs[j][0]
+		}
+		return pairs[i][1] < pairs[j][1]
+	})
+	for _, pair := range pairs {
+		a, b := pair[0], pair[1]
+		adj[a] = append(adj[a], b)
+		adj[b] = append(adj[b], a)
+		degree[a]++
+		degree[b]++
+	}
+	for i := range adj {
+		sort.Ints(adj[i])
+	}
+
+	// Fast delta counter for swap optimization (without initial deltas)
+	countDeltasFast := func(mapping []int) int {
+		var seen [256]bool
+		count := 0
+		for ch := 0; ch < 3; ch++ {
+			seq := trackSeqs[ch]
+			for i := 1; i < len(seq); i++ {
+				d := mapping[seq[i]] - mapping[seq[i-1]]
+				if d > 127 {
+					d -= 256
+				} else if d < -128 {
+					d += 256
+				}
+				if !seen[d+128] {
+					seen[d+128] = true
+					count++
+				}
+			}
+		}
+		return count
+	}
+
+	// Full delta counter including initial deltas (for final evaluation)
+	countDeltasFull := func(mapping []int) int {
+		var baseDeltas [256]bool
+		baseCount := 0
+		for ch := 0; ch < 3; ch++ {
+			seq := trackSeqs[ch]
+			for i := 1; i < len(seq); i++ {
+				d := mapping[seq[i]] - mapping[seq[i-1]]
+				if d > 127 {
+					d -= 256
+				} else if d < -128 {
+					d += 256
+				}
+				if !baseDeltas[d+128] {
+					baseDeltas[d+128] = true
+					baseCount++
+				}
+			}
+		}
+		starts := [3]int{}
+		for ch := 0; ch < 3; ch++ {
+			if len(trackSeqs[ch]) > 0 {
+				starts[ch] = mapping[trackSeqs[ch][0]]
+			}
+		}
+		bestNewDeltas := 3
+		for tryConst := 0; tryConst < 256; tryConst++ {
+			newDeltas := 0
+			var initSeen [256]bool
+			for ch := 0; ch < 3; ch++ {
+				d := starts[ch] - tryConst
+				if d > 127 {
+					d -= 256
+				} else if d < -128 {
+					d += 256
+				}
+				if !baseDeltas[d+128] && !initSeen[d+128] {
+					initSeen[d+128] = true
+					newDeltas++
+				}
+			}
+			if newDeltas < bestNewDeltas {
+				bestNewDeltas = newDeltas
+			}
+		}
+		return baseCount + bestNewDeltas
+	}
+	countDeltas := countDeltasFast // Use fast version for swaps
+	_ = countDeltasFull            // Used for candidate evaluation
+
+	// Optimize pattern indices using Cuthill-McKee + swaps
+	optimizeFromStart := func(startNode int) ([]int, int) {
+		visited := make([]bool, numPatterns)
+		cmOrder := make([]int, 0, numPatterns)
+		queue := []int{startNode}
+		visited[startNode] = true
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			cmOrder = append(cmOrder, curr)
+			neighbors := make([]int, len(adj[curr]))
+			copy(neighbors, adj[curr])
+			sort.Slice(neighbors, func(i, j int) bool {
+				if degree[neighbors[i]] != degree[neighbors[j]] {
+					return degree[neighbors[i]] < degree[neighbors[j]]
+				}
+				return neighbors[i] < neighbors[j]
+			})
+			for _, n := range neighbors {
+				if !visited[n] {
+					visited[n] = true
+					queue = append(queue, n)
+				}
+			}
+		}
+		for i := 0; i < numPatterns; i++ {
+			if !visited[i] {
+				cmOrder = append(cmOrder, i)
+			}
+		}
+		mapping := make([]int, numPatterns)
+		for newIdx, oldIdx := range cmOrder {
+			mapping[oldIdx] = newIdx
+		}
+		posToPattern := make([]int, numPatterns)
+		for pat, pos := range mapping {
+			posToPattern[pos] = pat
+		}
+		bestScore := countDeltas(mapping)
+		// Swap all positions
+		for bestScore > 32 {
+			improved := false
+			for i := 0; i < numPatterns; i++ {
+				for j := i + 1; j < numPatterns; j++ {
+					patI, patJ := posToPattern[i], posToPattern[j]
+					mapping[patI], mapping[patJ] = j, i
+					posToPattern[i], posToPattern[j] = patJ, patI
+					if score := countDeltas(mapping); score < bestScore {
+						bestScore = score
+						improved = true
+					} else {
+						mapping[patI], mapping[patJ] = i, j
+						posToPattern[i], posToPattern[j] = patI, patJ
+					}
+				}
+			}
+			if !improved {
+				break
+			}
+		}
+		if bestScore > 32 {
+			for i := 0; i < numPatterns && bestScore > 32; i++ {
+				for j := i + 1; j < numPatterns && bestScore > 32; j++ {
+					for k := j + 1; k < numPatterns && bestScore > 32; k++ {
+						patI, patJ, patK := posToPattern[i], posToPattern[j], posToPattern[k]
+						mapping[patI], mapping[patJ], mapping[patK] = j, k, i
+						posToPattern[i], posToPattern[j], posToPattern[k] = patK, patI, patJ
+						if score := countDeltas(mapping); score < bestScore {
+							bestScore = score
+						} else {
+							mapping[patI], mapping[patJ], mapping[patK] = k, i, j
+							posToPattern[i], posToPattern[j], posToPattern[k] = patJ, patK, patI
+							if score := countDeltas(mapping); score < bestScore {
+								bestScore = score
+							} else {
+								mapping[patI], mapping[patJ], mapping[patK] = i, j, k
+								posToPattern[i], posToPattern[j], posToPattern[k] = patI, patJ, patK
+							}
+						}
+					}
+				}
+			}
+		}
+		return mapping, bestScore
+	}
+
+	// Find nodes with low degree as candidates
+	minDeg := numPatterns + 1
+	for i := 0; i < numPatterns; i++ {
+		if degree[i] > 0 && degree[i] < minDeg {
+			minDeg = degree[i]
+		}
+	}
+	startCandidates := []int{}
+	for deg := minDeg; deg <= minDeg+2 && len(startCandidates) < 24; deg++ {
+		for i := 0; i < numPatterns && len(startCandidates) < 24; i++ {
+			if degree[i] == deg {
+				startCandidates = append(startCandidates, i)
+			}
+		}
+	}
+
+	// Try each candidate in parallel and pick the best
+	type result struct {
+		mapping []int
+		score   int
+		start   int
+	}
+	results := make(chan result, len(startCandidates))
+	for _, startNode := range startCandidates {
+		go func(s int) {
+			m, sc := optimizeFromStart(s)
+			results <- result{m, sc, s}
+		}(startNode)
+	}
+	allResults := make([]result, 0, len(startCandidates))
+	for range startCandidates {
+		allResults = append(allResults, <-results)
+	}
+	// Re-evaluate top candidates with full delta count (including initial deltas)
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].score < allResults[j].score
+	})
+	bestFullScore := 9999
+	bestIdx := 0
+	for i := 0; i < len(allResults) && i < 10; i++ {
+		fullScore := countDeltasFull(allResults[i].mapping)
+		if fullScore < bestFullScore || (fullScore == bestFullScore && allResults[i].start < allResults[bestIdx].start) {
+			bestFullScore = fullScore
+			bestIdx = i
+		}
+	}
+	oldToNewCM := allResults[bestIdx].mapping
+
+	// Apply renumbering to patterns
+	reorderedPatterns := make([][]byte, numPatterns)
+	reorderedTruncate := make([]int, numPatterns)
+	for oldIdx, newIdx := range oldToNewCM {
+		reorderedPatterns[newIdx] = patternData[oldIdx]
+		reorderedTruncate[newIdx] = patternTruncate[oldIdx]
+	}
+	patternData = reorderedPatterns
+	patternTruncate = reorderedTruncate
+
+	// Update patternIndex with new indices
+	for addr := range patternIndex {
+		patternIndex[addr] = byte(oldToNewCM[int(patternIndex[addr])])
+	}
+
 	// Pack patterns with optimized equiv map and gap encoding
 	dict, packed, patOffsets, patGapCodes, primaryCount, extendedCount, extendedBeforeEquiv, individualPacked := packPatternsWithEquiv(patternData, dict, equivMap, patternTruncate)
 
@@ -1957,6 +2618,9 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 			addr := uint16(lo) | uint16(hi)<<8
 			out[dstTrackptrOff[ch]+newIdx] = patternIndex[addr]
 		}
+		if len(reachableOrders) > 0 {
+			stats.TrackStarts[ch] = out[dstTrackptrOff[ch]]
+		}
 	}
 
 	// Write instruments 1-31 (inst 0 not stored, saves 16 bytes)
@@ -2085,6 +2749,31 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 
 	stats.PatternDictSize = len(dict) / 3
 	stats.PatternPackedSize = len(packed)
+
+	// Compute delta set from trackptr values (regular deltas only, initial deltas added later)
+	deltaSet := make(map[int]bool)
+	for ch := 0; ch < 3; ch++ {
+		if len(reachableOrders) == 0 {
+			continue
+		}
+		// Deltas between consecutive trackptr values
+		for i := 1; i < len(reachableOrders); i++ {
+			prev := int(out[dstTrackptrOff[ch]+i-1])
+			curr := int(out[dstTrackptrOff[ch]+i])
+			d := curr - prev
+			if d > 127 {
+				d -= 256
+			} else if d < -128 {
+				d += 256
+			}
+			deltaSet[d] = true
+		}
+	}
+	stats.DeltaSet = make([]int, 0, len(deltaSet))
+	for d := range deltaSet {
+		stats.DeltaSet = append(stats.DeltaSet, d)
+	}
+	sort.Ints(stats.DeltaSet)
 
 	return out, stats, nil
 }
@@ -4677,6 +5366,152 @@ func main() {
 		}
 	}
 	fmt.Printf("Wrote %d parts to %s\n", 9, partsDir)
+
+	// Generate global delta table
+	// First collect regular deltas and track starts
+	var baseDeltaSets [9][]int
+	var trackStarts [9][3]byte
+	for songNum := 1; songNum <= 9; songNum++ {
+		if convertedStats[songNum-1].DeltaSet != nil {
+			baseDeltaSets[songNum-1] = convertedStats[songNum-1].DeltaSet
+		}
+		trackStarts[songNum-1] = convertedStats[songNum-1].TrackStarts
+	}
+
+	// Single constant approach - find best starting constant
+	// Pre-compute base deltas union (without initial deltas)
+	var baseUnion [256]bool
+	for s := 0; s < 9; s++ {
+		for _, d := range baseDeltaSets[s] {
+			baseUnion[byte(d)] = true
+		}
+	}
+
+	// Score each constant by union size (quick filter)
+	type constScore struct {
+		c, union int
+	}
+	scores := make([]constScore, 256)
+	for c := 0; c < 256; c++ {
+		var seen [256]bool
+		copy(seen[:], baseUnion[:])
+		for s := 0; s < 9; s++ {
+			for ch := 0; ch < 3; ch++ {
+				d := int(trackStarts[s][ch]) - c
+				if d > 127 {
+					d -= 256
+				} else if d < -128 {
+					d += 256
+				}
+				seen[byte(d)] = true
+			}
+		}
+		count := 0
+		for _, v := range seen {
+			if v {
+				count++
+			}
+		}
+		scores[c] = constScore{c, count}
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].union < scores[j].union })
+
+	// Try top 10 constants in parallel
+	type constResult struct {
+		c, size int
+	}
+	constResults := make(chan constResult, 10)
+	for i := 0; i < 10; i++ {
+		go func(c int) {
+			var testSets [9][]int
+			for s := 0; s < 9; s++ {
+				var seen [256]bool
+				for _, d := range baseDeltaSets[s] {
+					seen[byte(d)] = true
+				}
+				for ch := 0; ch < 3; ch++ {
+					d := int(trackStarts[s][ch]) - c
+					if d > 127 {
+						d -= 256
+					} else if d < -128 {
+						d += 256
+					}
+					seen[byte(d)] = true
+				}
+				set := make([]int, 0, 35)
+				for d := 0; d < 256; d++ {
+					if seen[d] {
+						if d > 127 {
+							set = append(set, d-256)
+						} else {
+							set = append(set, d)
+						}
+					}
+				}
+				testSets[s] = set
+			}
+			result := solveDeltaTable(testSets)
+			constResults <- constResult{c, len(result.Table)}
+		}(scores[i].c)
+	}
+	bestConst, bestSize := 0, 9999
+	for i := 0; i < 10; i++ {
+		r := <-constResults
+		if r.size < bestSize || (r.size == bestSize && r.c < bestConst) {
+			bestSize, bestConst = r.size, r.c
+		}
+	}
+	fmt.Printf("  Single const %d: %d bytes\n", bestConst, bestSize)
+
+	// Build final delta sets with best constant
+	var allDeltaSets [9][]int
+	for s := 0; s < 9; s++ {
+		var seen [256]bool
+		for _, d := range baseDeltaSets[s] {
+			seen[byte(d)] = true
+		}
+		for ch := 0; ch < 3; ch++ {
+			d := int(trackStarts[s][ch]) - bestConst
+			if d > 127 {
+				d -= 256
+			} else if d < -128 {
+				d += 256
+			}
+			seen[byte(d)] = true
+		}
+		set := make([]int, 0, 35)
+		for d := 0; d < 256; d++ {
+			if seen[d] {
+				if d > 127 {
+					set = append(set, d-256)
+				} else {
+					set = append(set, d)
+				}
+			}
+		}
+		allDeltaSets[s] = set
+		sort.Ints(allDeltaSets[s])
+	}
+
+	// Show delta counts per song and compute union
+	unionDeltas := make(map[int]bool)
+	for _, ds := range allDeltaSets {
+		for _, d := range ds {
+			unionDeltas[d] = true
+		}
+	}
+	fmt.Printf("  Total unique deltas (union): %d\n", len(unionDeltas))
+	deltaResult := solveDeltaTable(allDeltaSets)
+	deltaResult.StartConst = bestConst
+	if !verifyDeltaTable(deltaResult) {
+		fmt.Println("WARNING: Delta table verification failed!")
+	}
+	deltaTablePath := projectPath("generated/delta_table.inc")
+	if err := writeDeltaTableInc(deltaResult, deltaTablePath); err != nil {
+		fmt.Printf("Error writing delta table: %v\n", err)
+	} else {
+		fmt.Printf("Delta table: %d bytes -> %s\n", len(deltaResult.Table), deltaTablePath)
+	}
 
 	// Analyze row dict combinations across all songs
 	var totalCombos [8]int

@@ -1978,26 +1978,20 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 
 
 	// Build new format (packed, exact sizes, all tables deduplicated)
-	// $000: Order bitstream (4 bytes per order: transpose+trackptr packed)
-	//       Layout per order: [ch1_tr:4][ch0_tr:4] [ch0_tp_lo:4][ch2_tr:4] [ch1_tp:5][ch0_tp_hi:1][ch2_tp_lo:2] [unused:5][ch2_tp_hi:3]
-	//       Max 255 orders = 1020 bytes ($3FC)
-	// $3FC to $600: gap (available for pattern data)
-	// $600: Instruments 1-31 (496 bytes, inst 0 not stored)
-	// $7F0: Filtertable (227 bytes max deduped)
-	// $8D3: Arptable (188 bytes max deduped)
-	// $98F: Row dictionary + packed pattern data
-	// Player uses inst_base = $5F0 (actual - 16) so inst N is at $5F0 + N*16
+	// $000: Instruments 1-31 (496 bytes), inst N at (N-1)*16
+	// $1F0: Order bitstream (4 bytes per order, max 255 orders = 1020 bytes, ends at $5EC)
+	// $5EC: Filtertable (227 bytes max)
+	// $6CF: Arptable (188 bytes max)
+	// $78B: Transpose base, $78C: Delta base
+	// $78D: Row dictionary, $BD4: Packed pointers
 
-	bitstreamOff := 0x000
-	maxOrders := 255                    // Max possible orders (order index is 1 byte)
-	bitstreamMaxSize := maxOrders * 4   // 1020 bytes = $3FC
-	bitstreamSize := newNumOrders * 4   // Actual size for this song
-	_ = bitstreamMaxSize                // Used for format documentation
-	newInstOff := 0x600                 // Instruments 1-31 start here (inst 0 not stored)
-	filterOff := 0x7F0     // Filter at $7F0 (227 bytes max)
-	arpOff := 0x8D3        // Arp at $8D3 (188 bytes max)
-	rowDictOff := 0x991    // Row dict0 (notes), dict1 at +365, dict2 at +730 (2 byte gap after arp for bases)
-	packedPtrsOff := 0xDD8 // Packed pointers (fixed location)
+	newInstOff := 0x000
+	bitstreamOff := 0x1F0
+	bitstreamSize := newNumOrders * 4
+	filterOff := 0x5EC
+	arpOff := 0x6CF
+	rowDictOff := 0x78D
+	packedPtrsOff := 0xBD4
 
 	// Extract patterns to slice for packing (do effect/order remapping first)
 	patternData := make([][]byte, numPatterns)
@@ -2441,10 +2435,10 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	stats.ExtendedBeforeEquiv = extendedBeforeEquiv
 
 	// Calculate all available gaps for pattern placement
-	// Gap 0: after used instruments, before filter (unused instrument slots)
+	// Gap 0: after used instruments, before bitstream
 	// With MFU packing, used instruments end at slot maxUsedSlot
 	instGapStart := newInstOff + maxUsedSlot*16
-	instGapSize := filterOff - instGapStart
+	instGapSize := bitstreamOff - instGapStart
 	if instGapSize < 0 {
 		instGapSize = 0
 	}
@@ -2454,9 +2448,9 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	if filterGapSize < 0 {
 		filterGapSize = 0
 	}
-	// Gap 2: after arp, before reserved bytes at 0x98F-0x990 (dict starts at 0x991)
+	// Gap 2: after arp, before reserved bytes at 0x78B-0x78C (dict starts at 0x78D)
 	arpGapStart := arpOff + newArpSize
-	arpGapSize := 0x98F - arpGapStart // Exclude 2 reserved bytes for transpose/delta bases
+	arpGapSize := 0x78B - arpGapStart // Exclude 2 reserved bytes for transpose/delta bases
 	if arpGapSize < 0 {
 		arpGapSize = 0
 	}
@@ -2476,9 +2470,9 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	// Gap 5: free slots in dict2 (params)
 	dict2GapStart := rowDictOff + 730 + dictFreeStart
 
-	// Gap 6: unused space after order bitstream (bitstreamSize to $600)
+	// Gap 6: unused space after order bitstream, before filter ($7F0)
 	bitstreamGapStart := bitstreamOff + bitstreamSize
-	bitstreamGapSize := newInstOff - bitstreamGapStart
+	bitstreamGapSize := filterOff - bitstreamGapStart
 	if bitstreamGapSize < 0 {
 		bitstreamGapSize = 0
 	}
@@ -2794,7 +2788,7 @@ func convertToNewFormat(raw []byte, songNum int, effectRemap [16]byte, fSubRemap
 	// Copy deduplicated tables (wavetable is global in player)
 	copy(out[filterOff:], newFilterTable)
 	copy(out[arpOff:], newArpTable)
-	// Note: reserved bytes at 0x98F-0x990 are filled with transpose/delta bases later
+	// Note: reserved bytes at 0x78B-0x78C are filled with transpose/delta bases later
 
 
 
@@ -5683,9 +5677,9 @@ func main() {
 			continue
 		}
 		stats := &convertedStats[songNum-1]
-		// Set transpose base at 0x98F, delta base at 0x990
-		convertedSongs[songNum-1][0x98F] = byte(transposeResult.Bases[songNum-1])
-		convertedSongs[songNum-1][0x990] = byte(deltaResult.Bases[songNum-1])
+		// Set transpose base at 0x78B, delta base at 0x78C
+		convertedSongs[songNum-1][0x78B] = byte(transposeResult.Bases[songNum-1])
+		convertedSongs[songNum-1][0x78C] = byte(deltaResult.Bases[songNum-1])
 		// Convert absolute trackptr values to relative delta indices (0-31)
 		numOrders := stats.NewOrders
 		deltaMap := songDeltaToRelIdx[songNum-1]
@@ -5717,7 +5711,7 @@ func main() {
 		}
 		// Pack into bitstream at offset 0x000
 		bitstream := packOrderBitstream(numOrders, stats.TempTranspose, stats.TempTrackptr)
-		copy(convertedSongs[songNum-1][0x000:], bitstream)
+		copy(convertedSongs[songNum-1][0x1F0:], bitstream)
 	}
 
 	// Second pass: run tests

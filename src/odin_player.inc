@@ -26,20 +26,14 @@ zp_dict1         = $1E          ; 2 bytes: dict1 (inst|effect bytes)
 zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 
 ; Song format: fixed offsets (all tables deduplicated)
-; $000: Order bitstream (4 bytes per order, max 255 orders = 1020 bytes)
-;       Layout per order: [ch1_tr:4][ch0_tr:4] [ch0_tp_lo:4][ch2_tr:4] [ch1_tp:5][ch0_tp_hi:1][ch2_tp_lo:2] [unused:5][ch2_tp_hi:3]
-;       ch*_tr = transpose relative index (0-15), ch*_tp = trackptr delta index (0-31)
-; $3FC: gap (available for pattern data, up to $600)
-; $600: Instruments 1-31 (496 bytes) - 16 bytes each, inst 0 not stored
-;       Virtual base is $5F0, so inst N is at $5F0 + N*16
-; $7F0: Filtertable (227 bytes max)
-; $8D3: Arptable (188 bytes max)
-; $98F: Transpose base (1 byte) - base index into transpose_table
-; $990: Delta base (1 byte) - base index into delta_table for trackptr decoding
-; $991: Row dict0 (365 bytes) - note bytes
-; $AFE: Row dict1 (365 bytes) - inst|effect bytes
-; $C6B: Row dict2 (365 bytes) - param bytes
-; $DD8: Packed pattern data pointers (dynamic length) - 2 bytes per pattern
+; $000: Instruments 1-31 (496 bytes), inst N at (N-1)*16
+; $1F0: Order bitstream (4 bytes per order, max 255 orders = 1020 bytes, ends at $5EC)
+;       Only 27 bits used per order (5 wasted); could save ~159 bytes with bit packing
+; $5EC: Filtertable (227 bytes max)
+; $6CF: Arptable (188 bytes max)
+; $78B: Transpose base, $78C: Delta base
+; $78D: Row dict0 (365 bytes), $8FA: dict1, $A67: dict2
+; $BD4: Packed pattern data pointers
 ;
 ; Global wavetable (163 bytes) is stored in player, shared across all songs.
 ; Instrument wave indices point directly into global_wavetable.
@@ -75,9 +69,9 @@ zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
 ;   -> effect = (1<<5>>5) | (($00>>4)&8) = 1 | 0 = 1 (arpeggio $49)
 
 ; Pattern packing constants
-ROW_DICT_OFF        = $991
+ROW_DICT_OFF        = $78D
 ROW_DICT_SIZE       = 365
-PACKED_PTRS_OFF     = $DD8          ; Pointers are absolute song-base offsets
+PACKED_PTRS_OFF     = $BD4          ; Pointers are absolute song-base offsets
 
 ; Instrument parameter offsets within 16-byte instrument block
 INST_AD          = 0
@@ -102,26 +96,29 @@ INST_FILTLOOP    = 15
 ; ============================================================================
 player_init:
         stx     zp_song_base+1
-        ; Set up bitstream address (order data at song_base + $000)
-        stx     bitstream_addr+1
-        lda     #0
+        ; Set up bitstream address (order data at song_base + $1F0)
+        txa
+        clc
+        adc     #1
+        sta     bitstream_addr+1
+        lda     #$F0
         sta     bitstream_addr
         ; Mark order decode as invalid (will be decoded on first use)
         lda     #$FF
         sta     decoded_order
         ; Patch table addresses (SMC)
-        txa
-        clc
-        adc     #7                      ; A = base + 7
-        sta     filter_load+2           ; $7F0 high byte
-        lda     #$f0
-        sta     filter_load+1           ; $7F0 low byte
         lda     zp_song_base+1
         clc
-        adc     #8                      ; A = base + 8
-        sta     arp_load_addr+1         ; $8D3 high byte
-        lda     #$d3
-        sta     arp_load_addr           ; $8D3 low byte
+        adc     #5                      ; A = base + 5
+        sta     filter_load+2           ; $5EC high byte
+        lda     #$EC
+        sta     filter_load+1           ; $5EC low byte
+        lda     zp_song_base+1
+        clc
+        adc     #6                      ; A = base + 6
+        sta     arp_load_addr+1         ; $6CF high byte
+        lda     #$CF
+        sta     arp_load_addr           ; $6CF low byte
         lda     #$00
         sta     zp_song_base
         ; Clear player variables
@@ -148,11 +145,9 @@ player_init:
         sta     chn_hardrestart+0
         sta     chn_hardrestart+1
         sta     chn_hardrestart+2
-        ; Initialize inst pointers to instrument 1 (at song_base + $600)
-        ; Inst 0 not stored; virtual base is $5F0 so inst N at $5F0 + N*16
+        ; Initialize inst pointers to instrument 1 (at song_base + $000)
+        ; Inst N is at (N-1)*16
         lda     zp_song_base+1
-        clc
-        adc     #6
         sta     chn_inst_ptr_hi+0
         sta     chn_inst_ptr_hi+1
         sta     chn_inst_ptr_hi+2
@@ -172,17 +167,17 @@ player_init:
         sta     chn_trackptr_cur+0
         sta     chn_trackptr_cur+1
         sta     chn_trackptr_cur+2
-        ; Load transpose base from song data ($98F)
+        ; Load transpose base from song data ($78B)
         lda     zp_song_base+1
         clc
-        adc     #9
+        adc     #7
         sta     zp_ptr+1
-        lda     #$8F
+        lda     #$8B
         sta     zp_ptr
         ldy     #0
         lda     (zp_ptr),y
         sta     transpose_base
-        iny                         ; Y = 1, read from $990
+        iny                         ; Y = 1, read from $78C
         lda     (zp_ptr),y
         sta     delta_base
         jsr     checkpoint
@@ -407,7 +402,7 @@ pattern_ok:
         and     #$1f
         beq     @fcr_checknote
         sta     chn_inst,x
-        ; Inst 0 not stored, so inst N is at $600 + (N-1)*16
+        ; Inst 0 not stored, so inst N is at (N-1)*16
         sec
         sbc     #1                      ; A = inst - 1
         asl
@@ -419,7 +414,6 @@ pattern_ok:
         lda     #0
         rol                             ; A = (inst >= 17) ? 1 : 0
         adc     zp_song_base+1
-        adc     #6                      ; + $600 base
         sta     zp_ptr+1
         sta     chn_inst_ptr_hi,x
         jsr     checkpoint
@@ -673,16 +667,16 @@ fx_haseffect:
         jmp     do_slide_vib
 @fx_5:
         ; Effect 5 = filter trigger (inlined, param pre-shifted *16)
-        ; Inst 0 not stored, virtual base is $5F0
+        ; Inst N at (N-1)*16, param = N*16, so addr = param - 16
         lda     speedcounter
         bne     @fx_exit2
         lda     chn_effectpar,x
         beq     @fx_exit2
-        clc
-        adc     #$F0                    ; + virtual base lo
+        sec
+        sbc     #$10                    ; param - 16
         sta     zp_ptr
         lda     zp_song_base+1
-        adc     #5                      ; + virtual base hi + carry
+        sbc     #0                      ; borrow
         sta     zp_ptr+1
         ldy     #INST_FILTSTART
         lda     (zp_ptr),y
@@ -1163,12 +1157,6 @@ dob_save_x:
         ldx     #0                  ; SMC: restore original X
         rts
 
-; Temp storage for bitstream decoding
-bs_byte0:               .byte   0
-bs_byte1:               .byte   0
-bs_byte2:               .byte   0
-bs_byte3:               .byte   0
-
 ; get_transpose_order - Get transpose for channel Y at order X
 ; Returns: A = transpose value (from transpose_table lookup)
 ; Bitstream stores relative indices (0-15), add base to get absolute
@@ -1533,6 +1521,10 @@ packed_ptrs_addr:       .word   0       ; Address of packed pointers table
 decoded_order:          .byte   $FF     ; Order for which we have decoded data ($FF = invalid)
 decoded_transpose:      .byte   0, 0, 0 ; Decoded transpose indices (0-15) for each channel
 decoded_trackptr_idx:   .byte   0, 0, 0 ; Decoded trackptr delta indices (0-31) for each channel
+bs_byte0:               .byte   0       ; Temp storage for bitstream decoding
+bs_byte1:               .byte   0
+bs_byte2:               .byte   0
+bs_byte3:               .byte   0
 
 ; Pattern decode state (row-by-row streaming)
 chn_decoded_pat:        .byte   $FF, $FF, $FF  ; Pattern index in each channel's decode buffer

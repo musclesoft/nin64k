@@ -62,7 +62,7 @@ $(SID_FILE): $(SID_OBJ) $(SID_CFG)
 
 test:
 	$(MAKE) -C tools/odin_convert
-	cd tools/odin_convert && ./odin_convert
+	cd tools/odin_convert && ./bin/odin_convert
 
 clean:
 	rm -rf build/*.o build/*.prg build/*.sid build/*.bin build/*.inc

@@ -105,6 +105,7 @@ type channelState struct {
 	transpose   int8
 	trackptr    byte // Current pattern index for this order
 	patArp      byte // Pattern arpeggio param (0 = none)
+	permArp     byte // Permanent arpeggio param (0 = none, persists across NOP rows)
 
 	// Instrument state
 	instPtr    int  // Pointer to current instrument data (-1 = no instrument)
@@ -427,9 +428,9 @@ func (vp *VirtualPlayer) playFrame() {
 	vp.dumpRegisters()
 }
 
-var vpDebug = true
-var vpDebugSong = "d5p"
-var vpDebugFrame = 38846 // Set to non-zero to debug around specific frame
+var vpDebug = false
+var vpDebugSong = ""
+var vpDebugFrame = 0
 
 func debugNearFrame(frame int) bool {
 	return vpDebugFrame > 0 && frame >= vpDebugFrame-5 && frame <= vpDebugFrame+5
@@ -448,11 +449,6 @@ func (vp *VirtualPlayer) processRow() {
 		if vpDebug && (vp.currentFrame < 8 || (vp.currentFrame >= 360 && vp.currentFrame <= 420) || (ch == 1 && vp.currentFrame >= 9875 && vp.currentFrame <= 9895) || debugNearFrame(vp.currentFrame)) {
 			fmt.Printf("  [f%d] ch%d row%d: note=%02X inst=%d eff=%d param=%02X raw=%02X %02X %02X order=%d arpIdx=%d\n",
 				vp.currentFrame, ch, vp.row, note, inst, effect, param, row[0], row[1], row[2], vp.order, vp.chn[ch].arpIdx)
-		}
-			// Debug for the d5p failing VP - has instPtr=16 at frame 38846
-		if ch == 1 && vp.currentFrame >= 38700 && vp.currentFrame <= 38850 && vp.speedCounter == 0 && vp.chn[1].instPtr == 16 && vp.songName == "d5p" {
-			fmt.Printf("  [f%d] %s ROW ch1 row%d: note=%02X inst=%d eff=%d param=%02X\n",
-				vp.currentFrame, vp.songName, vp.row, note, inst, effect, param)
 		}
 
 		// Store current row data
@@ -505,6 +501,7 @@ func (vp *VirtualPlayer) processRow() {
 			c.slideDeltaLo = 0
 			c.slideDeltaHi = 0
 			c.slideEnable = 0
+			c.permArp = 0 // Clear permanent arp on new note
 		} else if note == 0x61 { // Key off ($61 = note off)
 			c.gateon = 0xFE
 			if vpDebug && ch == 2 && vp.currentFrame >= 360 && vp.currentFrame <= 420 {
@@ -651,19 +648,6 @@ func (vp *VirtualPlayer) triggerInstrument(ch, inst int) {
 	c := &vp.chn[ch]
 	base := (inst - 1) * 16
 
-	if ch == 1 && vp.currentFrame >= 38700 && vp.currentFrame <= 38850 && vp.songName == "d5p" {
-		arpStart := vp.instData[base+5]
-		arpEnd := vp.instData[base+6]
-		arpLoop := vp.instData[base+7]
-		fmt.Printf("    [f%d %s] ch1 triggerInstrument: inst=%d base=%d arpStart=%d arpEnd=%d arpLoop=%d\n",
-			vp.currentFrame, vp.songName, inst, base, arpStart, arpEnd, arpLoop)
-		fmt.Printf("      arpTable[%d..%d]: ", arpStart, min(int(arpEnd)+2, len(vp.arpTable)-1))
-		for i := int(arpStart); i <= int(arpEnd)+2 && i < len(vp.arpTable); i++ {
-			fmt.Printf("%02X ", vp.arpTable[i])
-		}
-		fmt.Println()
-	}
-
 	c.instPtr = base
 	c.instActive = true
 	c.ad = vp.instData[base+0]
@@ -714,37 +698,16 @@ func (vp *VirtualPlayer) processInstrument(ch int) {
 			vp.currentFrame, c.effect, c.instActive, c.instPtr)
 	}
 
-	if ch == 1 && vp.currentFrame >= 38844 && vp.currentFrame <= 38848 && vp.songName == "d5p" {
-		arpStart := byte(0)
-		arpEnd := byte(0)
-		arpLoop := byte(0)
-		if c.instPtr >= 0 && c.instPtr+8 < len(vp.instData) {
-			arpStart = vp.instData[c.instPtr+5]
-			arpEnd = vp.instData[c.instPtr+6]
-			arpLoop = vp.instData[c.instPtr+7]
-		}
-		fmt.Printf("  [f%d] %s procInst ch1: eff=%d instPtr=%d arpIdx=%d arpRange=%d/%d/%d freq=%04X vibDep=%02X vibPos=%02X\n",
-			vp.currentFrame, vp.songName, c.effect, c.instPtr, c.arpIdx, arpStart, arpEnd, arpLoop, uint16(c.freqHi)<<8|uint16(c.freqLo), c.vibDepth, c.vibPos)
-	}
-
 	// Only process if instrument is active
 	if !c.instActive {
-		// Still need to set finFreq even if not active
 		c.finFreqLo = c.freqLo
 		c.finFreqHi = c.freqHi
-		if ch == 1 && vp.currentFrame == 38846 && vp.songName == "d5p" {
-			fmt.Printf("  [f38846] %s ch1 early return: !instActive\n", vp.songName)
-		}
 		return
 	}
 
 	if c.instPtr < 0 {
-		// Still need to set finFreq
 		c.finFreqLo = c.freqLo
 		c.finFreqHi = c.freqHi
-		if ch == 1 && vp.currentFrame == 38846 && vp.songName == "d5p" {
-			fmt.Printf("  [f38846] %s ch1 early return: instPtr<0\n", vp.songName)
-		}
 		return
 	}
 
@@ -817,19 +780,6 @@ func (vp *VirtualPlayer) processInstrument(ch int) {
 				finalNote = (note - 1) + int(c.transpose)
 			}
 
-			if ch == 1 && vp.currentFrame == 38846 && vp.songName == "d5p" {
-				arpStart := vp.instData[c.instPtr+5]
-				arpEnd := vp.instData[c.instPtr+6]
-				arpLoop := vp.instData[c.instPtr+7]
-				instNum := (c.instPtr / 16) + 1
-				fmt.Printf("    [f38846] %s ch1 freq calc: note=%d arpIdx=%d arpVal=%02X finalNote=%d trans=%d instPtr=%d inst#=%d arpRange=%d/%d/%d\n",
-					vp.songName, note, origArpIdx, origArpVal, finalNote, c.transpose, c.instPtr, instNum, arpStart, arpEnd, arpLoop)
-				fmt.Printf("    [f38846] %s arpTable[0..10]: ", vp.songName)
-				for i := 0; i < 11 && i < len(vp.arpTable); i++ {
-					fmt.Printf("%02X ", vp.arpTable[i])
-				}
-				fmt.Println()
-			}
 
 			if vpDebug && (vp.currentFrame < 6 || (vp.currentFrame >= 25 && vp.currentFrame <= 30) || (vp.currentFrame >= 20249 && vp.currentFrame <= 20261) || (ch == 1 && vp.currentFrame >= 9891 && vp.currentFrame <= 9895) || debugNearFrame(vp.currentFrame)) {
 				arpDbg := "none"
@@ -878,7 +828,8 @@ skipArpFreq:
 
 	// ASM: Effect 1 (pattern arpeggio) runs AFTER instrument arp and OVERWRITES frequency
 	// This ensures arpIdx continues to advance even during pattern arpeggio
-	if c.effect == 1 {
+	// Trigger on effect 1 (regular arp), effect 15 (perm arp), or effect 0 with active permArp
+	if c.effect == 1 || c.effect == 15 || (c.effect == 0 && c.patArp != 0) {
 		note := int(c.playingNote)
 		if note > 0 && note < 0x61 {
 			// Pattern arpeggio: mod3counter 0=low, 1=high, >=2=base
@@ -887,9 +838,9 @@ skipArpFreq:
 			var arpOffset int
 			switch vp.mod3counter {
 			case 0:
-				arpOffset = int(c.param & 0x0F) // Low nibble
+				arpOffset = int(c.patArp & 0x0F) // Low nibble
 			case 1:
-				arpOffset = int(c.param >> 4) // High nibble
+				arpOffset = int(c.patArp >> 4) // High nibble
 			default:
 				arpOffset = 0 // Base note
 			}
@@ -1099,11 +1050,6 @@ skipArpFreq:
 		c.finFreqLo = byte(freq)
 		c.finFreqHi = byte(freq >> 8)
 
-		if ch == 1 && vp.currentFrame >= 38844 && vp.currentFrame <= 38850 && vp.songName == "d5p" {
-			fmt.Printf("    [f%d] %s vib: freqHi=%02X freqLo=%02X vibTbl=%02X vibOff=%04X finFreq=%04X\n",
-				vp.currentFrame, vp.songName, c.freqHi, c.freqLo, vibratoTable[depthRow][pos], vibOffset, freq)
-		}
-
 		// Advance vibrato position
 		c.vibPos += c.vibSpeed
 	}
@@ -1139,7 +1085,11 @@ func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 	switch effect {
 	case 0:
 		// No effect or special param
-		c.patArp = 0 // Clear pattern arpeggio
+		if c.permArp != 0 && param == 0 {
+			c.patArp = c.permArp // Apply permanent arp on NOP rows
+		} else {
+			c.patArp = 0 // Clear pattern arpeggio
+		}
 		if param == 1 {
 			// GT vibrato - disable vibrato
 			c.vibDepth = 0
@@ -1159,7 +1109,8 @@ func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 			}
 		}
 	case 1:
-		// Pattern arpeggio (new effect 1)
+		// Pattern arpeggio (new effect 1) - clears permanent arp
+		c.permArp = 0
 		c.patArp = param
 	case 2:
 		// Portamento (new effect 2) - sliding handled in processInstrument
@@ -1233,6 +1184,11 @@ func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 		if vp.speedCounter == 0 {
 			vp.filterMode = param
 		}
+	case 15:
+		// Permanent arpeggio (new effect F)
+		// Stores param for use on subsequent NOP rows
+		c.permArp = param
+		c.patArp = param
 	}
 }
 
@@ -1465,10 +1421,6 @@ func (vp *VirtualPlayer) dumpRegisters() {
 		if vpDebug && vp.currentFrame < 6 && ch == 1 {
 			fmt.Printf("  [f%d] dump ch%d: freqLo=%02X freqHi=%02X note=%02X playingNote=%02X trans=%d instActive=%v\n",
 				vp.currentFrame, ch, c.freqLo, c.freqHi, c.note, c.playingNote, c.transpose, c.instActive)
-		}
-		if ch == 1 && vp.currentFrame == 38846 && vp.songName == "d5p" {
-			fmt.Printf("  [f38846] %s DUMP ch1: freqLo=%02X freqHi=%02X finFreqLo=%02X finFreqHi=%02X arpIdx=%d playNote=%02X\n",
-				vp.songName, c.freqLo, c.freqHi, c.finFreqLo, c.finFreqHi, c.arpIdx, c.playingNote)
 		}
 		if vpDebug && (vp.currentFrame >= 268 && vp.currentFrame <= 272 || debugNearFrame(vp.currentFrame)) && ch == 0 {
 			fmt.Printf("  [f%d] dump ch0: wave=%02X gateon=%02X result=%02X hrActive=%v waveIdx=%d note=%02X playNote=%02X freqLo=%02X finFreqLo=%02X slideEn=%02X slideLo=%02X slideHi=%02X vibD=%02X\n",

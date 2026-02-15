@@ -345,22 +345,29 @@ func optimizeOverlapForGaps(patterns [][]byte) ([]byte, []uint16) {
 	type result struct {
 		packed  []byte
 		offsets []int
+		seed    int
 	}
 	numTrials := 64
 	results := make(chan result, numTrials)
+	bestSeed := 0
 
 	for w := 0; w < numTrials; w++ {
 		seed := w + 1
-		go func() {
-			packed, offs := greedyOverlapShuffle(uniquePatterns, seed)
-			results <- result{packed, offs}
-		}()
+		go func(s int) {
+			packed, offs := greedyOverlapShuffle(uniquePatterns, s)
+			results <- result{packed, offs, s}
+		}(seed)
 	}
 
-	// Collect results, keep best
+	// Collect results, keep best (use seed as tiebreaker for determinism)
 	for i := 0; i < numTrials; i++ {
 		r := <-results
-		if len(r.packed) < len(bestPacked) {
+		better := len(r.packed) < len(bestPacked)
+		if !better && len(r.packed) == len(bestPacked) && bestSeed > 0 && r.seed < bestSeed {
+			// Same length as current best trial, prefer lower seed
+			better = true
+		}
+		if better {
 			// Validate offsets
 			valid := true
 			for j, pat := range uniquePatterns {
@@ -377,6 +384,7 @@ func optimizeOverlapForGaps(patterns [][]byte) ([]byte, []uint16) {
 			if valid {
 				bestPacked = r.packed
 				bestOffsets = r.offsets
+				bestSeed = r.seed
 			}
 		}
 	}

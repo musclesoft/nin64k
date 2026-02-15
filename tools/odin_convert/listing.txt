@@ -1,0 +1,1796 @@
+ca65 V2.18 - N/A
+Main file   : player_standalone.asm
+Current file: player_standalone.asm
+
+000000r 1               ; ============================================================================
+000000r 1               ; Standalone build of odin_player.inc for testing
+000000r 1               ; Entry points: +$00 init (A=song, X=buffer), +$03 play
+000000r 1               ; ============================================================================
+000000r 1               
+000000r 1               .setcpu "6502"
+000000r 1               
+000000r 1               .segment "CODE"
+000000r 1               
+000000r 1               .include "../../src/odin_player.inc"
+000000r 2               ; ============================================================================
+000000r 2               ; Odin Player - New Format Version for ca65
+000000r 2               ; ============================================================================
+000000r 2               ; Entry points:
+000000r 2               ;   +$00: Init - A=song number (ignored), X=buffer page high byte (e.g. $10, $70)
+000000r 2               ;   +$03: Play - call once per frame
+000000r 2               ;
+000000r 2               ; IMPORTANT: Define 'checkpoint' globally before including this file.
+000000r 2               ; Called frequently. Can trash A and P.
+000000r 2               ; Minimal: checkpoint: rts
+000000r 2               ; ============================================================================
+000000r 2               
+000000r 2               ; Entry point jump table
+000000r 2  4C rr rr             jmp     player_init             ; +$00: Init (A=song, X=buffer)
+000003r 2  4C rr rr             jmp     player_play             ; +$03: Play one frame
+000006r 2               
+000006r 2               ; Zero page usage (contiguous block $10-$21)
+000006r 2               zp_song_base     = $10          ; 2 bytes: base address of current song data
+000006r 2               zp_ptr           = $12          ; 2 bytes: temp pointer / temp values
+000006r 2               zp_trackptr      = $14          ; 2 bytes: track pointer
+000006r 2               zp_dict0         = $16          ; 2 bytes: dict0 (note bytes)
+000006r 2               zp_is_gap_zero   = $18          ; 1 byte: non-zero if current row is gap zero
+000006r 2               zp_temp0         = $1A          ; 2 bytes: temp (decode src / instrument processing)
+000006r 2               zp_temp1         = $1C          ; 2 bytes: temp (decode dst)
+000006r 2               zp_dict1         = $1E          ; 2 bytes: dict1 (inst|effect bytes)
+000006r 2               zp_dict2         = $20          ; 2 bytes: dict2 (param bytes)
+000006r 2               
+000006r 2               ; Song format: fixed offsets (all tables deduplicated)
+000006r 2               ; $000: Instruments 1-31 (496 bytes), inst N at (N-1)*16
+000006r 2               ; $1F0: Order bitstream (4 bytes per order, max 255 orders = 1020 bytes, ends at $5EC)
+000006r 2               ;       Only 27 bits used per order (5 wasted); could save ~159 bytes with bit packing
+000006r 2               ; $5EC: Filtertable (227 bytes max)
+000006r 2               ; $6CF: Arptable (188 bytes max)
+000006r 2               ; $78B: Transpose base, $78C: Delta base
+000006r 2               ; $78D: Row dict0 (400 bytes), $91D: dict1, $AAD: dict2
+000006r 2               ; $C3D: Packed pattern data pointers
+000006r 2               ;
+000006r 2               ; Global wavetable (163 bytes) is stored in player, shared across all songs.
+000006r 2               ; Instrument wave indices point directly into global_wavetable.
+000006r 2               ;
+000006r 2               ; Pattern packing format:
+000006r 2               ;   Row dictionary: 3 bytes per entry [note, inst|effect, param], sorted by frequency
+000006r 2               ;     dict[0] is implicit (always [0,0,0]), not stored - dict starts at index 1
+000006r 2               ;   Packed pointers: 2-byte offset into packed data for each pattern
+000006r 2               ;   Packed data encoding:
+000006r 2               ;     $00-$0F: dict[0] with RLE 0-15 (1 byte encodes 1-16 rows of [0,0,0])
+000006r 2               ;     $10-$EE: dictionary index 1-223 (subtract $0F to get actual index)
+000006r 2               ;     $EF-$FE: RLE repeat previous row 1-16 times
+000006r 2               ;     $FF + byte: extended dictionary index (225 + byte)
+000006r 2               ;   Each pattern decodes to 64 rows × 3 bytes = 192 bytes
+000006r 2               ;
+000006r 2               ; Row format (3 bytes):
+000006r 2               ;   Byte 0 (Note):    e nnn nnnn    e=effect bit 3, n=note value (0-96, $61=off)
+000006r 2               ;   Byte 1 (InstEff): EEE iiiii    E=effect bits 0-2, i=instrument (0-31)
+000006r 2               ;   Byte 2 (Param):   pppp pppp    p=effect parameter
+000006r 2               ;
+000006r 2               ;   Note values: $00=none, $01-$60=note 0-95 (subtract 1), $61=note-off
+000006r 2               ;   Effect = (InstEff >> 5) | ((Note >> 4) & $08)
+000006r 2               ;
+000006r 2               ; Effect mapping (frequency-sorted):
+000006r 2               ;   0=special (param: 0=nop, 1=vib off, 2=break, 3=fineslide)
+000006r 2               ;   1=arp 2=porta 3=speed 4=hrdrest 5=filttrig 6=SR 7=wave
+000006r 2               ;   8=pulse 9=AD A=reso B=slide C=globalvol D=filtmode
+000006r 2               ;
+000006r 2               ; Example: $00 $20 $49
+000006r 2               ;   Note=$00:    note = $00 & $7F = 0 (none), effect bit 3 = 0
+000006r 2               ;   InstEff=$20: inst = 0, effect bits 0-2 = 1
+000006r 2               ;   Param=$49:   parameter = $49
+000006r 2               ;   -> effect = (1<<5>>5) | (($00>>4)&8) = 1 | 0 = 1 (arpeggio $49)
+000006r 2               
+000006r 2               ; Pattern packing constants
+000006r 2               ROW_DICT_OFF        = $78D
+000006r 2               ROW_DICT_SIZE       = 400
+000006r 2               PACKED_PTRS_OFF     = $C3D          ; = $78D + 400*3, pointers are absolute song-base offsets
+000006r 2               
+000006r 2               ; Instrument parameter offsets within 16-byte instrument block
+000006r 2               INST_AD          = 0
+000006r 2               INST_SR          = 1
+000006r 2               INST_WAVESTART   = 2
+000006r 2               INST_WAVEEND     = 3
+000006r 2               INST_WAVELOOP    = 4
+000006r 2               INST_ARPSTART    = 5
+000006r 2               INST_ARPEND      = 6
+000006r 2               INST_ARPLOOP     = 7
+000006r 2               INST_VIBDELAY    = 8
+000006r 2               INST_VIBDEPSP    = 9
+000006r 2               INST_PULSEWIDTH  = 10
+000006r 2               INST_PULSESPEED  = 11
+000006r 2               INST_PULSELIMITS = 12
+000006r 2               INST_FILTSTART   = 13
+000006r 2               INST_FILTEND     = 14
+000006r 2               INST_FILTLOOP    = 15
+000006r 2               
+000006r 2               ; ============================================================================
+000006r 2               ; player_init - A=song number (ignored), X=buffer page high byte
+000006r 2               ; ============================================================================
+000006r 2               player_init:
+000006r 2  86 11                stx     zp_song_base+1
+000008r 2                       ; Set up bitstream address (order data at song_base + $1F0)
+000008r 2  8A                   txa
+000009r 2  18                   clc
+00000Ar 2  69 01                adc     #1
+00000Cr 2  8D rr rr             sta     bitstream_addr+1
+00000Fr 2  A9 F0                lda     #$F0
+000011r 2  8D rr rr             sta     bitstream_addr
+000014r 2                       ; Mark order decode as invalid (will be decoded on first use)
+000014r 2  A9 FF                lda     #$FF
+000016r 2  8D rr rr             sta     decoded_order
+000019r 2                       ; Patch table addresses (SMC)
+000019r 2  A5 11                lda     zp_song_base+1
+00001Br 2  18                   clc
+00001Cr 2  69 05                adc     #5                      ; A = base + 5
+00001Er 2  8D rr rr             sta     filter_load+2           ; $5EC high byte
+000021r 2  A9 EC                lda     #$EC
+000023r 2  8D rr rr             sta     filter_load+1           ; $5EC low byte
+000026r 2  A5 11                lda     zp_song_base+1
+000028r 2  18                   clc
+000029r 2  69 06                adc     #6                      ; A = base + 6
+00002Br 2  8D rr rr             sta     arp_load_addr+1         ; $6CF high byte
+00002Er 2  A9 CF                lda     #$CF
+000030r 2  8D rr rr             sta     arp_load_addr           ; $6CF low byte
+000033r 2  A9 00                lda     #$00
+000035r 2  85 10                sta     zp_song_base
+000037r 2                       ; Clear player variables
+000037r 2               .assert (PLAYERVARSSIZE & 1) = 0, error, "PLAYERVARSSIZE must be even for optimized clearing"
+000037r 2  A0 7D                ldy     #PLAYERVARSSIZE-1
+000039r 2               @clear:
+000039r 2  A9 00                lda     #$00
+00003Br 2  99 rr rr             sta     chn_hardrestart,y
+00003Er 2  88                   dey
+00003Fr 2  99 rr rr             sta     chn_hardrestart,y
+000042r 2  20 rr rr             jsr     checkpoint
+000045r 2  88                   dey
+000046r 2  10 F1                bpl     @clear
+000048r 2               @clear_done:
+000048r 2               
+000048r 2                       ; Initialize playback state (always start at order 0)
+000048r 2  A9 80                lda     #$80
+00004Ar 2  8D rr rr             sta     forcenewpattern
+00004Dr 2                       ; gateon will be set properly on first note trigger
+00004Dr 2  A0 06                ldy     #6
+00004Fr 2  8C rr rr             sty     speed
+000052r 2  88                   dey
+000053r 2  8C rr rr             sty     speedcounter
+000056r 2  A9 02                lda     #2
+000058r 2  8D rr rr             sta     chn_hardrestart+0
+00005Br 2  8D rr rr             sta     chn_hardrestart+1
+00005Er 2  8D rr rr             sta     chn_hardrestart+2
+000061r 2                       ; Initialize inst pointers to instrument 1 (at song_base + $000)
+000061r 2                       ; Inst N is at (N-1)*16
+000061r 2  A5 11                lda     zp_song_base+1
+000063r 2  8D rr rr             sta     chn_inst_ptr_hi+0
+000066r 2  8D rr rr             sta     chn_inst_ptr_hi+1
+000069r 2  8D rr rr             sta     chn_inst_ptr_hi+2
+00006Cr 2  A9 0F                lda     #$0f
+00006Er 2  8D rr rr             sta     globalvolume
+000071r 2                       ; Initialize decode buffer state (mark all as empty)
+000071r 2  A9 FF                lda     #$FF
+000073r 2  8D rr rr             sta     chn_decoded_pat+0
+000076r 2  8D rr rr             sta     chn_decoded_pat+1
+000079r 2  8D rr rr             sta     chn_decoded_pat+2
+00007Cr 2  8D rr rr             sta     chn_decoded_row+0
+00007Fr 2  8D rr rr             sta     chn_decoded_row+1
+000082r 2  8D rr rr             sta     chn_decoded_row+2
+000085r 2                       ; Initialize trackptr accumulators to TRACKPTR_START
+000085r 2                       ; (delta[0] will be added when newpattern runs on first frame)
+000085r 2  A9 15                lda     #TRACKPTR_START
+000087r 2  8D rr rr             sta     chn_trackptr_cur+0
+00008Ar 2  8D rr rr             sta     chn_trackptr_cur+1
+00008Dr 2  8D rr rr             sta     chn_trackptr_cur+2
+000090r 2                       ; Load transpose base from song data ($78B)
+000090r 2  A5 11                lda     zp_song_base+1
+000092r 2  18                   clc
+000093r 2  69 07                adc     #7
+000095r 2  85 13                sta     zp_ptr+1
+000097r 2  A9 8B                lda     #$8B
+000099r 2  85 12                sta     zp_ptr
+00009Br 2  A0 00                ldy     #0
+00009Dr 2  B1 12                lda     (zp_ptr),y
+00009Fr 2  8D rr rr             sta     transpose_base
+0000A2r 2  C8                   iny                         ; Y = 1, read from $78C
+0000A3r 2  B1 12                lda     (zp_ptr),y
+0000A5r 2  8D rr rr             sta     delta_base
+0000A8r 2  20 rr rr             jsr     checkpoint
+0000ABr 2                       ; Set up split dictionary pointers (3 arrays of ROW_DICT_SIZE bytes each)
+0000ABr 2                       ; dict0 (notes) at ROW_DICT_OFF
+0000ABr 2  A5 10                lda     zp_song_base
+0000ADr 2  18                   clc
+0000AEr 2  69 8D                adc     #<ROW_DICT_OFF
+0000B0r 2  85 16                sta     zp_dict0
+0000B2r 2  A5 11                lda     zp_song_base+1
+0000B4r 2  69 07                adc     #>ROW_DICT_OFF
+0000B6r 2  85 17                sta     zp_dict0+1
+0000B8r 2                       ; dict1 (inst|effect) at ROW_DICT_OFF + ROW_DICT_SIZE
+0000B8r 2  A5 16                lda     zp_dict0
+0000BAr 2  18                   clc
+0000BBr 2  69 90                adc     #<ROW_DICT_SIZE
+0000BDr 2  85 1E                sta     zp_dict1
+0000BFr 2  A5 17                lda     zp_dict0+1
+0000C1r 2  69 01                adc     #>ROW_DICT_SIZE
+0000C3r 2  85 1F                sta     zp_dict1+1
+0000C5r 2                       ; dict2 (params) at ROW_DICT_OFF + ROW_DICT_SIZE*2
+0000C5r 2  A5 1E                lda     zp_dict1
+0000C7r 2  18                   clc
+0000C8r 2  69 90                adc     #<ROW_DICT_SIZE
+0000CAr 2  85 20                sta     zp_dict2
+0000CCr 2  A5 1F                lda     zp_dict1+1
+0000CEr 2  69 01                adc     #>ROW_DICT_SIZE
+0000D0r 2  85 21                sta     zp_dict2+1
+0000D2r 2                       ; Set packed_ptrs_addr = song_base + PACKED_PTRS_OFF
+0000D2r 2  A5 10                lda     zp_song_base
+0000D4r 2  18                   clc
+0000D5r 2  69 3D                adc     #<PACKED_PTRS_OFF
+0000D7r 2  8D rr rr             sta     packed_ptrs_addr
+0000DAr 2  A5 11                lda     zp_song_base+1
+0000DCr 2  69 0C                adc     #>PACKED_PTRS_OFF
+0000DEr 2  8D rr rr             sta     packed_ptrs_addr+1
+0000E1r 2  60                   rts
+0000E2r 2               
+0000E2r 2               ; ============================================================================
+0000E2r 2               ; player_play - Play one frame
+0000E2r 2               ; ============================================================================
+0000E2r 2               player_play:
+0000E2r 2  20 rr rr             jsr     checkpoint
+0000E5r 2  CE rr rr             dec     mod3counter
+0000E8r 2  10 05                bpl     @mod3ok
+0000EAr 2  A9 02                lda     #$02
+0000ECr 2  8D rr rr             sta     mod3counter
+0000EFr 2               @mod3ok:
+0000EFr 2  EE rr rr             inc     speedcounter
+0000F2r 2  AD rr rr             lda     speedcounter
+0000F5r 2  CD rr rr             cmp     speed
+0000F8r 2  D0 03                bne     @skip_pattern
+0000FAr 2  4C rr rr             jmp     @pattern_update
+0000FDr 2               @skip_pattern:
+0000FDr 2                       ; Check if we should prefetch (speedcounter == speed-1)
+0000FDr 2                       ; (C already 0 from CMP when A < speed)
+0000FDr 2  69 01                adc     #1
+0000FFr 2  CD rr rr             cmp     speed
+000102r 2  D0 03                bne     @no_prefetch
+000104r 2  4C rr rr             jmp     @do_prefetch
+000107r 2               @no_prefetch:
+000107r 2  4C rr rr             jmp     pp_allframes
+00010Ar 2               @do_prefetch:
+00010Ar 2                       ; Prefetch next row's data
+00010Ar 2                       ; Calculate what next row/order will be
+00010Ar 2  AD rr rr             lda     forcenewpattern
+00010Dr 2  30 0A                bmi     @pf_newpattern
+00010Fr 2  AD rr rr             lda     trackrow
+000112r 2  18                   clc
+000113r 2  69 01                adc     #1
+000115r 2  C9 40                cmp     #$40
+000117r 2  90 07                bcc     @pf_row_ok
+000119r 2               @pf_newpattern:
+000119r 2                       ; Next frame will be new pattern
+000119r 2  AE rr rr             ldx     nextordernumber
+00011Cr 2  A9 00                lda     #0
+00011Er 2  F0 03                beq     @pf_store_row
+000120r 2               @pf_row_ok:
+000120r 2  AE rr rr             ldx     ordernumber
+000123r 2               @pf_store_row:
+000123r 2  8E rr rr             stx     prefetch_order
+000126r 2  8D rr rr             sta     prefetch_row
+000129r 2  8D rr rr             sta     decode_row
+00012Cr 2  A0 00                ldy     #0
+00012Er 2  20 rr rr             jsr     get_transpose_order
+000131r 2  8D rr rr             sta     prefetch_transpose+0
+000134r 2  20 rr rr             jsr     checkpoint
+000137r 2  A0 00                ldy     #0
+000139r 2  20 rr rr             jsr     get_trackptr_order
+00013Cr 2  AE rr rr             ldx     prefetch_order
+00013Fr 2  A0 01                ldy     #1
+000141r 2  20 rr rr             jsr     get_transpose_order
+000144r 2  8D rr rr             sta     prefetch_transpose+1
+000147r 2  20 rr rr             jsr     checkpoint
+00014Ar 2  A0 01                ldy     #1
+00014Cr 2  20 rr rr             jsr     get_trackptr_order
+00014Fr 2  AE rr rr             ldx     prefetch_order
+000152r 2  A0 02                ldy     #2
+000154r 2  20 rr rr             jsr     get_transpose_order
+000157r 2  8D rr rr             sta     prefetch_transpose+2
+00015Ar 2  20 rr rr             jsr     checkpoint
+00015Dr 2  A0 02                ldy     #2
+00015Fr 2  20 rr rr             jsr     get_trackptr_order
+000162r 2  A9 80                lda     #$80
+000164r 2  8D rr rr             sta     prefetch_done
+000167r 2  4C rr rr             jmp     pp_allframes
+00016Ar 2               @pattern_update:
+00016Ar 2  A9 00                lda     #$00
+00016Cr 2  8D rr rr             sta     speedcounter
+00016Fr 2  AD rr rr             lda     forcenewpattern
+000172r 2  30 09                bmi     newpattern
+000174r 2  EE rr rr             inc     trackrow
+000177r 2  AD rr rr             lda     trackrow
+00017Ar 2  0A                   asl     a
+00017Br 2  10 5E                bpl     pattern_ok
+00017Dr 2               newpattern:
+00017Dr 2  AD rr rr             lda     nextordernumber
+000180r 2  8D rr rr             sta     ordernumber
+000183r 2  EE rr rr             inc     nextordernumber
+000186r 2                       ; Clear permarp for all channels on pattern change
+000186r 2  A9 00                lda     #0
+000188r 2  8D rr rr             sta     chn_permarp+0
+00018Br 2  8D rr rr             sta     chn_permarp+1
+00018Er 2  8D rr rr             sta     chn_permarp+2
+000191r 2                       ; Decode bitstream for this order and update trackptr
+000191r 2  AE rr rr             ldx     ordernumber
+000194r 2  20 rr rr             jsr     decode_order_bitstream
+000197r 2  20 rr rr             jsr     checkpoint
+00019Ar 2                       ; Update trackptr: cur += delta_table[delta_base + decoded_trackptr_idx[ch]]
+00019Ar 2  AD rr rr             lda     decoded_trackptr_idx+0
+00019Dr 2  18                   clc
+00019Er 2  6D rr rr             adc     delta_base
+0001A1r 2  AA                   tax
+0001A2r 2  BD rr rr             lda     delta_table,x
+0001A5r 2  18                   clc
+0001A6r 2  6D rr rr             adc     chn_trackptr_cur+0
+0001A9r 2  8D rr rr             sta     chn_trackptr_cur+0
+0001ACr 2  AD rr rr             lda     decoded_trackptr_idx+1
+0001AFr 2  18                   clc
+0001B0r 2  6D rr rr             adc     delta_base
+0001B3r 2  AA                   tax
+0001B4r 2  BD rr rr             lda     delta_table,x
+0001B7r 2  18                   clc
+0001B8r 2  6D rr rr             adc     chn_trackptr_cur+1
+0001BBr 2  8D rr rr             sta     chn_trackptr_cur+1
+0001BEr 2  20 rr rr             jsr     checkpoint
+0001C1r 2  AD rr rr             lda     decoded_trackptr_idx+2
+0001C4r 2  18                   clc
+0001C5r 2  6D rr rr             adc     delta_base
+0001C8r 2  AA                   tax
+0001C9r 2  BD rr rr             lda     delta_table,x
+0001CCr 2  18                   clc
+0001CDr 2  6D rr rr             adc     chn_trackptr_cur+2
+0001D0r 2  8D rr rr             sta     chn_trackptr_cur+2
+0001D3r 2  A9 00                lda     #$00
+0001D5r 2  8D rr rr             sta     trackrow
+0001D8r 2  8D rr rr             sta     forcenewpattern
+0001DBr 2               pattern_ok:
+0001DBr 2  AD rr rr             lda     trackrow
+0001DEr 2  8D rr rr             sta     decode_row
+0001E1r 2                       ; Check if prefetch is valid
+0001E1r 2  AD rr rr             lda     prefetch_done
+0001E4r 2  10 2A                bpl     @no_prefetch_avail
+0001E6r 2  AD rr rr             lda     prefetch_order
+0001E9r 2  CD rr rr             cmp     ordernumber
+0001ECr 2  D0 22                bne     @no_prefetch_avail
+0001EEr 2  AD rr rr             lda     prefetch_row
+0001F1r 2  CD rr rr             cmp     trackrow
+0001F4r 2  D0 1A                bne     @no_prefetch_avail
+0001F6r 2                       ; Prefetch valid - use cached transpose, buffers already decoded
+0001F6r 2  A9 00                lda     #0
+0001F8r 2  8D rr rr             sta     prefetch_done
+0001FBr 2  AD rr rr             lda     prefetch_transpose+0
+0001FEr 2  8D rr rr             sta     chn_transpose+0
+000201r 2  AD rr rr             lda     prefetch_transpose+1
+000204r 2  8D rr rr             sta     chn_transpose+1
+000207r 2  AD rr rr             lda     prefetch_transpose+2
+00020Ar 2  8D rr rr             sta     chn_transpose+2
+00020Dr 2  4C rr rr             jmp     @use_prefetch
+000210r 2               @no_prefetch_avail:
+000210r 2  A9 00                lda     #0
+000212r 2  8D rr rr             sta     prefetch_done
+000215r 2  AE rr rr             ldx     ordernumber
+000218r 2  A0 00                ldy     #0
+00021Ar 2  20 rr rr             jsr     get_transpose_order
+00021Dr 2  8D rr rr             sta     chn_transpose+0
+000220r 2  20 rr rr             jsr     checkpoint
+000223r 2  A0 00                ldy     #0
+000225r 2  20 rr rr             jsr     get_trackptr_order
+000228r 2  AE rr rr             ldx     ordernumber
+00022Br 2  A0 01                ldy     #1
+00022Dr 2  20 rr rr             jsr     get_transpose_order
+000230r 2  8D rr rr             sta     chn_transpose+1
+000233r 2  20 rr rr             jsr     checkpoint
+000236r 2  A0 01                ldy     #1
+000238r 2  20 rr rr             jsr     get_trackptr_order
+00023Br 2  AE rr rr             ldx     ordernumber
+00023Er 2  A0 02                ldy     #2
+000240r 2  20 rr rr             jsr     get_transpose_order
+000243r 2  8D rr rr             sta     chn_transpose+2
+000246r 2  20 rr rr             jsr     checkpoint
+000249r 2  A0 02                ldy     #2
+00024Br 2  20 rr rr             jsr     get_trackptr_order
+00024Er 2               @use_prefetch:
+00024Er 2  20 rr rr             jsr     checkpoint
+000251r 2  A2 02                ldx     #2
+000253r 2               @fetch_channel_rows:
+000253r 2  BD rr rr             lda     decode_buffer_lo,x
+000256r 2  85 14                sta     zp_trackptr
+000258r 2  BD rr rr             lda     decode_buffer_hi,x
+00025Br 2  85 15                sta     zp_trackptr+1
+00025Dr 2               
+00025Dr 2  A0 00                ldy     #0
+00025Fr 2  B1 14                lda     (zp_trackptr),y
+000261r 2  0A                   asl     a
+000262r 2  48                   pha
+000263r 2  C8                   iny
+000264r 2  B1 14                lda     (zp_trackptr),y
+000266r 2  48                   pha
+000267r 2  6A                   ror     a
+000268r 2  29 F0                and     #$f0
+00026Ar 2  9D rr rr             sta     chn_effect,x
+00026Dr 2  C8                   iny
+00026Er 2  B1 14                lda     (zp_trackptr),y
+000270r 2  9D rr rr             sta     chn_effectpar,x
+000273r 2  68                   pla
+000274r 2  29 1F                and     #$1f
+000276r 2  F0 6C                beq     @fcr_checknote
+000278r 2  9D rr rr             sta     chn_inst,x
+00027Br 2                       ; Inst 0 not stored, so inst N is at (N-1)*16
+00027Br 2  38                   sec
+00027Cr 2  E9 01                sbc     #1                      ; A = inst - 1
+00027Er 2  0A                   asl
+00027Fr 2  0A                   asl
+000280r 2  0A                   asl
+000281r 2  0A                   asl                             ; A = (inst-1)*16, C = (inst >= 17)
+000282r 2  85 12                sta     zp_ptr
+000284r 2  9D rr rr             sta     chn_inst_ptr_lo,x
+000287r 2  A9 00                lda     #0
+000289r 2  2A                   rol                             ; A = (inst >= 17) ? 1 : 0
+00028Ar 2  65 11                adc     zp_song_base+1
+00028Cr 2  85 13                sta     zp_ptr+1
+00028Er 2  9D rr rr             sta     chn_inst_ptr_hi,x
+000291r 2  20 rr rr             jsr     checkpoint
+000294r 2  A0 00                ldy     #INST_AD
+000296r 2  B1 12                lda     (zp_ptr),y
+000298r 2  9D rr rr             sta     chn_ad,x
+00029Br 2  C8                   iny
+00029Cr 2  B1 12                lda     (zp_ptr),y
+00029Er 2  9D rr rr             sta     chn_sr,x
+0002A1r 2  C8                   iny
+0002A2r 2  B1 12                lda     (zp_ptr),y
+0002A4r 2  9D rr rr             sta     chn_waveidx,x
+0002A7r 2  A0 05                ldy     #INST_ARPSTART
+0002A9r 2  B1 12                lda     (zp_ptr),y
+0002ABr 2  9D rr rr             sta     chn_arpidx,x
+0002AEr 2  A0 08                ldy     #INST_VIBDELAY
+0002B0r 2  B1 12                lda     (zp_ptr),y
+0002B2r 2  9D rr rr             sta     chn_vibdelay,x
+0002B5r 2  A0 0A                ldy     #INST_PULSEWIDTH
+0002B7r 2  B1 12                lda     (zp_ptr),y
+0002B9r 2  29 F0                and     #$f0
+0002BBr 2  9D rr rr             sta     chn_plswidthlo,x
+0002BEr 2  B1 12                lda     (zp_ptr),y
+0002C0r 2  29 0F                and     #$0f
+0002C2r 2  9D rr rr             sta     chn_plswidthhi,x
+0002C5r 2  C8                   iny
+0002C6r 2  B1 12                lda     (zp_ptr),y
+0002C8r 2  9D rr rr             sta     chn_plsspeed,x
+0002CBr 2  C8                   iny
+0002CCr 2  B1 12                lda     (zp_ptr),y
+0002CEr 2  4A                   lsr     a
+0002CFr 2  4A                   lsr     a
+0002D0r 2  4A                   lsr     a
+0002D1r 2  4A                   lsr     a
+0002D2r 2  9D rr rr             sta     chn_plslimitdown,x
+0002D5r 2  B1 12                lda     (zp_ptr),y
+0002D7r 2  29 0F                and     #$0f
+0002D9r 2  9D rr rr             sta     chn_plslimitup,x
+0002DCr 2  A9 00                lda     #$00
+0002DEr 2  9D rr rr             sta     chn_plsdir,x
+0002E1r 2  9D rr rr             sta     chn_vibpos,x
+0002E4r 2               @fcr_checknote:
+0002E4r 2  20 rr rr             jsr     checkpoint
+0002E7r 2  68                   pla
+0002E8r 2  4A                   lsr     a
+0002E9r 2  F0 4B                beq     @fcr_done
+0002EBr 2  C9 61                cmp     #$61
+0002EDr 2  B0 42                bcs     @fcr_noteoff
+0002EFr 2  E9 00                sbc     #0
+0002F1r 2  9D rr rr             sta     chn_note,x
+0002F4r 2  BC rr rr             ldy     chn_effect,x
+0002F7r 2  C0 20                cpy     #$20
+0002F9r 2  D0 11                bne     @fcr_notporta
+0002FBr 2  18                   clc
+0002FCr 2  7D rr rr             adc     chn_transpose,x
+0002FFr 2  A8                   tay
+000300r 2  B9 rr rr             lda     freqtable_lo,y
+000303r 2  9D rr rr             sta     chn_notefreqlo,x
+000306r 2  B9 rr rr             lda     freqtable_hi,y
+000309r 2  9D rr rr             sta     chn_notefreqhi,x
+00030Cr 2               @fcr_notporta:
+00030Cr 2  BD rr rr             lda     chn_inst_ptr_lo,x
+00030Fr 2  85 12                sta     zp_ptr
+000311r 2  BD rr rr             lda     chn_inst_ptr_hi,x
+000314r 2  85 13                sta     zp_ptr+1
+000316r 2  A0 02                ldy     #INST_WAVESTART
+000318r 2  B1 12                lda     (zp_ptr),y
+00031Ar 2  9D rr rr             sta     chn_waveidx,x
+00031Dr 2  A0 05                ldy     #INST_ARPSTART
+00031Fr 2  B1 12                lda     (zp_ptr),y
+000321r 2  9D rr rr             sta     chn_arpidx,x
+000324r 2  A9 00                lda     #$00
+000326r 2  9D rr rr             sta     chn_slidedelta_lo,x
+000329r 2  9D rr rr             sta     chn_slidedelta_hi,x
+00032Cr 2  9D rr rr             sta     chn_slideenable,x
+00032Fr 2  A9 60                lda     #($ff ^ $fe ^ $61)
+000331r 2               @fcr_noteoff:
+000331r 2  49 9F                eor     #($fe ^ $61)
+000333r 2  9D rr rr             sta     chn_gateon,x
+000336r 2               @fcr_done:
+000336r 2  20 rr rr             jsr     checkpoint
+000339r 2  CA                   dex
+00033Ar 2  30 03                bmi     pp_allframes
+00033Cr 2  4C rr rr             jmp     @fetch_channel_rows
+00033Fr 2               
+00033Fr 2               pp_allframes:
+00033Fr 2  A2 00                ldx     #$00
+000341r 2               pp_chnloop:
+000341r 2  20 rr rr             jsr     checkpoint
+000344r 2  A9 00                lda     #$00
+000346r 2  9D rr rr             sta     chn_vibdepth,x
+000349r 2  BD rr rr             lda     chn_inst,x
+00034Cr 2  D0 03                bne     pi_hasinst
+00034Er 2  4C rr rr             jmp     pi_noinst
+000351r 2               pi_hasinst:
+000351r 2                       ; Inline process_instrument
+000351r 2  BD rr rr             lda     chn_inst_ptr_lo,x
+000354r 2  85 12                sta     zp_ptr
+000356r 2  BD rr rr             lda     chn_inst_ptr_hi,x
+000359r 2  85 13                sta     zp_ptr+1
+00035Br 2  BC rr rr             ldy     chn_waveidx,x
+00035Er 2  B9 rr rr             lda     global_wavetable,y
+000361r 2  9D rr rr             sta     chn_waveform,x
+000364r 2  C8                   iny
+000365r 2  98                   tya
+000366r 2  A0 03                ldy     #INST_WAVEEND
+000368r 2  D1 12                cmp     (zp_ptr),y
+00036Ar 2  90 03                bcc     pi_waveset
+00036Cr 2  C8                   iny                             ; INST_WAVELOOP
+00036Dr 2  B1 12                lda     (zp_ptr),y
+00036Fr 2               pi_waveset:
+00036Fr 2  9D rr rr             sta     chn_waveidx,x
+000372r 2  20 rr rr             jsr     checkpoint
+000375r 2  BD rr rr             lda     chn_effect,x
+000378r 2  C9 20                cmp     #$20
+00037Ar 2  F0 38                beq     pi_skiparp
+00037Cr 2  BC rr rr             ldy     chn_arpidx,x
+00037Fr 2               arp_load_addr = *+1
+00037Fr 2  B9 FF FF             lda     $FFFF,y
+000382r 2  30 07                bmi     pi_arpabs
+000384r 2  18                   clc
+000385r 2  7D rr rr             adc     chn_note,x
+000388r 2  7D rr rr             adc     chn_transpose,x
+00038Br 2               pi_arpabs:
+00038Br 2  29 7F                and     #$7f
+00038Dr 2  85 1A                sta     zp_temp0            ; save note value
+00038Fr 2  BC rr rr             ldy     chn_arpidx,x
+000392r 2  C8                   iny
+000393r 2  98                   tya
+000394r 2  A0 06                ldy     #INST_ARPEND
+000396r 2  D1 12                cmp     (zp_ptr),y
+000398r 2  90 03                bcc     pi_arpset
+00039Ar 2  C8                   iny                             ; INST_ARPLOOP
+00039Br 2  B1 12                lda     (zp_ptr),y
+00039Dr 2               pi_arpset:
+00039Dr 2  9D rr rr             sta     chn_arpidx,x
+0003A0r 2  A4 1A                ldy     zp_temp0            ; restore note value
+0003A2r 2  B9 rr rr             lda     freqtable_lo,y
+0003A5r 2  9D rr rr             sta     chn_notefreqlo,x
+0003A8r 2  9D rr rr             sta     chn_freqlo,x
+0003ABr 2  B9 rr rr             lda     freqtable_hi,y
+0003AEr 2  9D rr rr             sta     chn_notefreqhi,x
+0003B1r 2  9D rr rr             sta     chn_freqhi,x
+0003B4r 2               pi_skiparp:
+0003B4r 2  20 rr rr             jsr     checkpoint
+0003B7r 2  BD rr rr             lda     chn_vibdelay,x
+0003BAr 2  D0 15                bne     pi_vibdelayed
+0003BCr 2  A0 09                ldy     #INST_VIBDEPSP
+0003BEr 2  B1 12                lda     (zp_ptr),y
+0003C0r 2  A8                   tay
+0003C1r 2  29 F0                and     #$f0
+0003C3r 2  9D rr rr             sta     chn_vibdepth,x
+0003C6r 2  F0 0C                beq     pi_pulse
+0003C8r 2  98                   tya
+0003C9r 2  29 0F                and     #$0f
+0003CBr 2  9D rr rr             sta     chn_vibspeed,x
+0003CEr 2  4C rr rr             jmp     pi_pulse
+0003D1r 2               pi_vibdelayed:
+0003D1r 2  DE rr rr             dec     chn_vibdelay,x
+0003D4r 2               pi_pulse:
+0003D4r 2  BD rr rr             lda     chn_plsspeed,x
+0003D7r 2  F0 50                beq     pi_noinst
+0003D9r 2  BD rr rr             lda     chn_plsdir,x
+0003DCr 2  F0 25                beq     pi_pulseup
+0003DEr 2  BD rr rr             lda     chn_plswidthlo,x
+0003E1r 2  38                   sec
+0003E2r 2  FD rr rr             sbc     chn_plsspeed,x
+0003E5r 2  9D rr rr             sta     chn_plswidthlo,x
+0003E8r 2  BD rr rr             lda     chn_plswidthhi,x
+0003EBr 2  E9 00                sbc     #$00
+0003EDr 2  DD rr rr             cmp     chn_plslimitdown,x
+0003F0r 2  10 0B                bpl     pi_pulsestore
+0003F2r 2  A9 00                lda     #$00
+0003F4r 2  9D rr rr             sta     chn_plsdir,x
+0003F7r 2  9D rr rr             sta     chn_plswidthlo,x
+0003FAr 2  BD rr rr             lda     chn_plslimitdown,x
+0003FDr 2               pi_pulsestore:
+0003FDr 2  9D rr rr             sta     chn_plswidthhi,x
+000400r 2  4C rr rr             jmp     pi_noinst
+000403r 2               pi_pulseup:
+000403r 2  BD rr rr             lda     chn_plswidthlo,x
+000406r 2  18                   clc
+000407r 2  7D rr rr             adc     chn_plsspeed,x
+00040Ar 2  9D rr rr             sta     chn_plswidthlo,x
+00040Dr 2  BD rr rr             lda     chn_plswidthhi,x
+000410r 2  69 00                adc     #$00
+000412r 2  DD rr rr             cmp     chn_plslimitup,x
+000415r 2  30 E6                bmi     pi_pulsestore
+000417r 2  F0 E4                beq     pi_pulsestore
+000419r 2  A9 80                lda     #$80
+00041Br 2  9D rr rr             sta     chn_plsdir,x
+00041Er 2  A9 FF                lda     #$ff
+000420r 2  9D rr rr             sta     chn_plswidthlo,x
+000423r 2  BD rr rr             lda     chn_plslimitup,x
+000426r 2  4C rr rr             jmp     pi_pulsestore
+000429r 2               pi_noinst:
+000429r 2  20 rr rr             jsr     checkpoint
+00042Cr 2  BD rr rr             lda     chn_effect,x
+00042Fr 2  D0 4D                bne     fx_haseffect
+000431r 2                       ; Effect 0: special handling based on param
+000431r 2                       ; param 0=nop, 1=vib, 2=break, 3=fineslide
+000431r 2  BD rr rr             lda     chn_effectpar,x
+000434r 2  D0 0F                bne     @effect0_dispatch
+000436r 2                       ; True NOP - check permarp
+000436r 2  BD rr rr             lda     chn_permarp,x
+000439r 2  D0 03                bne     @use_permarp
+00043Br 2  4C rr rr             jmp     do_slide_vib
+00043Er 2               @use_permarp:
+00043Er 2  9D rr rr             sta     chn_effectpar,x         ; copy permarp to effectpar for do_arp
+000441r 2  18                   clc                             ; Clear carry for do_arp (same as effect 1 entry)
+000442r 2  4C rr rr             jmp     do_arp
+000445r 2               @effect0_dispatch:
+000445r 2                       ; Effect 0 with param: 1=vib, 2=break, 3=fineslide
+000445r 2                       ; Any non-NOP clears permarp
+000445r 2  48                   pha
+000446r 2  A9 00                lda     #0
+000448r 2  9D rr rr             sta     chn_permarp,x
+00044Br 2  68                   pla
+00044Cr 2  C9 02                cmp     #2
+00044Er 2  B0 0B                bcs     @effect0_break_or_fineslide
+000450r 2                       ; param 1 = vib: disable vibrato
+000450r 2  A9 00                lda     #0
+000452r 2  9D rr rr             sta     chn_vibdepth,x
+000455r 2  9D rr rr             sta     chn_vibspeed,x
+000458r 2  4C rr rr             jmp     do_slide_vib
+00045Br 2               @effect0_break_or_fineslide:
+00045Br 2  F0 19                beq     @effect0_break
+00045Dr 2                       ; param 3 = fineslide
+00045Dr 2  AD rr rr             lda     speedcounter
+000460r 2  F0 03                beq     @do_fineslide
+000462r 2  4C rr rr             jmp     do_slide_vib
+000465r 2               @do_fineslide:
+000465r 2  BD rr rr             lda     chn_slidedelta_lo,x
+000468r 2  18                   clc
+000469r 2  69 04                adc     #$04
+00046Br 2  9D rr rr             sta     chn_slidedelta_lo,x
+00046Er 2  A9 80                lda     #$80
+000470r 2  9D rr rr             sta     chn_slideenable,x
+000473r 2  4C rr rr             jmp     do_slide_vib
+000476r 2               @effect0_break:
+000476r 2                       ; param 2 = break
+000476r 2  A9 80                lda     #$80
+000478r 2  8D rr rr             sta     forcenewpattern
+00047Br 2  4C rr rr             jmp     do_slide_vib
+00047Er 2               fx_haseffect:
+00047Er 2                       ; Any non-NOP effect clears permarp
+00047Er 2  48                   pha
+00047Fr 2  A9 00                lda     #0
+000481r 2  9D rr rr             sta     chn_permarp,x
+000484r 2  68                   pla
+000485r 2                       ; Binary search dispatch for effects 1-E (14 effects), all inlined
+000485r 2  C9 80                cmp     #$80
+000487r 2  90 03                bcc     @fx_1_to_7
+000489r 2  4C rr rr             jmp     fx_8_to_e
+00048Cr 2               @fx_1_to_7:
+00048Cr 2  C9 40                cmp     #$40
+00048Er 2  90 57                bcc     @fx_1_to_3
+000490r 2                       ; Effects 4-7 (fall through to save JMP)
+000490r 2  C9 60                cmp     #$60
+000492r 2  B0 3D                bcs     @fx_6_7
+000494r 2  C9 50                cmp     #$50
+000496r 2  B0 0E                bcs     @fx_5
+000498r 2                       ; Effect 4 = hard restart (inlined)
+000498r 2  AD rr rr             lda     speedcounter
+00049Br 2  D0 06                bne     @fx_exit2
+00049Dr 2  BD rr rr             lda     chn_effectpar,x
+0004A0r 2  9D rr rr             sta     chn_hardrestart,x
+0004A3r 2               @fx_exit2:
+0004A3r 2  4C rr rr             jmp     do_slide_vib
+0004A6r 2               @fx_5:
+0004A6r 2                       ; Effect 5 = filter trigger (inlined, param pre-shifted *16)
+0004A6r 2                       ; Inst N at (N-1)*16, param = N*16, so addr = param - 16
+0004A6r 2  AD rr rr             lda     speedcounter
+0004A9r 2  D0 F8                bne     @fx_exit2
+0004ABr 2  BD rr rr             lda     chn_effectpar,x
+0004AEr 2  F0 F3                beq     @fx_exit2
+0004B0r 2  38                   sec
+0004B1r 2  E9 10                sbc     #$10                    ; param - 16
+0004B3r 2  85 12                sta     zp_ptr
+0004B5r 2  A5 11                lda     zp_song_base+1
+0004B7r 2  E9 00                sbc     #0                      ; borrow
+0004B9r 2  85 13                sta     zp_ptr+1
+0004BBr 2  A0 0D                ldy     #INST_FILTSTART
+0004BDr 2  B1 12                lda     (zp_ptr),y
+0004BFr 2  8D rr rr             sta     filter_idx
+0004C2r 2  C8                   iny                             ; INST_FILTEND
+0004C3r 2  B1 12                lda     (zp_ptr),y
+0004C5r 2  8D rr rr             sta     filter_end
+0004C8r 2  C8                   iny                             ; INST_FILTLOOP
+0004C9r 2  B1 12                lda     (zp_ptr),y
+0004CBr 2  8D rr rr             sta     filter_loop
+0004CEr 2  4C rr rr             jmp     do_slide_vib
+0004D1r 2               @fx_6_7:
+0004D1r 2  C9 70                cmp     #$70
+0004D3r 2  B0 09                bcs     @fx_7
+0004D5r 2                       ; Effect 6 = set SR (inlined)
+0004D5r 2  BD rr rr             lda     chn_effectpar,x
+0004D8r 2  9D rr rr             sta     chn_sr,x
+0004DBr 2  4C rr rr             jmp     do_slide_vib
+0004DEr 2               @fx_7:
+0004DEr 2                       ; Effect 7 = set waveform (every frame)
+0004DEr 2  BD rr rr             lda     chn_effectpar,x
+0004E1r 2  9D rr rr             sta     chn_waveform,x
+0004E4r 2  4C rr rr             jmp     do_slide_vib
+0004E7r 2               @fx_1_to_3:
+0004E7r 2                       ; Effects 1-3 (most common: arp, porta, speed)
+0004E7r 2  C9 20                cmp     #$20
+0004E9r 2  B0 3B                bcs     fx_2_3
+0004EBr 2                       ; Effect 1 = arpeggio (inlined)
+0004EBr 2               do_arp:
+0004EBr 2  AC rr rr             ldy     mod3counter
+0004EEr 2  F0 15                beq     @arp_val2
+0004F0r 2  88                   dey
+0004F1r 2  D0 0D                bne     @arp_val0
+0004F3r 2  BD rr rr             lda     chn_effectpar,x
+0004F6r 2  4A                   lsr     a
+0004F7r 2  4A                   lsr     a
+0004F8r 2  4A                   lsr     a
+0004F9r 2  4A                   lsr     a
+0004FAr 2  18                   clc
+0004FBr 2  7D rr rr             adc     chn_note,x
+0004FEr 2  90 0D                bcc     @arp_done
+000500r 2               @arp_val0:
+000500r 2  BD rr rr             lda     chn_note,x
+000503r 2  90 08                bcc     @arp_done
+000505r 2               @arp_val2:
+000505r 2  BD rr rr             lda     chn_effectpar,x
+000508r 2  29 0F                and     #$0f
+00050Ar 2  7D rr rr             adc     chn_note,x
+00050Dr 2               @arp_done:
+00050Dr 2  7D rr rr             adc     chn_transpose,x
+000510r 2  A8                   tay
+000511r 2  B9 rr rr             lda     freqtable_lo,y
+000514r 2  9D rr rr             sta     chn_notefreqlo,x
+000517r 2  9D rr rr             sta     chn_freqlo,x
+00051Ar 2  B9 rr rr             lda     freqtable_hi,y
+00051Dr 2  9D rr rr             sta     chn_notefreqhi,x
+000520r 2  9D rr rr             sta     chn_freqhi,x
+000523r 2  4C rr rr             jmp     do_slide_vib
+000526r 2               fx_2_3:
+000526r 2  F0 0E                beq     @fx_2
+000528r 2                       ; Effect 3 = speed (inlined)
+000528r 2  AD rr rr             lda     speedcounter
+00052Br 2  D0 06                bne     @fx_exit1
+00052Dr 2  BD rr rr             lda     chn_effectpar,x
+000530r 2  8D rr rr             sta     speed
+000533r 2               @fx_exit1:
+000533r 2  4C rr rr             jmp     do_slide_vib
+000536r 2               @fx_2:
+000536r 2                       ; Effect 2 = tone portamento (nibbles pre-swapped, freqcmp inlined)
+000536r 2  BD rr rr             lda     chn_effectpar,x ; A = $YX (swapped)
+000539r 2  A8                   tay
+00053Ar 2  29 F0                and     #$F0            ; low byte = $Y0
+00053Cr 2  85 12                sta     zp_ptr
+00053Er 2  98                   tya
+00053Fr 2  29 0F                and     #$0F            ; high byte = $0X
+000541r 2  85 13                sta     zp_ptr+1
+000543r 2                       ; Inline freqcmp #1: determine direction
+000543r 2  BD rr rr             lda     chn_freqhi,x
+000546r 2  DD rr rr             cmp     chn_notefreqhi,x
+000549r 2  D0 06                bne     @porta_cmp1
+00054Br 2  BD rr rr             lda     chn_freqlo,x
+00054Er 2  DD rr rr             cmp     chn_notefreqlo,x
+000551r 2               @porta_cmp1:
+000551r 2  90 1F                bcc     @porta_up
+000553r 2                       ; Porta down
+000553r 2  BD rr rr             lda     chn_freqlo,x
+000556r 2  E5 12                sbc     zp_ptr
+000558r 2  9D rr rr             sta     chn_freqlo,x
+00055Br 2  BD rr rr             lda     chn_freqhi,x
+00055Er 2  E5 13                sbc     zp_ptr+1
+000560r 2  9D rr rr             sta     chn_freqhi,x
+000563r 2                       ; Inline freqcmp #2: check overshoot (down) - A already has freqhi
+000563r 2  DD rr rr             cmp     chn_notefreqhi,x
+000566r 2  D0 06                bne     @porta_cmp2
+000568r 2  BD rr rr             lda     chn_freqlo,x
+00056Br 2  DD rr rr             cmp     chn_notefreqlo,x
+00056Er 2               @porta_cmp2:
+00056Er 2  B0 C3                bcs     @fx_exit1
+000570r 2  90 1D                bcc     @porta_snap
+000572r 2               @porta_up:
+000572r 2  BD rr rr             lda     chn_freqlo,x
+000575r 2  65 12                adc     zp_ptr
+000577r 2  9D rr rr             sta     chn_freqlo,x
+00057Ar 2  BD rr rr             lda     chn_freqhi,x
+00057Dr 2  65 13                adc     zp_ptr+1
+00057Fr 2  9D rr rr             sta     chn_freqhi,x
+000582r 2                       ; Inline freqcmp #3: check overshoot (up) - A already has freqhi
+000582r 2  DD rr rr             cmp     chn_notefreqhi,x
+000585r 2  D0 06                bne     @porta_cmp3
+000587r 2  BD rr rr             lda     chn_freqlo,x
+00058Ar 2  DD rr rr             cmp     chn_notefreqlo,x
+00058Dr 2               @porta_cmp3:
+00058Dr 2  90 A4                bcc     @fx_exit1
+00058Fr 2               @porta_snap:
+00058Fr 2  BD rr rr             lda     chn_notefreqlo,x
+000592r 2  9D rr rr             sta     chn_freqlo,x
+000595r 2  BD rr rr             lda     chn_notefreqhi,x
+000598r 2  9D rr rr             sta     chn_freqhi,x
+00059Br 2  4C rr rr             jmp     do_slide_vib
+00059Er 2               fx_8_to_e:
+00059Er 2  C9 C0                cmp     #$c0
+0005A0r 2  B0 61                bcs     @fx_c_to_e
+0005A2r 2  C9 A0                cmp     #$a0
+0005A4r 2  B0 24                bcs     @fx_a_b
+0005A6r 2  C9 90                cmp     #$90
+0005A8r 2  B0 17                bcs     @fx_9
+0005AAr 2                       ; Effect 8 = pulse width (inlined, hardcoded values)
+0005AAr 2  BD rr rr             lda     chn_effectpar,x
+0005ADr 2  F0 09                beq     @pulse_zero
+0005AFr 2  A9 08                lda     #$08                ; param!=0: hi=$08, lo=$00
+0005B1r 2  9D rr rr             sta     chn_plswidthhi,x
+0005B4r 2  A9 00                lda     #$00
+0005B6r 2  F0 03                beq     @pulse_done
+0005B8r 2               @pulse_zero:
+0005B8r 2  9D rr rr             sta     chn_plswidthhi,x    ; param==0: hi=$00, lo=$00
+0005BBr 2               @pulse_done:
+0005BBr 2  9D rr rr             sta     chn_plswidthlo,x
+0005BEr 2  4C rr rr             jmp     do_slide_vib
+0005C1r 2               @fx_9:
+0005C1r 2                       ; Effect 9 = set AD (inlined)
+0005C1r 2  BD rr rr             lda     chn_effectpar,x
+0005C4r 2  9D rr rr             sta     chn_ad,x
+0005C7r 2  4C rr rr             jmp     do_slide_vib
+0005CAr 2               @fx_a_b:
+0005CAr 2  C9 B0                cmp     #$b0
+0005CCr 2  B0 09                bcs     @fx_b
+0005CEr 2                       ; Effect A = filter resonance (inlined)
+0005CEr 2  BD rr rr             lda     chn_effectpar,x
+0005D1r 2  8D rr rr             sta     filter_resonance
+0005D4r 2  4C rr rr             jmp     do_slide_vib
+0005D7r 2               @fx_b:
+0005D7r 2                       ; Effect B = slide (inlined)
+0005D7r 2  A9 80                lda     #$80
+0005D9r 2  9D rr rr             sta     chn_slideenable,x
+0005DCr 2  BC rr rr             ldy     chn_effectpar,x
+0005DFr 2  F0 11                beq     @slide_up
+0005E1r 2  BD rr rr             lda     chn_slidedelta_lo,x
+0005E4r 2  38                   sec
+0005E5r 2  E9 20                sbc     #$20
+0005E7r 2  9D rr rr             sta     chn_slidedelta_lo,x
+0005EAr 2  B0 03                bcs     @slide_dn_done
+0005ECr 2  DE rr rr             dec     chn_slidedelta_hi,x
+0005EFr 2               @slide_dn_done:
+0005EFr 2  4C rr rr             jmp     do_slide_vib
+0005F2r 2               @slide_up:
+0005F2r 2  BD rr rr             lda     chn_slidedelta_lo,x
+0005F5r 2  18                   clc
+0005F6r 2  69 20                adc     #$20
+0005F8r 2  9D rr rr             sta     chn_slidedelta_lo,x
+0005FBr 2  90 03                bcc     @slide_up_done
+0005FDr 2  FE rr rr             inc     chn_slidedelta_hi,x
+000600r 2               @slide_up_done:
+000600r 2  4C rr rr             jmp     do_slide_vib
+000603r 2               @fx_c_to_e:
+000603r 2  C9 E0                cmp     #$e0
+000605r 2  B0 20                bcs     @fx_e
+000607r 2  C9 D0                cmp     #$d0
+000609r 2  B0 0E                bcs     @fx_d
+00060Br 2                       ; Effect C = global volume (inlined)
+00060Br 2  AD rr rr             lda     speedcounter
+00060Er 2  D0 06                bne     @fx_exit3
+000610r 2  BD rr rr             lda     chn_effectpar,x
+000613r 2  8D rr rr             sta     globalvolume
+000616r 2               @fx_exit3:
+000616r 2  4C rr rr             jmp     do_slide_vib
+000619r 2               @fx_d:
+000619r 2                       ; Effect D = filter mode (inlined, param pre-shifted in data)
+000619r 2  AD rr rr             lda     speedcounter
+00061Cr 2  D0 F8                bne     @fx_exit3
+00061Er 2  BD rr rr             lda     chn_effectpar,x
+000621r 2  8D rr rr             sta     filter_mode
+000624r 2  4C rr rr             jmp     do_slide_vib
+000627r 2               @fx_e:
+000627r 2                       ; Effect E (14) = permanent arpeggio
+000627r 2  BD rr rr             lda     chn_effectpar,x
+00062Ar 2  9D rr rr             sta     chn_permarp,x
+00062Dr 2  18                   clc                             ; Clear carry for do_arp (same as effect 1 entry)
+00062Er 2  4C rr rr             jmp     do_arp
+000631r 2               do_slide_vib:
+000631r 2  20 rr rr             jsr     checkpoint
+000634r 2  BD rr rr             lda     chn_slideenable,x
+000637r 2  F0 13                beq     @noslide
+000639r 2  BD rr rr             lda     chn_freqlo,x
+00063Cr 2  18                   clc
+00063Dr 2  7D rr rr             adc     chn_slidedelta_lo,x
+000640r 2  9D rr rr             sta     chn_freqlo,x
+000643r 2  BD rr rr             lda     chn_freqhi,x
+000646r 2  7D rr rr             adc     chn_slidedelta_hi,x
+000649r 2  9D rr rr             sta     chn_freqhi,x
+00064Cr 2               @noslide:
+00064Cr 2  BD rr rr             lda     chn_vibdepth,x
+00064Fr 2  F0 52                beq     @novib
+000651r 2  BD rr rr             lda     chn_vibpos,x
+000654r 2  29 1F                and     #$1f
+000656r 2  C9 10                cmp     #$10
+000658r 2  90 02                bcc     @vib_haveval
+00065Ar 2  49 1F                eor     #$1f
+00065Cr 2               @vib_haveval:
+00065Cr 2  1D rr rr             ora     chn_vibdepth,x
+00065Fr 2  A8                   tay
+000660r 2  B9 rr rr             lda     vibrato_table-16,y
+000663r 2  0A                   asl     a
+000664r 2  85 12                sta     zp_ptr
+000666r 2  A9 00                lda     #$00
+000668r 2  2A                   rol     a
+000669r 2  85 13                sta     zp_ptr+1
+00066Br 2  BD rr rr             lda     chn_vibpos,x
+00066Er 2  29 20                and     #$20
+000670r 2  D0 14                bne     @vib_add
+000672r 2  BD rr rr             lda     chn_freqlo,x
+000675r 2  38                   sec
+000676r 2  E5 12                sbc     zp_ptr
+000678r 2  9D rr rr             sta     chn_finfreqlo,x
+00067Br 2  BD rr rr             lda     chn_freqhi,x
+00067Er 2  E5 13                sbc     zp_ptr+1
+000680r 2  9D rr rr             sta     chn_finfreqhi,x
+000683r 2  4C rr rr             jmp     @vib_done
+000686r 2               @vib_add:
+000686r 2  BD rr rr             lda     chn_freqlo,x
+000689r 2  65 12                adc     zp_ptr
+00068Br 2  9D rr rr             sta     chn_finfreqlo,x
+00068Er 2  BD rr rr             lda     chn_freqhi,x
+000691r 2  65 13                adc     zp_ptr+1
+000693r 2  9D rr rr             sta     chn_finfreqhi,x
+000696r 2               @vib_done:
+000696r 2  BD rr rr             lda     chn_vibpos,x
+000699r 2  18                   clc
+00069Ar 2  7D rr rr             adc     chn_vibspeed,x
+00069Dr 2  9D rr rr             sta     chn_vibpos,x
+0006A0r 2  4C rr rr             jmp     pp_nextchn
+0006A3r 2               @novib:
+0006A3r 2  BD rr rr             lda     chn_freqlo,x
+0006A6r 2  9D rr rr             sta     chn_finfreqlo,x
+0006A9r 2  BD rr rr             lda     chn_freqhi,x
+0006ACr 2  9D rr rr             sta     chn_finfreqhi,x
+0006AFr 2               pp_nextchn:
+0006AFr 2  E8                   inx
+0006B0r 2  E0 03                cpx     #$03
+0006B2r 2  F0 03                beq     pp_chnloop_done
+0006B4r 2  4C rr rr             jmp     pp_chnloop
+0006B7r 2               pp_chnloop_done:
+0006B7r 2  20 rr rr             jsr     checkpoint
+0006BAr 2  AC rr rr             ldy     filter_idx
+0006BDr 2  F0 12                beq     filtdone
+0006BFr 2               filter_load:
+0006BFr 2  B9 FF FF             lda     $FFFF,y             ; Inline get_filtertable_y (SMC: address patched in init)
+0006C2r 2  8D rr rr             sta     filter_cutoff
+0006C5r 2  C8                   iny
+0006C6r 2  CC rr rr             cpy     filter_end
+0006C9r 2  90 03                bcc     filtok
+0006CBr 2  AC rr rr             ldy     filter_loop
+0006CEr 2               filtok:
+0006CEr 2  8C rr rr             sty     filter_idx
+0006D1r 2               filtdone:
+0006D1r 2               
+0006D1r 2  AC rr rr             ldy     ordernumber
+0006D4r 2  AD rr rr             lda     forcenewpattern
+0006D7r 2  30 09                bmi     @hr_newpat
+0006D9r 2  AE rr rr             ldx     trackrow
+0006DCr 2  E8                   inx
+0006DDr 2  8A                   txa
+0006DEr 2  29 3F                and     #$3f
+0006E0r 2  D0 05                bne     @hr_setpos
+0006E2r 2               @hr_newpat:
+0006E2r 2  A2 00                ldx     #0
+0006E4r 2  AC rr rr             ldy     nextordernumber
+0006E7r 2               @hr_setpos:
+0006E7r 2  8E rr rr             stx     hrtrackrow
+0006EAr 2  8C rr rr             sty     hrordernumber
+0006EDr 2  8A                   txa
+0006EEr 2  8D rr rr             sta     decode_row
+0006F1r 2  AD rr rr             lda     speedcounter
+0006F4r 2  18                   clc
+0006F5r 2  6D rr rr             adc     chn_hardrestart+0
+0006F8r 2  CD rr rr             cmp     speed
+0006FBr 2  90 10                bcc     @hr1
+0006FDr 2  20 rr rr             jsr     checkpoint
+000700r 2  AE rr rr             ldx     hrordernumber
+000703r 2  A0 00                ldy     #0
+000705r 2  20 rr rr             jsr     get_trackptr_order
+000708r 2  A2 00                ldx     #0
+00070Ar 2  20 rr rr             jsr     check_hardrestart
+00070Dr 2               @hr1:
+00070Dr 2  20 rr rr             jsr     checkpoint
+000710r 2  AD rr rr             lda     speedcounter
+000713r 2  18                   clc
+000714r 2  6D rr rr             adc     chn_hardrestart+1
+000717r 2  CD rr rr             cmp     speed
+00071Ar 2  90 10                bcc     @hr2
+00071Cr 2  AE rr rr             ldx     hrordernumber
+00071Fr 2  A0 01                ldy     #1
+000721r 2  20 rr rr             jsr     get_trackptr_order
+000724r 2  20 rr rr             jsr     checkpoint
+000727r 2  A2 01                ldx     #1
+000729r 2  20 rr rr             jsr     check_hardrestart
+00072Cr 2               @hr2:
+00072Cr 2  AD rr rr             lda     speedcounter
+00072Fr 2  18                   clc
+000730r 2  6D rr rr             adc     chn_hardrestart+2
+000733r 2  CD rr rr             cmp     speed
+000736r 2  90 10                bcc     @dump
+000738r 2  20 rr rr             jsr     checkpoint
+00073Br 2  AE rr rr             ldx     hrordernumber
+00073Er 2  A0 02                ldy     #2
+000740r 2  20 rr rr             jsr     get_trackptr_order
+000743r 2  A2 02                ldx     #2
+000745r 2  20 rr rr             jsr     check_hardrestart
+000748r 2               
+000748r 2               @dump:
+000748r 2  A2 00                ldx     #$00
+00074Ar 2               @dumploop:
+00074Ar 2  20 rr rr             jsr     checkpoint
+00074Dr 2  BC rr rr             ldy     sidregoffs,x
+000750r 2  BD rr rr             lda     chn_plswidthlo,x
+000753r 2  99 02 D4             sta     $d402,y
+000756r 2  BD rr rr             lda     chn_plswidthhi,x
+000759r 2  99 03 D4             sta     $d403,y
+00075Cr 2  BD rr rr             lda     chn_finfreqlo,x
+00075Fr 2  99 00 D4             sta     $d400,y
+000762r 2  BD rr rr             lda     chn_finfreqhi,x
+000765r 2  99 01 D4             sta     $d401,y
+000768r 2  BD rr rr             lda     chn_waveform,x
+00076Br 2  3D rr rr             and     chn_gateon,x
+00076Er 2  99 04 D4             sta     $d404,y
+000771r 2  BD rr rr             lda     chn_ad,x
+000774r 2  99 05 D4             sta     $d405,y
+000777r 2  BD rr rr             lda     chn_sr,x
+00077Ar 2  99 06 D4             sta     $d406,y
+00077Dr 2  E8                   inx
+00077Er 2  E0 03                cpx     #$03
+000780r 2  D0 C8                bne     @dumploop
+000782r 2  AD rr rr             lda     filter_cutoff
+000785r 2  8D 16 D4             sta     $d416
+000788r 2  AD rr rr             lda     filter_resonance
+00078Br 2  8D 17 D4             sta     $d417
+00078Er 2  AD rr rr             lda     globalvolume
+000791r 2  0D rr rr             ora     filter_mode
+000794r 2  8D 18 D4             sta     $d418
+000797r 2  4C rr rr             jmp     checkpoint
+00079Ar 2               
+00079Ar 2               ; ============================================================================
+00079Ar 2               ; check_hardrestart - Check if hard restart needed for channel X
+00079Ar 2               ; ============================================================================
+00079Ar 2               check_hardrestart:
+00079Ar 2  A0 00                ldy     #0
+00079Cr 2  B1 14                lda     (zp_trackptr),y
+00079Er 2  29 7F                and     #$7f
+0007A0r 2  F0 1C                beq     @done
+0007A2r 2  C9 61                cmp     #$61
+0007A4r 2  F0 18                beq     @done
+0007A6r 2  B1 14                lda     (zp_trackptr),y
+0007A8r 2  30 09                bmi     @do_hr
+0007AAr 2  C8                   iny
+0007ABr 2  B1 14                lda     (zp_trackptr),y
+0007ADr 2  29 E0                and     #$e0
+0007AFr 2  C9 40                cmp     #$40              ; tone portamento (new effect 2 = bits 0-2 = 2 = 0x40 >> 5)
+0007B1r 2  F0 0B                beq     @done
+0007B3r 2               @do_hr:
+0007B3r 2                       ; Zero waveform, AD, SR for hard restart
+0007B3r 2  A9 00                lda     #$00
+0007B5r 2  9D rr rr             sta     chn_waveform,x
+0007B8r 2  9D rr rr             sta     chn_ad,x
+0007BBr 2  9D rr rr             sta     chn_sr,x
+0007BEr 2               @done:
+0007BEr 2  60                   rts
+0007BFr 2               
+0007BFr 2               ; ============================================================================
+0007BFr 2               ; Data access routines for new format
+0007BFr 2               ; ============================================================================
+0007BFr 2               
+0007BFr 2               ; decode_order_bitstream - Decode bitstream data for order in X
+0007BFr 2               ; Sets decoded_order, decoded_transpose[0-2], decoded_trackptr_idx[0-2]
+0007BFr 2               ; Preserves X
+0007BFr 2               decode_order_bitstream:
+0007BFr 2  EC rr rr             cpx     decoded_order
+0007C2r 2  D0 01                bne     @need_decode
+0007C4r 2  60                   rts
+0007C5r 2               @need_decode:
+0007C5r 2  8E rr rr             stx     decoded_order
+0007C8r 2  8E rr rr             stx     dob_save_x+1        ; SMC: save X for later restore
+0007CBr 2                       ; Calculate zp_ptr = bitstream_addr + order * 4
+0007CBr 2  8A                   txa
+0007CCr 2  0A                   asl     a                   ; A = order * 2, carry into high byte
+0007CDr 2  85 12                sta     zp_ptr              ; temp store low * 2
+0007CFr 2  A9 00                lda     #0
+0007D1r 2  2A                   rol     a                   ; A = high byte so far
+0007D2r 2  85 13                sta     zp_ptr+1
+0007D4r 2  06 12                asl     zp_ptr              ; low * 4
+0007D6r 2  26 13                rol     zp_ptr+1            ; high byte (0, 1, 2, or 3 depending on order)
+0007D8r 2  20 rr rr             jsr     checkpoint
+0007DBr 2  A5 12                lda     zp_ptr
+0007DDr 2  18                   clc
+0007DEr 2  6D rr rr             adc     bitstream_addr
+0007E1r 2  85 12                sta     zp_ptr
+0007E3r 2  A5 13                lda     zp_ptr+1
+0007E5r 2  6D rr rr             adc     bitstream_addr+1
+0007E8r 2  85 13                sta     zp_ptr+1
+0007EAr 2                       ; Read 4 bytes from bitstream
+0007EAr 2  A0 00                ldy     #0
+0007ECr 2  B1 12                lda     (zp_ptr),y
+0007EEr 2  8D rr rr             sta     bs_byte0
+0007F1r 2  C8                   iny
+0007F2r 2  B1 12                lda     (zp_ptr),y
+0007F4r 2  8D rr rr             sta     bs_byte1
+0007F7r 2  C8                   iny
+0007F8r 2  B1 12                lda     (zp_ptr),y
+0007FAr 2  8D rr rr             sta     bs_byte2
+0007FDr 2  C8                   iny
+0007FEr 2  B1 12                lda     (zp_ptr),y
+000800r 2  8D rr rr             sta     bs_byte3
+000803r 2  20 rr rr             jsr     checkpoint
+000806r 2                       ; Extract transpose values (4 bits each)
+000806r 2                       ; ch0_tr = byte0 & $0F
+000806r 2  AD rr rr             lda     bs_byte0
+000809r 2  29 0F                and     #$0F
+00080Br 2  8D rr rr             sta     decoded_transpose+0
+00080Er 2                       ; ch1_tr = byte0 >> 4
+00080Er 2  AD rr rr             lda     bs_byte0
+000811r 2  4A                   lsr     a
+000812r 2  4A                   lsr     a
+000813r 2  4A                   lsr     a
+000814r 2  4A                   lsr     a
+000815r 2  8D rr rr             sta     decoded_transpose+1
+000818r 2                       ; ch2_tr = byte1 & $0F
+000818r 2  AD rr rr             lda     bs_byte1
+00081Br 2  29 0F                and     #$0F
+00081Dr 2  8D rr rr             sta     decoded_transpose+2
+000820r 2  20 rr rr             jsr     checkpoint
+000823r 2                       ; Extract trackptr indices (5 bits each)
+000823r 2                       ; ch0_tp = (byte1 >> 4) | ((byte2 & 1) << 4)
+000823r 2  AD rr rr             lda     bs_byte1
+000826r 2  4A                   lsr     a
+000827r 2  4A                   lsr     a
+000828r 2  4A                   lsr     a
+000829r 2  4A                   lsr     a
+00082Ar 2  8D rr rr             sta     decoded_trackptr_idx+0
+00082Dr 2  AD rr rr             lda     bs_byte2
+000830r 2  29 01                and     #$01
+000832r 2  F0 08                beq     @ch0_tp_done
+000834r 2  AD rr rr             lda     decoded_trackptr_idx+0
+000837r 2  09 10                ora     #$10
+000839r 2  8D rr rr             sta     decoded_trackptr_idx+0
+00083Cr 2               @ch0_tp_done:
+00083Cr 2                       ; ch1_tp = (byte2 >> 1) & $1F
+00083Cr 2  AD rr rr             lda     bs_byte2
+00083Fr 2  4A                   lsr     a
+000840r 2  29 1F                and     #$1F
+000842r 2  8D rr rr             sta     decoded_trackptr_idx+1
+000845r 2  20 rr rr             jsr     checkpoint
+000848r 2                       ; ch2_tp = (byte2 >> 6) | ((byte3 & 7) << 2)
+000848r 2  AD rr rr             lda     bs_byte2
+00084Br 2  4A                   lsr     a
+00084Cr 2  4A                   lsr     a
+00084Dr 2  4A                   lsr     a
+00084Er 2  4A                   lsr     a
+00084Fr 2  4A                   lsr     a
+000850r 2  4A                   lsr     a                   ; bits 6-7 now in bits 0-1
+000851r 2  8D rr rr             sta     decoded_trackptr_idx+2
+000854r 2  AD rr rr             lda     bs_byte3
+000857r 2  29 07                and     #$07
+000859r 2  0A                   asl     a
+00085Ar 2  0A                   asl     a
+00085Br 2  0D rr rr             ora     decoded_trackptr_idx+2
+00085Er 2  8D rr rr             sta     decoded_trackptr_idx+2
+000861r 2               dob_save_x:
+000861r 2  A2 00                ldx     #0                  ; SMC: restore original X
+000863r 2  60                   rts
+000864r 2               
+000864r 2               ; get_transpose_order - Get transpose for channel Y at order X
+000864r 2               ; Returns: A = transpose value (from transpose_table lookup)
+000864r 2               ; Bitstream stores relative indices (0-15), add base to get absolute
+000864r 2               get_transpose_order:
+000864r 2  8C rr rr             sty     gto_save_y+1        ; SMC: save channel
+000867r 2  20 rr rr             jsr     decode_order_bitstream  ; ensure order X is decoded
+00086Ar 2               gto_save_y:
+00086Ar 2  A0 00                ldy     #0                  ; SMC: restored channel
+00086Cr 2  B9 rr rr             lda     decoded_transpose,y ; load relative index (0-15)
+00086Fr 2  18                   clc
+000870r 2  6D rr rr             adc     transpose_base      ; add base to get absolute index
+000873r 2  A8                   tay
+000874r 2  B9 rr rr             lda     transpose_table,y   ; look up actual transpose value
+000877r 2  60                   rts
+000878r 2               
+000878r 2               ; get_trackptr_order - Get pattern index for channel Y at order X
+000878r 2               ; cur holds trackptr for ordernumber; next is computed as cur + delta_table[index]
+000878r 2               get_trackptr_order:
+000878r 2  8C rr rr             sty     gto_channel+1       ; SMC: save channel
+00087Br 2  EC rr rr             cpx     ordernumber
+00087Er 2  F0 18                beq     @use_cur
+000880r 2                       ; X = nextordernumber: decode bitstream and compute cur + delta_table[index]
+000880r 2  20 rr rr             jsr     decode_order_bitstream
+000883r 2  AC rr rr             ldy     gto_channel+1       ; restore Y = channel
+000886r 2  B9 rr rr             lda     decoded_trackptr_idx,y
+000889r 2  18                   clc
+00088Ar 2  6D rr rr             adc     delta_base          ; convert relative to absolute index
+00088Dr 2  AA                   tax
+00088Er 2  BD rr rr             lda     delta_table,x       ; look up actual delta
+000891r 2  18                   clc
+000892r 2  79 rr rr             adc     chn_trackptr_cur,y
+000895r 2  4C rr rr             jmp     gto_have_pattern
+000898r 2               @use_cur:
+000898r 2  B9 rr rr             lda     chn_trackptr_cur,y
+00089Br 2               gto_have_pattern:
+00089Br 2  8D rr rr             sta     chn_trackptr_tmp    ; save pattern index for gto_need_decode
+00089Er 2               gto_channel:
+00089Er 2  A2 00                ldx     #0                  ; SMC: channel
+0008A0r 2                       ; Check if this exact row is already decoded
+0008A0r 2  DD rr rr             cmp     chn_decoded_pat,x
+0008A3r 2  D0 16                bne     gto_need_decode
+0008A5r 2  AD rr rr             lda     decode_row
+0008A8r 2  DD rr rr             cmp     chn_decoded_row,x
+0008ABr 2  D0 03                bne     @not_already_decoded
+0008ADr 2  4C rr rr             jmp     gto_already_decoded
+0008B0r 2               @not_already_decoded:
+0008B0r 2                       ; Same pattern, different row - check if sequential
+0008B0r 2  BD rr rr             lda     chn_decoded_row,x
+0008B3r 2  18                   clc
+0008B4r 2  69 01                adc     #1
+0008B6r 2  CD rr rr             cmp     decode_row
+0008B9r 2  F0 51                beq     gto_advance_one     ; sequential, decode next row
+0008BBr 2               gto_need_decode:
+0008BBr 2                       ; Different pattern or non-sequential - restart from row 0
+0008BBr 2  20 rr rr             jsr     checkpoint
+0008BEr 2  AD rr rr             lda     chn_trackptr_tmp    ; get pattern index saved by get_trackptr_order
+0008C1r 2  9D rr rr             sta     chn_decoded_pat,x
+0008C4r 2                       ; Load gap code from packed pointer bits 13-15
+0008C4r 2  0A                   asl     a                   ; pattern index * 2
+0008C5r 2  A8                   tay
+0008C6r 2  AD rr rr             lda     packed_ptrs_addr
+0008C9r 2  85 1A                sta     zp_temp0
+0008CBr 2  AD rr rr             lda     packed_ptrs_addr+1
+0008CEr 2  85 1B                sta     zp_temp0+1
+0008D0r 2  C8                   iny                         ; point to high byte
+0008D1r 2  B1 1A                lda     (zp_temp0),y        ; ptr hi: bits 0-4=offset, bits 5-7=gap code
+0008D3r 2  4A                   lsr     a
+0008D4r 2  4A                   lsr     a
+0008D5r 2  4A                   lsr     a
+0008D6r 2  4A                   lsr     a
+0008D7r 2  4A                   lsr     a                   ; gap code now in bits 0-2 (0-6)
+0008D8r 2  A8                   tay
+0008D9r 2  B9 rr rr             lda     gap_code_table,y    ; look up gap value
+0008DCr 2  9D rr rr             sta     chn_gap,x
+0008DFr 2                       ; Reset decoder state
+0008DFr 2  A9 00                lda     #0
+0008E1r 2  9D rr rr             sta     chn_src_off,x
+0008E4r 2  9D rr rr             sta     chn_rle_count,x
+0008E7r 2  9D rr rr             sta     chn_gap_remaining,x
+0008EAr 2  9D rr rr             sta     chn_prev_row_0,x
+0008EDr 2  9D rr rr             sta     chn_prev_row_1,x
+0008F0r 2  9D rr rr             sta     chn_prev_row_2,x
+0008F3r 2  A9 FF                lda     #$ff
+0008F5r 2  9D rr rr             sta     chn_decoded_row,x   ; mark as "before row 0"
+0008F8r 2                       ; Skip to target row
+0008F8r 2               gto_skip_loop:
+0008F8r 2  BD rr rr             lda     chn_decoded_row,x
+0008FBr 2  CD rr rr             cmp     decode_row
+0008FEr 2  F0 12                beq     gto_store_to_buffer ; reached target, decode and store
+000900r 2  20 rr rr             jsr     decode_advance_row  ; decode (skip) one row
+000903r 2  20 rr rr             jsr     checkpoint
+000906r 2  FE rr rr             inc     chn_decoded_row,x
+000909r 2  4C rr rr             jmp     gto_skip_loop
+00090Cr 2               gto_advance_one:
+00090Cr 2                       ; Sequential advance - decode one more row
+00090Cr 2  20 rr rr             jsr     decode_advance_row
+00090Fr 2  20 rr rr             jsr     checkpoint
+000912r 2               gto_store_to_buffer:
+000912r 2                       ; Set up decode buffer pointer (common to both paths)
+000912r 2  BD rr rr             lda     decode_buffer_lo,x
+000915r 2  85 1C                sta     zp_temp1
+000917r 2  BD rr rr             lda     decode_buffer_hi,x
+00091Ar 2  85 1D                sta     zp_temp1+1
+00091Cr 2                       ; Check if this is a gap zero (zp_is_gap_zero set by decode_advance_row)
+00091Cr 2  A5 18                lda     zp_is_gap_zero
+00091Er 2  F0 0E                beq     @copy_prev_row
+000920r 2                       ; Gap zero: output zeros (unrolled for speed)
+000920r 2  A9 00                lda     #0
+000922r 2  A0 00                ldy     #0
+000924r 2  91 1C                sta     (zp_temp1),y
+000926r 2  C8                   iny
+000927r 2  91 1C                sta     (zp_temp1),y
+000929r 2  C8                   iny
+00092Ar 2  91 1C                sta     (zp_temp1),y
+00092Cr 2  D0 13                bne     @store_done             ; always taken (Y=2)
+00092Er 2               @copy_prev_row:
+00092Er 2                       ; Normal row: copy prev_row to decode buffer
+00092Er 2  A0 00                ldy     #0
+000930r 2  BD rr rr             lda     chn_prev_row_0,x
+000933r 2  91 1C                sta     (zp_temp1),y
+000935r 2  C8                   iny
+000936r 2  BD rr rr             lda     chn_prev_row_1,x
+000939r 2  91 1C                sta     (zp_temp1),y
+00093Br 2  C8                   iny
+00093Cr 2  BD rr rr             lda     chn_prev_row_2,x
+00093Fr 2  91 1C                sta     (zp_temp1),y
+000941r 2               @store_done:
+000941r 2                       ; Update decoded row
+000941r 2  AD rr rr             lda     decode_row
+000944r 2  9D rr rr             sta     chn_decoded_row,x
+000947r 2               gto_already_decoded:
+000947r 2  20 rr rr             jsr     checkpoint
+00094Ar 2                       ; Set zp_trackptr to channel's decode buffer
+00094Ar 2  BD rr rr             lda     decode_buffer_lo,x
+00094Dr 2  85 14                sta     zp_trackptr
+00094Fr 2  BD rr rr             lda     decode_buffer_hi,x
+000952r 2  85 15                sta     zp_trackptr+1
+000954r 2  60                   rts
+000955r 2               
+000955r 2               ; decode_advance_row - Decode one row, updating prev_row and state
+000955r 2               ; Input: X = channel (chn_decoded_pat,x must contain pattern index)
+000955r 2               ; Updates: chn_src_off, chn_rle_count, chn_gap_remaining, chn_prev_row_*
+000955r 2               decode_advance_row:
+000955r 2  20 rr rr             jsr     checkpoint
+000958r 2                       ; Check for implicit zeros from gap encoding
+000958r 2                       ; Store gap_remaining as flag: non-zero = gap zero, zero = normal row
+000958r 2  BD rr rr             lda     chn_gap_remaining,x
+00095Br 2  85 18                sta     zp_is_gap_zero          ; ZP access saves cycles
+00095Dr 2  F0 04                beq     dar_not_gap
+00095Fr 2                       ; Gap: decrement and return (flag already set to non-zero)
+00095Fr 2  DE rr rr             dec     chn_gap_remaining,x
+000962r 2  60                   rts
+000963r 2               dar_not_gap:
+000963r 2                       ; Check for pending RLE (is_gap_zero already 0)
+000963r 2  BD rr rr             lda     chn_rle_count,x
+000966r 2  F0 0C                beq     dar_not_rle
+000968r 2                       ; RLE: prev_row stays same, just decrement count and set gap
+000968r 2  DE rr rr             dec     chn_rle_count,x
+00096Br 2  BD rr rr             lda     chn_gap,x
+00096Er 2  F0 03                beq     @rle_done
+000970r 2  9D rr rr             sta     chn_gap_remaining,x
+000973r 2               @rle_done:
+000973r 2  60                   rts
+000974r 2               dar_not_rle:
+000974r 2                       ; Set up source pointer from pattern index
+000974r 2                       ; Calculate source: song_base + packed_ptrs[pattern_idx]
+000974r 2  BD rr rr             lda     chn_decoded_pat,x
+000977r 2  0A                   asl     a                   ; pattern index * 2
+000978r 2  A8                   tay
+000979r 2  AD rr rr             lda     packed_ptrs_addr
+00097Cr 2  85 12                sta     zp_ptr
+00097Er 2  AD rr rr             lda     packed_ptrs_addr+1
+000981r 2  85 13                sta     zp_ptr+1
+000983r 2  B1 12                lda     (zp_ptr),y          ; ptr lo (absolute song-base offset)
+000985r 2                       ; (C already 0: ASL of index < 128 never sets carry)
+000985r 2  65 10                adc     zp_song_base
+000987r 2  85 1A                sta     zp_temp0
+000989r 2  C8                   iny
+00098Ar 2  B1 12                lda     (zp_ptr),y          ; ptr hi (gap code in bits 5-7)
+00098Cr 2  29 1F                and     #$1F                ; mask off gap code, keep offset bits 8-12
+00098Er 2  65 11                adc     zp_song_base+1
+000990r 2  85 1B                sta     zp_temp0+1
+000992r 2                       ; Add current source offset
+000992r 2  BD rr rr             lda     chn_src_off,x
+000995r 2                       ; (C already 0: previous ADC of ptr hi + base hi never overflows)
+000995r 2  65 1A                adc     zp_temp0
+000997r 2  85 1A                sta     zp_temp0
+000999r 2  90 02                bcc     @dar_no_carry
+00099Br 2  E6 1B                inc     zp_temp0+1
+00099Dr 2               @dar_no_carry:
+00099Dr 2  20 rr rr             jsr     checkpoint
+0009A0r 2                       ; Read encoded byte
+0009A0r 2                       ; Format: $00-$0F = dict[0]+RLE, $10-$EE = dict[1-223], $EF-$FE = RLE, $FF = extended
+0009A0r 2  A0 00                ldy     #0
+0009A2r 2  B1 1A                lda     (zp_temp0),y
+0009A4r 2  C9 10                cmp     #$10
+0009A6r 2  90 1E                bcc     dar_dict_zero_rle   ; $00-$0F: dict[0] with RLE 0-15
+0009A8r 2  C9 EF                cmp     #$EF
+0009AAr 2  B0 2E                bcs     dar_check_rle       ; $EF-$FF: RLE or extended
+0009ACr 2                       ; $10-$EE: dict[1-223] - subtract $0F to get actual index (fall through)
+0009ACr 2  38                   sec
+0009ADr 2  E9 0F                sbc     #$0F                ; $10->1, $11->2, etc.
+0009AFr 2                       ; Fall through to dar_copy_dict_entry
+0009AFr 2               ; Copy dict entry A to prev_row (primary index 1-224)
+0009AFr 2               ; Split dict format: 3 separate arrays indexed by Y
+0009AFr 2               ; dict[0] is implicit (always 0), so dict[1] is at offset 0
+0009AFr 2               dar_copy_dict_entry:
+0009AFr 2  A8                   tay
+0009B0r 2  88                   dey                         ; Y = index - 1 (dict[1] at offset 0)
+0009B1r 2  B1 16                lda     (zp_dict0),y
+0009B3r 2  9D rr rr             sta     chn_prev_row_0,x
+0009B6r 2  B1 1E                lda     (zp_dict1),y
+0009B8r 2  9D rr rr             sta     chn_prev_row_1,x
+0009BBr 2  B1 20                lda     (zp_dict2),y
+0009BDr 2  9D rr rr             sta     chn_prev_row_2,x
+0009C0r 2  FE rr rr             inc     chn_src_off,x       ; advance past dict index byte
+0009C3r 2  4C rr rr             jmp     dar_set_gap
+0009C6r 2               dar_dict_zero_rle:
+0009C6r 2                       ; $00-$0F: dict[0] with RLE 0-15
+0009C6r 2                       ; A = RLE count (0 = just dict[0], 1 = dict[0] + 1 repeat, etc.)
+0009C6r 2                       ; dict[0] is always [0,0,0], not stored in memory
+0009C6r 2  9D rr rr             sta     chn_rle_count,x     ; store RLE count for subsequent calls
+0009C9r 2  A9 00                lda     #0
+0009CBr 2  9D rr rr             sta     chn_prev_row_0,x
+0009CEr 2  9D rr rr             sta     chn_prev_row_1,x
+0009D1r 2  9D rr rr             sta     chn_prev_row_2,x
+0009D4r 2  FE rr rr             inc     chn_src_off,x       ; advance past the byte
+0009D7r 2  4C rr rr             jmp     dar_set_gap
+0009DAr 2               dar_check_rle:
+0009DAr 2  C9 FF                cmp     #$FF
+0009DCr 2  F0 0C                beq     dar_extended
+0009DEr 2                       ; $EF-$FE: RLE 1-16 (repeat prev row)
+0009DEr 2  38                   sec
+0009DFr 2  E9 EF                sbc     #$EF                ; count-1 = byte - 0xEF (0-15 remaining after this row)
+0009E1r 2  9D rr rr             sta     chn_rle_count,x
+0009E4r 2  FE rr rr             inc     chn_src_off,x       ; advance past RLE byte
+0009E7r 2  4C rr rr             jmp     dar_set_gap         ; prev_row unchanged, but set up gap zeros
+0009EAr 2               dar_extended:
+0009EAr 2                       ; $FF + byte: extended dict index = 224 + next byte
+0009EAr 2                       ; dict[0] implicit, so offset = (224 + byte) - 1 = 223 + byte
+0009EAr 2  FE rr rr             inc     chn_src_off,x       ; skip 0xFF marker
+0009EDr 2  A0 01                ldy     #1
+0009EFr 2  B1 1A                lda     (zp_temp0),y        ; get extended byte
+0009F1r 2  18                   clc
+0009F2r 2  69 DF                adc     #223                ; offset = 223 + byte (dict[224] at offset 223)
+0009F4r 2  8D rr rr             sta     dar_dict_idx
+0009F7r 2  A9 00                lda     #0
+0009F9r 2  2A                   rol                         ; index hi = carry
+0009FAr 2  8D rr rr             sta     dar_dict_idx_hi
+0009FDr 2  4C rr rr             jmp     dar_copy_dict_entry_16
+000A00r 2               
+000A00r 2               ; Copy dict entry for extended index (offset 224 + byte, dict indices 225-409)
+000A00r 2               dar_copy_dict_entry_16:
+000A00r 2  AC rr rr             ldy     dar_dict_idx        ; Y = index_lo
+000A03r 2  AD rr rr             lda     dar_dict_idx_hi
+000A06r 2  F0 21                beq     dar_ext_direct      ; index < 256, use Y directly
+000A08r 2                       ; index >= 256: increment dict high bytes temporarily
+000A08r 2  E6 17                inc     zp_dict0+1
+000A0Ar 2  E6 1F                inc     zp_dict1+1
+000A0Cr 2  E6 21                inc     zp_dict2+1
+000A0Er 2  B1 16                lda     (zp_dict0),y
+000A10r 2  9D rr rr             sta     chn_prev_row_0,x
+000A13r 2  B1 1E                lda     (zp_dict1),y
+000A15r 2  9D rr rr             sta     chn_prev_row_1,x
+000A18r 2  B1 20                lda     (zp_dict2),y
+000A1Ar 2  9D rr rr             sta     chn_prev_row_2,x
+000A1Dr 2                       ; Restore dict pointers
+000A1Dr 2  C6 17                dec     zp_dict0+1
+000A1Fr 2  C6 1F                dec     zp_dict1+1
+000A21r 2  C6 21                dec     zp_dict2+1
+000A23r 2  FE rr rr             inc     chn_src_off,x       ; advance past extended byte
+000A26r 2  4C rr rr             jmp     dar_set_gap
+000A29r 2               dar_ext_direct:
+000A29r 2  B1 16                lda     (zp_dict0),y
+000A2Br 2  9D rr rr             sta     chn_prev_row_0,x
+000A2Er 2  B1 1E                lda     (zp_dict1),y
+000A30r 2  9D rr rr             sta     chn_prev_row_1,x
+000A33r 2  B1 20                lda     (zp_dict2),y
+000A35r 2  9D rr rr             sta     chn_prev_row_2,x
+000A38r 2  FE rr rr             inc     chn_src_off,x       ; advance past extended byte
+000A3Br 2                       ; Fall through to dar_set_gap
+000A3Br 2               dar_set_gap:
+000A3Br 2                       ; Set up implicit zeros after this row (gap encoding)
+000A3Br 2  BD rr rr             lda     chn_gap,x
+000A3Er 2  F0 03                beq     @skip               ; gap=0: skip sta (gap_remaining already 0)
+000A40r 2  9D rr rr             sta     chn_gap_remaining,x
+000A43r 2  60           @skip:  rts
+000A44r 2               
+000A44r 2               ; ============================================================================
+000A44r 2               ; Data Section (player variables initialized to zero serve as boundary marker)
+000A44r 2               ; ============================================================================
+000A44r 2               
+000A44r 2               ; Player Variables (zero-initialized - forms natural code/data boundary)
+000A44r 2  00 00 00     chn_hardrestart:        .byte   0, 0, 0
+000A47r 2  00 00 00     chn_gateon:             .byte   0, 0, 0
+000A4Ar 2  00 00 00     chn_slideenable:        .byte   0, 0, 0
+000A4Dr 2  00 00 00     chn_plsdir:             .byte   0, 0, 0
+000A50r 2  00 00 00     chn_transpose:          .byte   0, 0, 0
+000A53r 2  00 00 00     chn_note:               .byte   0, 0, 0
+000A56r 2  00 00 00     chn_inst:               .byte   0, 0, 0
+000A59r 2  00 00 00     chn_inst_ptr_lo:        .byte   0, 0, 0
+000A5Cr 2  00 00 00     chn_inst_ptr_hi:        .byte   0, 0, 0
+000A5Fr 2  00 00 00     chn_effect:             .byte   0, 0, 0
+000A62r 2  00 00 00     chn_effectpar:          .byte   0, 0, 0
+000A65r 2  00 00 00     chn_permarp:            .byte   0, 0, 0         ; Permanent arp value (persists until cleared)
+000A68r 2  00           chn_pad:                .byte   0               ; Padding for even PLAYERVARSSIZE
+000A69r 2  00 00 00     chn_waveform:           .byte   0, 0, 0
+000A6Cr 2  00 00 00     chn_ad:                 .byte   0, 0, 0
+000A6Fr 2  00 00 00     chn_sr:                 .byte   0, 0, 0
+000A72r 2  00 00 00     chn_plswidthlo:         .byte   0, 0, 0
+000A75r 2  00 00 00     chn_plswidthhi:         .byte   0, 0, 0
+000A78r 2  00 00 00     chn_plsspeed:           .byte   0, 0, 0
+000A7Br 2  00 00 00     chn_plslimitdown:       .byte   0, 0, 0
+000A7Er 2  00 00 00     chn_plslimitup:         .byte   0, 0, 0
+000A81r 2  00 00 00     chn_vibdelay:           .byte   0, 0, 0
+000A84r 2  00 00 00     chn_vibdepth:           .byte   0, 0, 0
+000A87r 2  00 00 00     chn_vibspeed:           .byte   0, 0, 0
+000A8Ar 2  00 00 00     chn_waveidx:            .byte   0, 0, 0
+000A8Dr 2  00 00 00     chn_arpidx:             .byte   0, 0, 0
+000A90r 2  00 00 00     chn_notefreqlo:         .byte   0, 0, 0
+000A93r 2  00 00 00     chn_notefreqhi:         .byte   0, 0, 0
+000A96r 2  00 00 00     chn_freqlo:             .byte   0, 0, 0
+000A99r 2  00 00 00     chn_freqhi:             .byte   0, 0, 0
+000A9Cr 2  00 00 00     chn_finfreqlo:          .byte   0, 0, 0
+000A9Fr 2  00 00 00     chn_finfreqhi:          .byte   0, 0, 0
+000AA2r 2  00 00 00     chn_vibpos:             .byte   0, 0, 0
+000AA5r 2  00 00 00     chn_slidedelta_lo:      .byte   0, 0, 0
+000AA8r 2  00 00 00     chn_slidedelta_hi:      .byte   0, 0, 0
+000AABr 2  00           filter_idx:             .byte   0
+000AACr 2  00           filter_end:             .byte   0
+000AADr 2  00           filter_loop:            .byte   0
+000AAEr 2  00           filter_cutoff:          .byte   0
+000AAFr 2  00           filter_resonance:       .byte   0
+000AB0r 2  00           filter_mode:            .byte   0
+000AB1r 2  00           globalvolume:           .byte   0
+000AB2r 2  00           mod3counter:            .byte   0
+000AB3r 2  00           speed:                  .byte   0
+000AB4r 2  00           speedcounter:           .byte   0
+000AB5r 2  00           trackrow:               .byte   0
+000AB6r 2  00           hrtrackrow:             .byte   0
+000AB7r 2  00           decode_row:             .byte   0       ; current row for pattern decode
+000AB8r 2  00           ordernumber:            .byte   0
+000AB9r 2  00           nextordernumber:        .byte   0
+000ABAr 2  00           hrordernumber:          .byte   0
+000ABBr 2  00           forcenewpattern:        .byte   0
+000ABCr 2  00           prefetch_done:          .byte   0       ; $80 = prefetch valid
+000ABDr 2  00           prefetch_order:         .byte   0       ; order position used for prefetch
+000ABEr 2  00           prefetch_row:           .byte   0       ; row used for prefetch
+000ABFr 2  00 00 00     prefetch_transpose:     .byte   0, 0, 0 ; cached transpose values
+000AC2r 2               
+000AC2r 2               PLAYERVARSSIZE = * - chn_hardrestart
+000AC2r 2               
+000AC2r 2               ; Trackptr delta decoding state
+000AC2r 2  00 00 00     chn_trackptr_cur:       .byte   0, 0, 0        ; Pattern index for current ordernumber
+000AC5r 2  00           chn_trackptr_tmp:       .byte   0              ; Temp storage for get_trackptr_order
+000AC6r 2               
+000AC6r 2               ; Values computed from song base during init
+000AC6r 2  00 00        bitstream_addr:         .word   0       ; Address of order bitstream (song_base + 0)
+000AC8r 2  00           transpose_base:         .byte   0       ; Base index into transpose_table
+000AC9r 2  00           delta_base:             .byte   0       ; Base index into delta_table
+000ACAr 2  00 00        packed_ptrs_addr:       .word   0       ; Address of packed pointers table
+000ACCr 2               
+000ACCr 2               ; Bitstream decode state
+000ACCr 2  FF           decoded_order:          .byte   $FF     ; Order for which we have decoded data ($FF = invalid)
+000ACDr 2  00 00 00     decoded_transpose:      .byte   0, 0, 0 ; Decoded transpose indices (0-15) for each channel
+000AD0r 2  00 00 00     decoded_trackptr_idx:   .byte   0, 0, 0 ; Decoded trackptr delta indices (0-31) for each channel
+000AD3r 2  00           bs_byte0:               .byte   0       ; Temp storage for bitstream decoding
+000AD4r 2  00           bs_byte1:               .byte   0
+000AD5r 2  00           bs_byte2:               .byte   0
+000AD6r 2  00           bs_byte3:               .byte   0
+000AD7r 2               
+000AD7r 2               ; Pattern decode state (row-by-row streaming)
+000AD7r 2  FF FF FF     chn_decoded_pat:        .byte   $FF, $FF, $FF  ; Pattern index in each channel's decode buffer
+000ADAr 2  FF FF FF     chn_decoded_row:        .byte   $FF, $FF, $FF  ; Which row (0-63) is decoded
+000ADDr 2               
+000ADDr 2               ; Decoder state per channel for streaming decode
+000ADDr 2  00 00 00     chn_src_off:            .byte   0, 0, 0        ; Byte offset into packed pattern data
+000AE0r 2  00 00 00     chn_rle_count:          .byte   0, 0, 0        ; RLE count remaining
+000AE3r 2  00 00 00     chn_gap:                .byte   0, 0, 0        ; Gap value for current pattern (0,1,3,7,15,31,63)
+000AE6r 2  00 00 00     chn_gap_remaining:      .byte   0, 0, 0        ; Implicit zeros remaining after current row
+000AE9r 2  00 00 00     chn_prev_row_0:         .byte   0, 0, 0        ; prev_row byte 0 (note) per channel
+000AECr 2  00 00 00     chn_prev_row_1:         .byte   0, 0, 0        ; prev_row byte 1 (inst|eff) per channel
+000AEFr 2  00 00 00     chn_prev_row_2:         .byte   0, 0, 0        ; prev_row byte 2 (param) per channel
+000AF2r 2               
+000AF2r 2               ; Decode buffers (3 bytes × 3 channels = 9 bytes) - single row per channel
+000AF2r 2  xx xx xx     decode_buffer_0:        .res    3
+000AF5r 2  xx xx xx     decode_buffer_1:        .res    3
+000AF8r 2  xx xx xx     decode_buffer_2:        .res    3
+000AFBr 2               
+000AFBr 2               ; Decode buffer address tables
+000AFBr 2               decode_buffer_lo:
+000AFBr 2  rr rr rr             .byte   <decode_buffer_0, <decode_buffer_1, <decode_buffer_2
+000AFEr 2               decode_buffer_hi:
+000AFEr 2  rr rr rr             .byte   >decode_buffer_0, >decode_buffer_1, >decode_buffer_2
+000B01r 2               
+000B01r 2               ; Local variables for decode_advance_row
+000B01r 2  00           dar_dict_idx:           .byte   0
+000B02r 2  00           dar_dict_idx_hi:        .byte   0
+000B03r 2               
+000B03r 2               ; ============================================================================
+000B03r 2               ; Constant Tables
+000B03r 2               ; ============================================================================
+000B03r 2               
+000B03r 2               sidregoffs:
+000B03r 2  00 07 0E             .byte   0, 7, 14
+000B06r 2               
+000B06r 2               ; Gap code to gap value lookup table
+000B06r 2               ; Code 0-6 maps to gap 0,1,3,7,15,31,63 (2^N - 1 for N>0)
+000B06r 2               gap_code_table:
+000B06r 2  00 01 03 07          .byte   0, 1, 3, 7, 15, 31, 63
+000B0Ar 2  0F 1F 3F     
+000B0Dr 2               
+000B0Dr 2               ; Vibrato table (9 rows, depth 0 deleted - code skips lookup when depth=0)
+000B0Dr 2               ; Frequency order: 4(22) 2(13) 3(11) 1(6) 6(2) 10(1) 5(1) 8(1) 15(1)
+000B0Dr 2               vibrato_table:
+000B0Dr 2  00 06 0C 13          .byte   $00,$06,$0c,$13,$18,$1e,$24,$29,$2d,$31,$35,$38,$3b,$3d,$3f,$40  ; old depth 4 -> new 1
+000B11r 2  18 1E 24 29  
+000B15r 2  2D 31 35 38  
+000B1Dr 2  00 03 06 09          .byte   $00,$03,$06,$09,$0c,$0f,$12,$14,$17,$19,$1b,$1c,$1e,$1f,$1f,$20  ; old depth 2 -> new 2
+000B21r 2  0C 0F 12 14  
+000B25r 2  17 19 1B 1C  
+000B2Dr 2  00 05 09 0E          .byte   $00,$05,$09,$0e,$12,$17,$1b,$1e,$22,$25,$28,$2a,$2c,$2e,$2f,$30  ; old depth 3 -> new 3
+000B31r 2  12 17 1B 1E  
+000B35r 2  22 25 28 2A  
+000B3Dr 2  00 02 03 05          .byte   $00,$02,$03,$05,$06,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,$0f,$10,$10  ; old depth 1 -> new 4
+000B41r 2  06 08 09 0A  
+000B45r 2  0B 0C 0D 0E  
+000B4Dr 2  00 09 13 1C          .byte   $00,$09,$13,$1c,$25,$2d,$35,$3d,$44,$4a,$50,$55,$59,$5c,$5e,$60  ; old depth 6 -> new 5
+000B51r 2  25 2D 35 3D  
+000B55r 2  44 4A 50 55  
+000B5Dr 2  00 00 00 00          .byte   $00,$00,$00,$00,$00,$00,$00,$66,$71,$00,$00,$00,$00,$00,$00,$9f  ; old depth 10 -> new 6 (cols 1-6,9-14 unused)
+000B61r 2  00 00 00 66  
+000B65r 2  71 00 00 00  
+000B6Dr 2  00 08 10 17          .byte   $00,$08,$10,$17,$1f,$26,$2c,$33,$39,$3e,$43,$47,$4a,$4d,$4e,$50  ; old depth 5 -> new 7
+000B71r 2  1F 26 2C 33  
+000B75r 2  39 3E 43 47  
+000B7Dr 2  00 0D 19 25          .byte   $00,$0d,$19,$25,$31,$3c,$47,$51,$5b,$63,$6a,$71,$76,$7a,$7e,$7f  ; old depth 8 -> new 8
+000B81r 2  31 3C 47 51  
+000B85r 2  5B 63 6A 71  
+000B8Dr 2  00 18 2F 46          .byte   $00,$18,$2f,$46,$5c,$71,$85,$98,$aa,$ba,$c8,$d4,$de,$e6,$eb,$ef  ; old depth 15 -> new 9
+000B91r 2  5C 71 85 98  
+000B95r 2  AA BA C8 D4  
+000B9Dr 2               
+000B9Dr 2               ; Split frequency tables (104 entries: notes 0-103)
+000B9Dr 2               ; Note 103 holds remapped absolute note value (was 127)
+000B9Dr 2               freqtable_lo:
+000B9Dr 2  12 00 00 46          .byte   $12,$00,$00,$46,$5a,$6e,$84,$9b,$b3,$cd,$e9,$06
+000BA1r 2  5A 6E 84 9B  
+000BA5r 2  B3 CD E9 06  
+000BA9r 2  25 45 68 8C          .byte   $25,$45,$68,$8c,$b3,$dc,$08,$36,$67,$9b,$d2,$0c
+000BADr 2  B3 DC 08 36  
+000BB1r 2  67 9B D2 0C  
+000BB5r 2  49 8B D0 19          .byte   $49,$8b,$d0,$19,$67,$b9,$10,$6c,$ce,$35,$a3,$17
+000BB9r 2  67 B9 10 6C  
+000BBDr 2  CE 35 A3 17  
+000BC1r 2  93 15 9F 32          .byte   $93,$15,$9f,$32,$cd,$72,$20,$d8,$9c,$6b,$46,$2f
+000BC5r 2  CD 72 20 D8  
+000BC9r 2  9C 6B 46 2F  
+000BCDr 2  25 2A 3F 64          .byte   $25,$2a,$3f,$64,$9a,$e3,$3f,$b1,$38,$d6,$8d,$5e
+000BD1r 2  9A E3 3F B1  
+000BD5r 2  38 D6 8D 5E  
+000BD9r 2  4B 55 7E C8          .byte   $4b,$55,$7e,$c8,$34,$c6,$7f,$61,$6f,$ac,$1a,$bc
+000BDDr 2  34 C6 7F 61  
+000BE1r 2  6F AC 1A BC  
+000BE5r 2  95 A9 FC 8F          .byte   $95,$a9,$fc,$8f,$69,$8c,$fe,$c2,$df,$58,$34,$78
+000BE9r 2  69 8C FE C2  
+000BEDr 2  DF 58 34 78  
+000BF1r 2  2B 53 F7 1F          .byte   $2b,$53,$f7,$1f,$d2,$19,$fc,$85,$bd,$b0,$67,$ff
+000BF5r 2  D2 19 FC 85  
+000BF9r 2  BD B0 67 FF  
+000BFDr 2                       ; Notes 96-103: 96-102 unused (read $00), 103 = remapped from 127
+000BFDr 2  00 00 00 00          .byte   $00,$00,$00,$00,$00,$00,$00,$2f
+000C01r 2  00 00 00 2F  
+000C05r 2               freqtable_hi:
+000C05r 2  01 00 00 01          .byte   $01,$00,$00,$01,$01,$01,$01,$01,$01,$01,$01,$02
+000C09r 2  01 01 01 01  
+000C0Dr 2  01 01 01 02  
+000C11r 2  02 02 02 02          .byte   $02,$02,$02,$02,$02,$02,$03,$03,$03,$03,$03,$04
+000C15r 2  02 02 03 03  
+000C19r 2  03 03 03 04  
+000C1Dr 2  04 04 04 05          .byte   $04,$04,$04,$05,$05,$05,$06,$06,$06,$07,$07,$08
+000C21r 2  05 05 06 06  
+000C25r 2  06 07 07 08  
+000C29r 2  08 09 09 0A          .byte   $08,$09,$09,$0a,$0a,$0b,$0c,$0c,$0d,$0e,$0f,$10
+000C2Dr 2  0A 0B 0C 0C  
+000C31r 2  0D 0E 0F 10  
+000C35r 2  11 12 13 14          .byte   $11,$12,$13,$14,$15,$16,$18,$19,$1b,$1c,$1e,$20
+000C39r 2  15 16 18 19  
+000C3Dr 2  1B 1C 1E 20  
+000C41r 2  22 24 26 28          .byte   $22,$24,$26,$28,$2b,$2d,$30,$33,$36,$39,$3d,$40
+000C45r 2  2B 2D 30 33  
+000C49r 2  36 39 3D 40  
+000C4Dr 2  44 48 4C 51          .byte   $44,$48,$4c,$51,$56,$5b,$60,$66,$6c,$73,$7a,$81
+000C51r 2  56 5B 60 66  
+000C55r 2  6C 73 7A 81  
+000C59r 2  89 91 99 A3          .byte   $89,$91,$99,$a3,$ac,$b7,$c1,$cd,$d9,$e6,$f4,$ff
+000C5Dr 2  AC B7 C1 CD  
+000C61r 2  D9 E6 F4 FF  
+000C65r 2                       ; Notes 96-103: 96-102 unused (read $00), 103 = remapped from 127
+000C65r 2  00 00 00 00          .byte   $00,$00,$00,$00,$00,$00,$00,$30
+000C69r 2  00 00 00 30  
+000C6Dr 2               
+000C6Dr 2               ; Global wavetable (shared across all songs)
+000C6Dr 2               .include "../generated/wavetable.inc"
+000C6Dr 3               ; Auto-generated wavetable - DO NOT EDIT
+000C6Dr 3               
+000C6Dr 3               ; Global wave table: 163 bytes
+000C6Dr 3               global_wavetable:
+000C6Dr 3  15 41 41 41  	.byte	$15, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41	; 0
+000C71r 3  41 41 41 41  
+000C75r 3  41 41 41 41  
+000C7Dr 3  41 41 41 41  	.byte	$41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $41, $40, $40, $41, $41	; 16
+000C81r 3  41 41 41 41  
+000C85r 3  41 41 41 41  
+000C8Dr 3  40 11 11 11  	.byte	$40, $11, $11, $11, $81, $81, $11, $11, $10, $10, $81, $81, $11, $11, $10, $10	; 32
+000C91r 3  81 81 11 11  
+000C95r 3  10 10 81 81  
+000C9Dr 3  11 80 40 40  	.byte	$11, $80, $40, $40, $80, $41, $81, $41, $41, $41, $41, $41, $41, $41, $41, $41	; 48
+000CA1r 3  80 41 81 41  
+000CA5r 3  41 41 41 41  
+000CADr 3  41 41 41 41  	.byte	$41, $41, $41, $41, $41, $41, $41, $00, $00, $41, $41, $41, $41, $41, $41, $41	; 64
+000CB1r 3  41 41 41 00  
+000CB5r 3  00 41 41 41  
+000CBDr 3  41 41 00 00  	.byte	$41, $41, $00, $00, $41, $41, $41, $41, $41, $41, $41, $41, $00, $00, $00, $41	; 80
+000CC1r 3  41 41 41 41  
+000CC5r 3  41 41 41 41  
+000CCDr 3  41 11 81 41  	.byte	$41, $11, $81, $41, $41, $80, $81, $81, $11, $41, $81, $80, $81, $81, $41, $41	; 96
+000CD1r 3  41 80 81 81  
+000CD5r 3  11 41 81 80  
+000CDDr 3  41 40 81 81  	.byte	$41, $40, $81, $81, $00, $17, $43, $53, $57, $11, $81, $11, $11, $11, $11, $11	; 112
+000CE1r 3  00 17 43 53  
+000CE5r 3  57 11 81 11  
+000CEDr 3  11 11 11 11  	.byte	$11, $11, $11, $11, $11, $11, $00, $41, $41, $21, $21, $21, $21, $21, $21, $21	; 128
+000CF1r 3  11 11 00 41  
+000CF5r 3  41 21 21 21  
+000CFDr 3  21 21 21 21  	.byte	$21, $21, $21, $21, $21, $21, $00, $81, $81, $51, $51, $51, $51, $51, $51, $51	; 144
+000D01r 3  21 21 00 81  
+000D05r 3  81 51 51 51  
+000D0Dr 3  00 00 51     	.byte	$00, $00, $51	; 160
+000D10r 3               
+000D10r 2               
+000D10r 2               ; Lookup tables for delta and transpose encoding
+000D10r 2               .include "../generated/tables.inc"
+000D10r 3               ; Auto-generated lookup tables - DO NOT EDIT
+000D10r 3               
+000D10r 3               ; Delta table: 120 bytes
+000D10r 3               delta_table:
+000D10r 3  ED EE EF F0  	.byte	$ED, $EE, $EF, $F0, $F1, $F2, $F3, $F6, $F7, $F9, $FA, $FB, $FC, $FF, $00, $01	; 0
+000D14r 3  F1 F2 F3 F6  
+000D18r 3  F7 F9 FA FB  
+000D20r 3  04 05 06 08  	.byte	$04, $05, $06, $08, $09, $0A, $0C, $0D, $0E, $0F, $10, $12, $14, $F8, $FD, $FE	; 16
+000D24r 3  09 0A 0C 0D  
+000D28r 3  0E 0F 10 12  
+000D30r 3  02 03 07 ED  	.byte	$02, $03, $07, $ED, $EE, $EF, $F0, $F1, $F2, $F3, $F4, $F6, $F7, $FF, $00, $01	; 32
+000D34r 3  EE EF F0 F1  
+000D38r 3  F2 F3 F4 F6  
+000D40r 3  05 11 19 F5  	.byte	$05, $11, $19, $F5, $F9, $FA, $FC, $FD, $02, $04, $0A, $0C, $0D, $0E, $0F, $10	; 48
+000D44r 3  F9 FA FC FD  
+000D48r 3  02 04 0A 0C  
+000D50r 3  12 13 E9 ED  	.byte	$12, $13, $E9, $ED, $EE, $F3, $F4, $F6, $F7, $FE, $FF, $00, $03, $06, $07, $09	; 64
+000D54r 3  EE F3 F4 F6  
+000D58r 3  F7 FE FF 00  
+000D60r 3  0B 16 26 F5  	.byte	$0B, $16, $26, $F5, $F8, $F9, $FA, $FB, $FC, $FD, $01, $02, $04, $05, $08, $0A	; 80
+000D64r 3  F8 F9 FA FB  
+000D68r 3  FC FD 01 02  
+000D70r 3  36 0C 0D 21  	.byte	$36, $0C, $0D, $21, $45, $23, $F0, $F1, $F2, $F4, $F5, $F6, $F7, $F8, $F9, $FE	; 96
+000D74r 3  45 23 F0 F1  
+000D78r 3  F2 F4 F5 F6  
+000D80r 3  FF 00 03 09  	.byte	$FF, $00, $03, $09, $0B, $0E, $0F, $1E	; 112
+000D84r 3  0B 0E 0F 1E  
+000D88r 3               
+000D88r 3               TRACKPTR_START = 21
+000D88r 3               
+000D88r 3               ; Transpose table: 45 bytes
+000D88r 3               transpose_table:
+000D88r 3  F4 F8 FA 00  	.byte	$F4, $F8, $FA, $00, $01, $04, $06, $07, $08, $0C, $0D, $12, $13, $14, $F4, $F9	; 0
+000D8Cr 3  01 04 06 07  
+000D90r 3  08 0C 0D 12  
+000D98r 3  03 0F DC E8  	.byte	$03, $0F, $DC, $E8, $F0, $F5, $FB, $FC, $FE, $00, $01, $05, $07, $0C, $F4, $03	; 16
+000D9Cr 3  F0 F5 FB FC  
+000DA0r 3  FE 00 01 05  
+000DA8r 3  04 06 09 0A  	.byte	$04, $06, $09, $0A, $E8, $FA, $FD, $FF, $02, $00, $20, $18, $24	; 32
+000DACr 3  E8 FA FD FF  
+000DB0r 3  02 00 20 18  
+000DB5r 3               
+000DB5r 2               
+000DB5r 1               
+000DB5r 1               ; Checkpoint stub for standalone player (no-op)
+000DB5r 1               checkpoint:
+000DB5r 1  60                   rts
+000DB5r 1               

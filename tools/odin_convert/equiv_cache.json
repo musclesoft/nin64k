@@ -11471,9 +11471,7 @@
         "e14059"
       ]
     },
-    "excluded_orig": [
-      "370c00"
-    ]
+    "excluded_orig": []
   },
   {
     "song": 5,
@@ -13606,10 +13604,7 @@
         "480a00"
       ]
     },
-    "excluded_orig": [
-      "a4db00",
-      "a8db00"
-    ]
+    "excluded_orig": []
   },
   {
     "song": 6,
@@ -15077,11 +15072,7 @@
         "540100"
       ]
     },
-    "excluded_orig": [
-      "4f0100",
-      "c7ddf4",
-      "4d0100"
-    ]
+    "excluded_orig": []
   },
   {
     "song": 8,
@@ -19931,12 +19922,7 @@
         "e1e0e4"
       ]
     },
-    "excluded_orig": [
-      "341d00",
-      "a3ef08",
-      "b2f308",
-      "3b1d00"
-    ]
+    "excluded_orig": []
   },
   {
     "song": 9,
@@ -20491,10 +20477,6 @@
         "e1e000"
       ]
     },
-    "excluded_orig": [
-      "c5e109",
-      "c2e1f0",
-      "a1c6f0"
-    ]
+    "excluded_orig": []
   }
 ]

@@ -369,8 +369,11 @@ func InstrLengths() map[byte]int {
 func FindInstructionStarts(code []byte, base uint16) []uint16 {
 	var starts []uint16
 	for i := 0; i < len(code); {
-		starts = append(starts, base+uint16(i))
 		opcode := code[i]
+		if opcode == 0x00 && i+1 < len(code) && code[i+1] == 0x00 {
+			break
+		}
+		starts = append(starts, base+uint16(i))
 		if length, ok := instrLengths[opcode]; ok {
 			i += length
 		} else {

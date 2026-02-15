@@ -10,7 +10,8 @@ type instFreq struct {
 	count int
 }
 
-func buildInstRemap(anal analysis.SongAnalysis, numInst int) ([]int, int) {
+// BuildInstRemap builds instrument remapping from analysis
+func BuildInstRemap(anal analysis.SongAnalysis, numInst int) ([]int, int) {
 	var used []instFreq
 	for i := 1; i < numInst; i++ {
 		if count, ok := anal.InstrumentFreq[i]; ok && count > 0 {

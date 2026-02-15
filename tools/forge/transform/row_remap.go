@@ -1,6 +1,7 @@
 package transform
 
-func remapRowBytes(b0, b1, b2 byte, remap [16]byte, fSubRemap map[int]byte, instRemap []int) (byte, byte, byte) {
+// RemapRowBytes remaps a row's bytes using effect/inst remapping
+func RemapRowBytes(b0, b1, b2 byte, remap [16]byte, fSubRemap map[int]byte, instRemap []int) (byte, byte, byte) {
 	oldEffect := (b1 >> 5) | ((b0 >> 4) & 8)
 	var newEffect byte
 	var newParam byte = b2
@@ -42,8 +43,10 @@ func remapRowBytes(b0, b1, b2 byte, remap [16]byte, fSubRemap map[int]byte, inst
 		newEffect = remap[0xA]
 		newParam = b2
 	case 0xB:
-		newEffect = remap[0xB]
-		newParam = b2
+		// Position jump - convert to break (same as 0xD)
+		// Jumps are handled at order level; pattern just needs to break
+		newEffect = 0
+		newParam = 2
 	case 0xD:
 		newEffect = 0
 		newParam = 2

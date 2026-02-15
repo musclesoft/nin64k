@@ -7,8 +7,8 @@ import (
 
 // BuildGlobalEffectRemap builds effect remapping based on usage frequency across all songs.
 // Effects are sorted by frequency and assigned new effect numbers starting from 1.
-// This matches odin_convert's dynamic effect remapping behavior.
-func BuildGlobalEffectRemap(analyses []analysis.SongAnalysis) ([16]byte, map[int]byte) {
+// Returns effectRemap, fSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect.
+func BuildGlobalEffectRemap(analyses []analysis.SongAnalysis) ([16]byte, map[int]byte, byte, byte, byte, byte) {
 	// Aggregate effect usage across all songs
 	allEffectCounts := make(map[byte]int)
 	fSubCounts := make(map[string]int)
@@ -22,7 +22,8 @@ func BuildGlobalEffectRemap(analyses []analysis.SongAnalysis) ([16]byte, map[int
 		}
 	}
 
-	// Collect used effects (excluding 0, 4, D, F which are handled specially)
+	// Collect used effects (excluding 0, 4, B, D, F which are handled specially)
+	// 4=vibrato off, B=position jump (->break), D=break, F=sub-effects
 	type effectFreq struct {
 		name  string
 		code  int
@@ -31,7 +32,7 @@ func BuildGlobalEffectRemap(analyses []analysis.SongAnalysis) ([16]byte, map[int
 	var usedEffects []effectFreq
 
 	for effect := byte(1); effect < 16; effect++ {
-		if effect == 4 || effect == 0xD || effect == 0xF {
+		if effect == 4 || effect == 0xB || effect == 0xD || effect == 0xF {
 			continue
 		}
 		if count, ok := allEffectCounts[effect]; ok && count > 0 {
@@ -82,9 +83,21 @@ func BuildGlobalEffectRemap(analyses []analysis.SongAnalysis) ([16]byte, map[int
 	}
 
 	// Special cases that map to effect 0 with specific params
-	effectRemap[4] = 0   // GT vibrato -> effect 0, param 1
+	effectRemap[4] = 0   // GT vibrato off -> effect 0, param 1
+	effectRemap[0xB] = 0 // GT position jump -> effect 0, param 2 (break)
 	effectRemap[0xD] = 0 // GT break -> effect 0, param 2
 	effectRemap[0xF] = 0 // F handled via fSubRemap; fineslide -> effect 0, param 3
 
-	return effectRemap, fSubRemap
+	// Permanent ARP uses effect 14 (reserved above)
+	var permArpEffect byte
+	if effectRemap[0xA] != 0 {
+		permArpEffect = 14
+	}
+
+	// Find porta effects (GT effects 1, 2, 3)
+	portaUpEffect := effectRemap[1]   // GT effect 1 = porta up
+	portaDownEffect := effectRemap[2] // GT effect 2 = porta down
+	tonePortaEffect := effectRemap[3] // GT effect 3 = tone portamento (always persistent)
+
+	return effectRemap, fSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect
 }

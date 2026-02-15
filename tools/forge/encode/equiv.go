@@ -55,130 +55,31 @@ func GetEquivSources(projectRoot string, songNum int) []string {
 	return sources
 }
 
-func translateRowHex(origHex string, effectRemap [16]byte, fSubRemap map[int]byte, instRemap []int) string {
-	if len(origHex) != 6 {
-		return origHex
+// GetExcludedOrig returns the excluded_orig entries for a song
+func GetExcludedOrig(projectRoot string, songNum int) []string {
+	cache := LoadEquivCache(projectRoot)
+	if cache == nil || songNum < 1 || songNum > len(cache) {
+		return nil
 	}
-	var b0, b1, b2 byte
-	fmt.Sscanf(origHex, "%02x%02x%02x", &b0, &b1, &b2)
-	newB0, newB1, newParam := remapRowBytesForEquiv(b0, b1, b2, effectRemap, fSubRemap, instRemap)
-	return fmt.Sprintf("%02x%02x%02x", newB0, newB1, newParam)
+	return cache[songNum-1].ExcludedOrig
 }
 
-func remapRowBytesForEquiv(b0, b1, b2 byte, remap [16]byte, fSubRemap map[int]byte, instRemap []int) (byte, byte, byte) {
-	oldEffect := (b1 >> 5) | ((b0 >> 4) & 8)
-	var newEffect byte
-	var newParam byte = b2
-
-	switch oldEffect {
-	case 0:
-		newEffect = 0
-		newParam = 0
-	case 1:
-		newEffect = remap[1]
-		if b2&0x80 != 0 {
-			newParam = 0
-		} else {
-			newParam = 1
-		}
-	case 2:
-		newEffect = remap[2]
-		if b2 == 0x80 {
-			newParam = 1
-		} else {
-			newParam = 0
-		}
-	case 3:
-		newEffect = remap[3]
-		newParam = ((b2 & 0x0F) << 4) | ((b2 & 0xF0) >> 4)
-	case 4:
-		newEffect = 0
-		newParam = 1
-	case 7:
-		newEffect = remap[7]
-		newParam = b2
-	case 8:
-		newEffect = remap[8]
-		newParam = b2
-	case 9:
-		newEffect = remap[9]
-		newParam = b2
-	case 0xA:
-		newEffect = remap[0xA]
-		newParam = b2
-	case 0xB:
-		newEffect = remap[0xB]
-		newParam = b2
-	case 0xD:
-		newEffect = 0
-		newParam = 2
-	case 0xE:
-		newEffect = remap[0xE]
-		newParam = b2
-	case 0xF:
-		if b2 < 0x80 {
-			newEffect = fSubRemap[0x10]
-			newParam = b2
-		} else {
-			hiNib := b2 & 0xF0
-			loNib := b2 & 0x0F
-			switch hiNib {
-			case 0xB0:
-				newEffect = 0
-				newParam = 3
-			case 0xF0:
-				newEffect = fSubRemap[0x11]
-				newParam = loNib
-			case 0xE0:
-				newEffect = fSubRemap[0x12]
-				instIdx := int(loNib)
-				if instRemap != nil && instIdx > 0 && instIdx < len(instRemap) && instRemap[instIdx] > 0 {
-					remapped := instRemap[instIdx]
-					if remapped <= 15 {
-						instIdx = remapped
-					}
-				}
-				newParam = byte(instIdx << 4)
-			case 0x80:
-				newEffect = fSubRemap[0x13]
-				newParam = loNib
-			case 0x90:
-				newEffect = fSubRemap[0x14]
-				newParam = loNib << 4
-			default:
-				newEffect = 0
-				newParam = 0
-			}
-		}
-	default:
-		newEffect = remap[oldEffect]
-		newParam = b2
-	}
-
-	newB0 := (b0 & 0x7F) | ((newEffect & 8) << 4)
-
-	inst := int(b1 & 0x1F)
-	if instRemap != nil && inst > 0 && inst < len(instRemap) && instRemap[inst] > 0 {
-		inst = instRemap[inst]
-	}
-	newB1 := byte(inst&0x1F) | ((newEffect & 7) << 5)
-
-	return newB0, newB1, newParam
-}
+// OverrideExcluded temporarily overrides excluded entries (nil = use cache defaults)
+var OverrideExcluded []string
+var UseOverrideExcluded bool
 
 // TestExclusions is set during equiv bisection to test specific exclusions
 var TestExclusions []string
 
-func BuildEquivMap(
+// BuildEquivHexMap returns a map of source row hex -> target row hex for use during transformation.
+// Works entirely in RAW (original GT) format - no translation.
+// Patterns should be in RAW format (3 bytes per row: note|effect_hi, inst|effect_lo, param).
+func BuildEquivHexMap(
 	projectRoot string,
 	songNum int,
-	dict []byte,
 	patterns [][]byte,
 	truncateLimits []int,
-	effectRemap [16]byte,
-	fSubRemap map[int]byte,
-	instRemap []int,
-) map[int]int {
+) map[string]string {
 	if songNum < 1 || songNum > 9 {
 		return nil
 	}
@@ -193,93 +94,68 @@ func BuildEquivMap(
 	}
 
 	excludedOrig := make(map[string]bool)
-	for _, origHex := range equivCache[songNum-1].ExcludedOrig {
-		excludedOrig[origHex] = true
-	}
-	// Add test exclusions (used during bisection)
-	for _, origHex := range TestExclusions {
-		excludedOrig[origHex] = true
-	}
-	if len(TestExclusions) > 0 {
-		fmt.Printf("      [equiv] TestExclusions=%d, total excluded=%d\n", len(TestExclusions), len(excludedOrig))
-	}
-
-	translatedEquiv := make(map[string][]string)
-	for origSrc, origDsts := range songEquiv {
-		if excludedOrig[origSrc] {
-			continue
+	if UseOverrideExcluded {
+		for _, origHex := range OverrideExcluded {
+			excludedOrig[origHex] = true
 		}
-		convSrc := translateRowHex(origSrc, effectRemap, fSubRemap, instRemap)
-		var convDsts []string
-		for _, origDst := range origDsts {
-			convDsts = append(convDsts, translateRowHex(origDst, effectRemap, fSubRemap, instRemap))
+	} else {
+		for _, origHex := range equivCache[songNum-1].ExcludedOrig {
+			excludedOrig[origHex] = true
 		}
-		translatedEquiv[convSrc] = convDsts
 	}
 
-	numEntries := len(dict) / 3
-	rowToIdx := make(map[string]int)
-	rowToIdx["000000"] = 0
-	for idx := 1; idx < numEntries; idx++ {
-		rowHex := fmt.Sprintf("%02x%02x%02x", dict[idx*3], dict[idx*3+1], dict[idx*3+2])
-		rowToIdx[rowHex] = idx
-	}
-
-	usedInPatterns := make(map[int]bool)
-	usedInPatterns[0] = true
+	// Build set of rows actually used in patterns (RAW format)
+	usedRows := make(map[string]bool)
+	usedRows["000000"] = true
 	for i, pat := range patterns {
 		numRows := len(pat) / 3
 		truncateAt := numRows
 		if i < len(truncateLimits) && truncateLimits[i] > 0 && truncateLimits[i] < truncateAt {
 			truncateAt = truncateLimits[i]
 		}
-
 		var prevRow [3]byte
 		for row := 0; row < truncateAt; row++ {
 			off := row * 3
 			curRow := [3]byte{pat[off], pat[off+1], pat[off+2]}
 			if curRow != prevRow {
 				rowHex := fmt.Sprintf("%02x%02x%02x", curRow[0], curRow[1], curRow[2])
-				if idx, ok := rowToIdx[rowHex]; ok {
-					usedInPatterns[idx] = true
-				}
+				usedRows[rowHex] = true
 			}
 			prevRow = curRow
 		}
 	}
 
+	// Build equiv rows with options (same strategy as BuildEquivMap)
 	type equivRow struct {
-		idx     int
-		options []int
+		src     string
+		options []string
 		hasZero bool
 	}
 
 	var rows []equivRow
-	for rowHex, optionHexList := range translatedEquiv {
-		idx, ok := rowToIdx[rowHex]
-		if !ok {
+	for src, dsts := range songEquiv {
+		if excludedOrig[src] {
 			continue
 		}
-		if !usedInPatterns[idx] || idx == 0 {
+		if !usedRows[src] || src == "000000" {
 			continue
 		}
-		var options []int
+		var options []string
 		hasZero := false
-		for _, optHex := range optionHexList {
-			if optIdx, ok := rowToIdx[optHex]; ok && optIdx != idx {
-				options = append(options, optIdx)
-				if optIdx == 0 {
+		for _, dst := range dsts {
+			if dst != src {
+				options = append(options, dst)
+				if dst == "000000" {
 					hasZero = true
 				}
 			}
 		}
 		if len(options) > 0 {
-			rows = append(rows, equivRow{idx: idx, options: options, hasZero: hasZero})
+			rows = append(rows, equivRow{src: src, options: options, hasZero: hasZero})
 		}
 	}
 
-	// Sort: standard odin_convert sorting
-	// rows with idx 0 option first, then fewest options, then by idx for determinism
+	// Sort: hasZero first, then fewest options, then by src for determinism
 	for i := 0; i < len(rows)-1; i++ {
 		for j := i + 1; j < len(rows); j++ {
 			swap := false
@@ -288,7 +164,7 @@ func BuildEquivMap(
 			} else if rows[j].hasZero == rows[i].hasZero {
 				if len(rows[j].options) < len(rows[i].options) {
 					swap = true
-				} else if len(rows[j].options) == len(rows[i].options) && rows[j].idx < rows[i].idx {
+				} else if len(rows[j].options) == len(rows[i].options) && rows[j].src < rows[i].src {
 					swap = true
 				}
 			}
@@ -298,63 +174,63 @@ func BuildEquivMap(
 		}
 	}
 
-	finalUsed := make(map[int]bool)
-	for idx := range usedInPatterns {
-		finalUsed[idx] = true
+	finalUsed := make(map[string]bool)
+	for row := range usedRows {
+		finalUsed[row] = true
 	}
 
-	equivMap := make(map[int]int)
+	result := make(map[string]string)
 
+	// First pass: map all rows that can map to "000000"
 	for _, r := range rows {
 		if r.hasZero {
-			equivMap[r.idx] = 0
-			delete(finalUsed, r.idx)
+			result[r.src] = "000000"
+			delete(finalUsed, r.src)
 		}
 	}
 
+	// Second pass: map remaining rows to targets still in use
 	for _, r := range rows {
-		if _, mapped := equivMap[r.idx]; mapped {
+		if _, mapped := result[r.src]; mapped {
 			continue
 		}
 
-		bestTarget := -1
+		bestTarget := ""
 		for _, opt := range r.options {
-			if finalUsed[opt] && (bestTarget < 0 || opt < bestTarget) {
+			if finalUsed[opt] && (bestTarget == "" || opt < bestTarget) {
 				bestTarget = opt
 			}
 		}
 
-		if bestTarget >= 0 {
-			equivMap[r.idx] = bestTarget
-			delete(finalUsed, r.idx)
+		if bestTarget != "" {
+			result[r.src] = bestTarget
+			delete(finalUsed, r.src)
 		}
 	}
 
+	// Iterative pass: keep trying until stable
 	changed := true
 	for changed {
 		changed = false
 		for _, r := range rows {
-			if _, mapped := equivMap[r.idx]; mapped {
+			if _, mapped := result[r.src]; mapped {
 				continue
 			}
 
-			bestTarget := -1
+			bestTarget := ""
 			for _, opt := range r.options {
-				if finalUsed[opt] && (bestTarget < 0 || opt < bestTarget) {
+				if finalUsed[opt] && (bestTarget == "" || opt < bestTarget) {
 					bestTarget = opt
 				}
 			}
 
-			if bestTarget >= 0 {
-				equivMap[r.idx] = bestTarget
-				delete(finalUsed, r.idx)
+			if bestTarget != "" {
+				result[r.src] = bestTarget
+				delete(finalUsed, r.src)
 				changed = true
 			}
 		}
 	}
 
-	if len(TestExclusions) > 0 {
-		fmt.Printf("      [equiv] Final equivMap size: %d\n", len(equivMap))
-	}
-	return equivMap
+	return result
 }

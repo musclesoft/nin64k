@@ -123,7 +123,10 @@ func runSingle(inputPath, outputPath string) {
 	fmt.Printf("  Used instruments: %d, Filter trigger: %d\n",
 		len(anal.UsedInstruments), len(anal.FilterTriggerInst))
 
-	transformed := transform.Transform(song, anal, raw)
+	transformOpts := transform.TransformOptions{
+		PermanentArp: false, // Disabled for single file mode
+	}
+	transformed := transform.Transform(song, anal, raw, transformOpts)
 	if err := verify.Transform(song, anal, transformed, raw); err != nil {
 		fmt.Printf("FATAL: transform verification failed:\n%v\n", err)
 		os.Exit(1)
@@ -167,7 +170,7 @@ func runBatch(outputDir string) {
 	var parsedSongs [9]parse.ParsedSong
 	var analyses [9]analysis.SongAnalysis
 
-	fmt.Println("=== Phase 1a: Parse and analyze all songs ===")
+	fmt.Println("=== Phase 1: Parse and analyze all songs ===")
 	var allAnalyses []analysis.SongAnalysis
 	for i, name := range songNames {
 		inputPath := projectPath(fmt.Sprintf("uncompressed/%s.raw", name))
@@ -197,8 +200,19 @@ func runBatch(outputDir string) {
 		allAnalyses = append(allAnalyses, anal)
 	}
 
-	fmt.Println("\n=== Phase 1b: Build global effect remap ===")
-	globalEffectRemap, globalFSubRemap := transform.BuildGlobalEffectRemap(allAnalyses)
+	fmt.Println("\n=== Phase 2: Build global effect remap ===")
+	globalEffectRemap, globalFSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect := transform.BuildGlobalEffectRemap(allAnalyses)
+	transformOpts := transform.TransformOptions{
+		PermanentArp:     false, // DISABLED - requires player changes
+		PermArpEffect:    permArpEffect,
+		MaxPermArpRows:   0, // unlimited
+		PersistPorta:     false, // DISABLED - requires player changes
+		PortaUpEffect:    portaUpEffect,
+		PortaDownEffect:  portaDownEffect,
+		PersistTonePorta: false, // DISABLED - requires player changes
+		TonePortaEffect:  tonePortaEffect,
+		OptimizeInst:     false, // DISABLED - requires player changes
+	}
 	fmt.Println("  Effect remap (orig -> new):")
 	for orig := 0; orig < 16; orig++ {
 		if globalEffectRemap[orig] != 0 || orig == 0 {
@@ -210,58 +224,101 @@ func runBatch(outputDir string) {
 		fmt.Printf("    0x%X -> %d\n", code, newEff)
 	}
 
-	fmt.Println("\n=== Phase 1c: Transform and encode all songs ===")
+	fmt.Println("\n=== Phase 3: Build equiv maps ===")
+	equivMaps := make([]map[string]string, len(songNames))
 	for i, name := range songNames {
 		if rawData[i] == nil {
 			continue
 		}
+		patterns, truncateLimits := transform.ExtractRawPatternsAsBytes(parsedSongs[i], analyses[i], rawData[i])
+		equivMaps[i] = encode.BuildEquivHexMap(projectRoot, i+1, patterns, truncateLimits)
+		if len(equivMaps[i]) > 0 {
+			fmt.Printf("  %s: %d mappings\n", name, len(equivMaps[i]))
+		}
+	}
 
-		transformed := transform.TransformWithGlobalEffects(parsedSongs[i], analyses[i], rawData[i], globalEffectRemap, globalFSubRemap)
-		if err := verify.Transform(parsedSongs[i], analyses[i], transformed, rawData[i]); err != nil {
-			fmt.Printf("FATAL: %s transform verification failed:\n%v\n", name, err)
+	fmt.Println("\n=== Phase 4: Apply equiv and remap ===")
+	transformedSongs := make([]transform.TransformedSong, len(songNames))
+	for i, name := range songNames {
+		if rawData[i] == nil {
+			continue
+		}
+		songOpts := transformOpts
+		songOpts.EquivMap = equivMaps[i]
+		transformedSongs[i] = transform.TransformWithGlobalEffects(
+			parsedSongs[i], analyses[i], rawData[i],
+			globalEffectRemap, globalFSubRemap, songOpts,
+		)
+		fmt.Printf("  %s: %d patterns, %d instruments\n",
+			name, len(transformedSongs[i].Patterns), transformedSongs[i].MaxUsedSlot)
+	}
+
+	fmt.Println("\n=== Phase 5: Verify remapped patterns ===")
+	for i, name := range songNames {
+		if rawData[i] == nil {
+			continue
+		}
+		if err := verify.Transform(parsedSongs[i], analyses[i], transformedSongs[i], rawData[i]); err != nil {
+			fmt.Printf("FATAL: %s verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
+	}
+	fmt.Println("  All verified")
 
-		encoded := encode.EncodeWithEquiv(transformed, i+1, projectRoot)
-		if err := verify.Encode(transformed, encoded); err != nil {
+	fmt.Println("\n=== Phase 6: Build dictionaries and pack patterns ===")
+	encodedSongs := make([]encode.EncodedSong, len(songNames))
+	for i, name := range songNames {
+		if rawData[i] == nil {
+			continue
+		}
+		encodedSongs[i] = encode.Encode(transformedSongs[i])
+		fmt.Printf("  %s: dict=%d\n", name, len(encodedSongs[i].RowDict)/3)
+	}
+
+	fmt.Println("\n=== Phase 7: Verify packed patterns ===")
+	for i, name := range songNames {
+		if rawData[i] == nil {
+			continue
+		}
+		if err := verify.Encode(transformedSongs[i], encodedSongs[i]); err != nil {
 			fmt.Printf("FATAL: %s encode verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
-
-		if err := verify.PatternSemantics(transformed, encoded); err != nil {
+		if err := verify.PatternSemantics(transformedSongs[i], encodedSongs[i]); err != nil {
 			fmt.Printf("FATAL: %s semantic verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
-
-		if err := verify.DictionaryInstruments(transformed, encoded); err != nil {
+		if err := verify.DictionaryInstruments(transformedSongs[i], encodedSongs[i]); err != nil {
 			fmt.Printf("FATAL: %s dictionary verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
-
-		if err := verify.FilterTableRemap(transformed, encoded); err != nil {
-			fmt.Printf("FATAL: %s filter table remap verification failed:\n%v\n", name, err)
+		if err := verify.FilterTableRemap(transformedSongs[i], encodedSongs[i]); err != nil {
+			fmt.Printf("FATAL: %s filter verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
-
-		if err := verify.ArpTableRemap(transformed, encoded); err != nil {
-			fmt.Printf("FATAL: %s arp table remap verification failed:\n%v\n", name, err)
+		if err := verify.ArpTableRemap(transformedSongs[i], encodedSongs[i]); err != nil {
+			fmt.Printf("FATAL: %s arp verification failed:\n%v\n", name, err)
 			os.Exit(1)
 		}
+	}
+	fmt.Println("  All verified")
 
+	// Build processedSong structs
+	for i, name := range songNames {
+		if rawData[i] == nil {
+			continue
+		}
 		songs[i] = &processedSong{
 			name:        name,
 			raw:         rawData[i],
 			song:        parsedSongs[i],
 			anal:        analyses[i],
-			transformed: transformed,
-			encoded:     encoded,
+			transformed: transformedSongs[i],
+			encoded:     encodedSongs[i],
 		}
-
-		fmt.Printf("  %s: Orders: %d, Patterns: %d, Dict: %d\n",
-			name, len(analyses[i].ReachableOrders), len(transformed.Patterns), len(encoded.RowDict)/3)
 	}
 
-	fmt.Println("\n=== Phase 2: Collect delta and transpose sets ===")
+	fmt.Println("\n=== Phase 8: Collect delta and transpose sets ===")
 	var baseDeltaSets [9][]int
 	var trackStarts [9][3]byte
 	var transposeSets [9][]int8
@@ -281,7 +338,7 @@ func runBatch(outputDir string) {
 			trackStarts[i][0], trackStarts[i][1], trackStarts[i][2])
 	}
 
-	fmt.Println("\n=== Phase 2b: Find optimal start constant ===")
+	fmt.Println("\n=== Phase 9: Find optimal start constant ===")
 	var baseUnion [256]bool
 	for s := 0; s < 9; s++ {
 		for _, d := range baseDeltaSets[s] {
@@ -400,7 +457,7 @@ func runBatch(outputDir string) {
 	}
 	fmt.Printf("  Total unique deltas (union): %d\n", len(unionDeltas))
 
-	fmt.Println("\n=== Phase 3: Solve global tables ===")
+	fmt.Println("\n=== Phase 10: Solve global tables ===")
 	deltaResult := solve.SolveDeltaTable(deltaSets)
 	deltaResult.StartConst = bestConst
 	fmt.Printf("  Delta table: %d bytes\n", len(deltaResult.Table))
@@ -421,7 +478,7 @@ func runBatch(outputDir string) {
 	fmt.Printf("  Delta bases: %v\n", deltaResult.Bases)
 	fmt.Printf("  Transpose bases: %v\n", transposeResult.Bases)
 
-	fmt.Println("\n=== Phase 4: Build lookup maps ===")
+	fmt.Println("\n=== Phase 11: Build lookup maps ===")
 	var deltaToIdx [9]map[int]byte
 	var transposeToIdx [9]map[int8]byte
 
@@ -460,7 +517,7 @@ func runBatch(outputDir string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("\n=== Phase 4b: Build global wave table ===")
+	fmt.Println("\n=== Phase 12: Build global wave table ===")
 	var waveTables [][]byte
 	var waveInstruments [][]solve.WaveInstrumentInfo
 
@@ -487,7 +544,7 @@ func runBatch(outputDir string) {
 	fmt.Printf("  Global wave table: %d bytes (%d unique snippets)\n",
 		len(globalWave.Data), len(globalWave.Snippets))
 
-	fmt.Println("\n=== Phase 5: Serialize with global tables ===")
+	fmt.Println("\n=== Phase 13: Serialize with global tables ===")
 	outputs := make([][]byte, 9)
 	for i, ps := range songs {
 		if ps == nil {
@@ -582,7 +639,7 @@ func runBatch(outputDir string) {
 	writeWavetableInc(globalWave, wavetablePath)
 	fmt.Printf("Wrote wavetable: %s\n", wavetablePath)
 
-	fmt.Println("\n=== Phase 6: Validate with VM ===")
+	fmt.Println("\n=== Phase 14: Validate with VM ===")
 	if err := rebuildPlayer(); err != nil {
 		fmt.Printf("  Warning: could not rebuild player: %v\n", err)
 	}
@@ -599,8 +656,8 @@ func runBatch(outputDir string) {
 	}
 	fmt.Println("  Tables verified in player binary")
 
-	// Phase 6: Original format VP validation (tests core playback logic)
-	fmt.Println("\n=== Phase 6: Original Format VP Validation ===")
+	// Phase 11: Original format VP validation (tests core playback logic)
+	fmt.Println("\n=== Phase 15: Original Format VP Validation ===")
 	origVPPassed, origVPFailed := 0, 0
 	var origWritesCache [9][]validate.SIDWrite
 	for i, ps := range songs {
@@ -638,8 +695,8 @@ func runBatch(outputDir string) {
 	}
 	fmt.Printf("Original VP validation: %d passed, %d failed\n", origVPPassed, origVPFailed)
 
-	// Phase 6a: Virtual player validation (tests conversion, not ASM)
-	fmt.Println("\n=== Phase 6a: Transformed VP Validation ===")
+	// Phase 12: Virtual player validation (tests conversion, not ASM)
+	fmt.Println("\n=== Phase 16: Transformed VP Validation ===")
 	vpPassed, vpFailed := 0, 0
 	for i, ps := range songs {
 		if ps == nil || outputs[i] == nil {
@@ -717,8 +774,16 @@ func runBatch(outputDir string) {
 	}
 	fmt.Printf("Virtual validation: %d passed, %d failed\n", vpPassed, vpFailed)
 
-	// Phase 6b: ASM player validation (parallel)
-	fmt.Println("\n=== Phase 6b: ASM Player Validation ===")
+	// Phase 13: Check which excluded equiv entries are actually needed
+	fmt.Println("\n=== Phase 17: Verify Excluded Equiv Entries ===")
+	hasOptionalExclusions := checkExcludedEntries(songs, outputs, deltaResult, transposeResult, globalWave, deltaToIdx, transposeToIdx, globalEffectRemap, globalFSubRemap, transformOpts, playerData)
+	if hasOptionalExclusions {
+		fmt.Println("\nFATAL: Optional exclusions found - these should be removed from equiv_cache.json")
+		os.Exit(1)
+	}
+
+	// Phase 14: ASM player validation (parallel)
+	fmt.Println("\n=== Phase 18: ASM Player Validation ===")
 
 	type asmResult struct {
 		ok     bool
@@ -766,8 +831,108 @@ func runBatch(outputDir string) {
 	}
 	fmt.Printf("\nASM validation: %d passed, %d failed\n", passed, failed)
 
-	// Phase 7: Report stats
+	// Phase 15: Report stats
 	reportASMStats(allStats, playerData)
+}
+
+func checkExcludedEntries(
+	songs [9]*processedSong,
+	outputs [][]byte,
+	deltaResult solve.DeltaTableResult,
+	transposeResult solve.TransposeTableResult,
+	globalWave *solve.GlobalWaveTable,
+	deltaToIdx [9]map[int]byte,
+	transposeToIdx [9]map[int8]byte,
+	globalEffectRemap [16]byte,
+	globalFSubRemap map[int]byte,
+	transformOpts transform.TransformOptions,
+	playerData []byte,
+) bool {
+	hasOptional := false
+	for i, ps := range songs {
+		if ps == nil || outputs[i] == nil {
+			continue
+		}
+		songNum := i + 1
+		excluded := encode.GetExcludedOrig(projectRoot, songNum)
+		if len(excluded) == 0 {
+			continue
+		}
+
+		var optional []string
+		for _, entry := range excluded {
+			// Test with this entry NOT excluded (i.e., active)
+			newExcluded := make([]string, 0, len(excluded)-1)
+			for _, e := range excluded {
+				if e != entry {
+					newExcluded = append(newExcluded, e)
+				}
+			}
+
+			// Re-build equiv map with new exclusions
+			encode.UseOverrideExcluded = true
+			encode.OverrideExcluded = newExcluded
+
+			patterns, truncateLimits := transform.ExtractRawPatternsAsBytes(
+				ps.song, ps.anal, ps.raw,
+			)
+			equivMap := encode.BuildEquivHexMap(
+				projectRoot, songNum,
+				patterns, truncateLimits,
+			)
+
+			// Re-transform with new equiv map
+			songOpts := transformOpts
+			songOpts.EquivMap = equivMap
+			transformed := transform.TransformWithGlobalEffects(ps.song, ps.anal, ps.raw, globalEffectRemap, globalFSubRemap, songOpts)
+
+			// Re-encode
+			encoded := encode.Encode(transformed)
+
+			// Re-serialize
+			output := serialize.SerializeWithWaveRemap(
+				transformed,
+				encoded,
+				deltaToIdx[i],
+				transposeToIdx[i],
+				deltaResult.Bases[i],
+				transposeResult.Bases[i],
+				globalWave.Remap[i],
+				deltaResult.StartConst,
+			)
+			encode.UseOverrideExcluded = false
+
+			// ASM validate
+			ok, _, _ := testSong(songNum, ps.raw, output, playerData, transformed, encoded)
+			if ok {
+				optional = append(optional, entry)
+			}
+		}
+
+		if len(optional) > 0 {
+			fmt.Printf("  Song %d: %d/%d exclusions optional: %v\n", songNum, len(optional), len(excluded), optional)
+			hasOptional = true
+		} else {
+			fmt.Printf("  Song %d: all %d exclusions required\n", songNum, len(excluded))
+		}
+	}
+	return hasOptional
+}
+
+func getOrigWrites(rawData []byte, songNum int, testFrames int) []validate.SIDWrite {
+	var bufferBase uint16
+	if songNum%2 == 1 {
+		bufferBase = 0x1000
+	} else {
+		bufferBase = 0x7000
+	}
+	playAddr := bufferBase + 3
+
+	cpu := validate.NewCPU()
+	copy(cpu.Memory[bufferBase:], rawData)
+	cpu.A = 0
+	cpu.Call(bufferBase)
+	return cpu.RunFrames(playAddr, testFrames)
 }
 
 func reportASMStats(allStats []*ASMStats, playerData []byte) {

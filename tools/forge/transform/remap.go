@@ -9,8 +9,7 @@ import (
 )
 
 func Transform(song parse.ParsedSong, anal analysis.SongAnalysis, raw []byte, opts TransformOptions) TransformedSong {
-	effectRemap, fSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect := BuildGlobalEffectRemap()
-	opts.PermArpEffect = permArpEffect
+	effectRemap, fSubRemap, portaUpEffect, portaDownEffect, tonePortaEffect := BuildGlobalEffectRemap()
 	opts.PortaUpEffect = portaUpEffect
 	opts.PortaDownEffect = portaDownEffect
 	opts.TonePortaEffect = tonePortaEffect
@@ -161,23 +160,15 @@ func TransformWithGlobalEffects(song parse.ParsedSong, anal analysis.SongAnalysi
 		}
 	}
 
-	if opts.PermanentArp {
-		arpEffect := effectRemap[0xA]
-		if arpEffect != 0 {
-			origPatterns := deepCopyPatterns(result.Patterns)
-			result.Patterns = optimizeArpToPermanent(result.Patterns, arpEffect, baselineRows)
-			if err := VerifyFullSongPermarp(origPatterns, result.Patterns, result.Orders, arpEffect); err != nil {
-				panic("permarp verification failed: " + err.Error())
-			}
-		}
-	}
+	// NOTE: PermanentArp optimization is applied in pipeline/remap.go AFTER
+	// OptimizePersistentFXSelective to avoid creating NOPs that incorrectly inherit permarp
 
 	if opts.PersistPorta {
 		for _, portaEffect := range []byte{opts.PortaUpEffect, opts.PortaDownEffect} {
 			if portaEffect == 0 {
 				continue
 			}
-			origPatterns := deepCopyPatterns(result.Patterns)
+			origPatterns := DeepCopyPatterns(result.Patterns)
 			result.Patterns = OptimizePortaToNOP(result.Patterns, portaEffect, baselineRows)
 			if err := VerifyFullSongPorta(origPatterns, result.Patterns, result.Orders, portaEffect); err != nil {
 				panic("persistporta verification failed: " + err.Error())
@@ -187,7 +178,7 @@ func TransformWithGlobalEffects(song parse.ParsedSong, anal analysis.SongAnalysi
 
 	if opts.PersistTonePorta && opts.TonePortaEffect != 0 {
 		result.Patterns = AddNopHardAfterTonePorta(result.Patterns, opts.TonePortaEffect)
-		origPatterns := deepCopyPatterns(result.Patterns)
+		origPatterns := DeepCopyPatterns(result.Patterns)
 		result.Patterns = OptimizeTonePortaRuns(result.Patterns, opts.TonePortaEffect, baselineRows)
 		if err := VerifyFullSongTonePorta(origPatterns, result.Patterns, result.Orders, opts.TonePortaEffect); err != nil {
 			panic("permtoneporta verification failed: " + err.Error())
@@ -195,7 +186,7 @@ func TransformWithGlobalEffects(song parse.ParsedSong, anal analysis.SongAnalysi
 	}
 
 	if false && opts.OptimizeInst && result.MaxUsedSlot < 31 {
-		origPatterns := deepCopyPatterns(result.Patterns)
+		origPatterns := DeepCopyPatterns(result.Patterns)
 		result.Patterns = OptimizeInstrumentReuse(result.Patterns, result.Orders, result.MaxUsedSlot)
 		if err := VerifyInstOptTransform(origPatterns, result.Patterns, result.Orders); err != nil {
 			panic("instopt verification failed: " + err.Error())

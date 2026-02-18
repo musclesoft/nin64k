@@ -23,7 +23,6 @@ type TransformedOrder struct {
 
 type TransformOptions struct {
 	PermanentArp     bool
-	PermArpEffect    byte
 	MaxPermArpRows   int
 	PersistPorta     bool
 	PortaUpEffect    byte
@@ -50,5 +49,4 @@ type TransformedSong struct {
 	OrderMap       map[int]int
 	MaxUsedSlot    int
 	PatternOrder   []uint16
-	PermArpEffect  byte
 }

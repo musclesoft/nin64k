@@ -111,12 +111,10 @@ player_init:
         clc
         adc     #3                      ; A = base + 3
         sta     filter_load+2           ; $3CC high byte
+        adc     #1                      ; A = base + 4 (C still clear)
+        sta     arp_load_addr+1         ; $4AF high byte
         lda     #$CC
         sta     filter_load+1           ; $3CC low byte
-        lda     zp_song_base+1
-        clc
-        adc     #4                      ; A = base + 4
-        sta     arp_load_addr+1         ; $4AF high byte
         lda     #$AF
         sta     arp_load_addr           ; $4AF low byte
         lda     #$00
@@ -143,31 +141,39 @@ player_init:
         dey
         sty     speedcounter
         lda     #2
-        sta     chn_hardrestart+0
-        sta     chn_hardrestart+1
-        sta     chn_hardrestart+2
+        tay
+@init_hr:
+        sta     chn_hardrestart,y
+        dey
+        bpl     @init_hr
         ; Initialize inst pointers to instrument 1 (at song_base + $000)
         ; Inst N is at (N-1)*16
         lda     zp_song_base+1
-        sta     chn_inst_ptr_hi+0
-        sta     chn_inst_ptr_hi+1
-        sta     chn_inst_ptr_hi+2
+        ldy     #2
+@init_insthi:
+        sta     chn_inst_ptr_hi,y
+        dey
+        bpl     @init_insthi
+        jsr     checkpoint
         lda     #$0f
         sta     globalvolume
         ; Initialize decode buffer state (mark all as empty)
         lda     #$FF
-        sta     chn_decoded_pat+0
-        sta     chn_decoded_pat+1
-        sta     chn_decoded_pat+2
-        sta     chn_decoded_row+0
-        sta     chn_decoded_row+1
-        sta     chn_decoded_row+2
+        ldy     #2
+@init_ff:
+        sta     chn_decoded_pat,y
+        sta     chn_decoded_row,y
+        dey
+        bpl     @init_ff
+        jsr     checkpoint
         ; Initialize trackptr accumulators to TRACKPTR_START
         ; (delta[0] will be added when newpattern runs on first frame)
         lda     #TRACKPTR_START
-        sta     chn_trackptr_cur+0
-        sta     chn_trackptr_cur+1
-        sta     chn_trackptr_cur+2
+        ldy     #2
+@init_trackptr:
+        sta     chn_trackptr_cur,y
+        dey
+        bpl     @init_trackptr
         ; Load transpose base from song data ($56B)
         lda     zp_song_base+1
         clc
@@ -237,9 +243,7 @@ player_play:
         ; (C already 0 from CMP when A < speed)
         adc     #1
         cmp     speed
-        bne     @no_prefetch
-        jmp     @do_prefetch
-@no_prefetch:
+        beq     @do_prefetch
         jmp     pp_allframes
 @do_prefetch:
         ; Prefetch next row's data
@@ -303,31 +307,19 @@ newpattern:
         jsr     decode_order_bitstream
         jsr     checkpoint
         ; Update trackptr: cur += delta_table[delta_base + decoded_trackptr_idx[ch]]
-        lda     decoded_trackptr_idx+0
+        ldy     #2
+@tp_loop:
+        lda     decoded_trackptr_idx,y
         clc
         adc     delta_base
         tax
         lda     delta_table,x
         clc
-        adc     chn_trackptr_cur+0
-        sta     chn_trackptr_cur+0
-        lda     decoded_trackptr_idx+1
-        clc
-        adc     delta_base
-        tax
-        lda     delta_table,x
-        clc
-        adc     chn_trackptr_cur+1
-        sta     chn_trackptr_cur+1
+        adc     chn_trackptr_cur,y
+        sta     chn_trackptr_cur,y
         jsr     checkpoint
-        lda     decoded_trackptr_idx+2
-        clc
-        adc     delta_base
-        tax
-        lda     delta_table,x
-        clc
-        adc     chn_trackptr_cur+2
-        sta     chn_trackptr_cur+2
+        dey
+        bpl     @tp_loop
         lda     #$00
         sta     trackrow
         sta     forcenewpattern
@@ -346,18 +338,18 @@ pattern_ok:
         ; Prefetch valid - use cached transpose, buffers already decoded
         lda     #0
         sta     prefetch_done
-        lda     prefetch_transpose+0
-        sta     chn_transpose+0
-        lda     prefetch_transpose+1
-        sta     chn_transpose+1
-        lda     prefetch_transpose+2
-        sta     chn_transpose+2
+        ldy     #2
+@copy_tr:
+        lda     prefetch_transpose,y
+        sta     chn_transpose,y
+        dey
+        bpl     @copy_tr
         jmp     @use_prefetch
 @no_prefetch_avail:
         lda     #0
         sta     prefetch_done
         ldx     ordernumber
-        ldy     #0
+        tay                         ; Y=0, A still 0 from above
         jsr     get_transpose_order
         sta     chn_transpose+0
         jsr     checkpoint
@@ -571,7 +563,7 @@ pi_skiparp:
         tya
         and     #$0f
         sta     chn_vibspeed,x
-        jmp     pi_pulse
+        bpl     pi_pulse            ; N always 0 after AND #$0f
 pi_vibdelayed:
         dec     chn_vibdelay,x
 pi_pulse:
@@ -609,31 +601,43 @@ pi_pulseup:
         lda     #$ff
         sta     chn_plswidthlo,x
         lda     chn_plslimitup,x
-        jmp     pi_pulsestore
+        bpl     pi_pulsestore       ; limitup is 0-15, N always 0
 pi_noinst:
         jsr     checkpoint
         lda     chn_effect,x
-        bne     fx_haseffect
-        ; Effect 0: special handling based on param
-        ; param 0=nop, 1=vib, 2=break, 3=fineslide
+        beq     :+
+        jmp     fx_haseffect
+:       ; Effect 0: special handling based on param
+        ; param 0=nop, 1=vib, 2=break, 3=fineslide, 4+=nophard
+        ; Check nophard first for fastest path (avoids PHA/PLA overhead)
         lda     chn_effectpar,x
-        bne     @effect0_dispatch
-        jmp     do_slide_vib
-@effect0_dispatch:
+        beq     @effect0_nop
+        cmp     #4
+        bcs     @effect0_nophard        ; param >= 4: fastest exit
+        cmp     #3
+        beq     @effect0_fineslide
         cmp     #2
-        bcs     @effect0_break_or_fineslide
-        ; param 1 = vib: disable vibrato
+        beq     @effect0_break
+        ; param = 1: fall through to vib off
+@effect0_vib:
+        ; param 1 = vib off: clear vibrato and permarp
         lda     #0
         sta     chn_vibdepth,x
         sta     chn_vibspeed,x
+        sta     chn_permarp,x
         jmp     do_slide_vib
-@effect0_break_or_fineslide:
-        beq     @effect0_break
-        ; param 3 = fineslide
+@effect0_nop:
+        ; param 0 = NOP: use permarp if set
+        lda     chn_permarp,x
+        beq     @effect0_done
+        jmp     do_arp_calc             ; Shared arp calculation
+@effect0_fineslide:
+        ; param 3 = fineslide (only on speedcounter==0)
         lda     speedcounter
-        beq     @do_fineslide
-        jmp     do_slide_vib
-@do_fineslide:
+        bne     @effect0_nophard        ; speedcounter!=0: just clear permarp and exit
+        ; speedcounter==0: clear permarp AND do fineslide
+        lda     #0
+        sta     chn_permarp,x
         lda     chn_slidedelta_lo,x
         clc
         adc     #$04
@@ -642,11 +646,61 @@ pi_noinst:
         sta     chn_slideenable,x
         jmp     do_slide_vib
 @effect0_break:
-        ; param 2 = break
+        ; param 2 = break: set flag, then fall through to clear permarp
         lda     #$80
         sta     forcenewpattern
+        ; Fall through to @effect0_nophard
+@effect0_nophard:
+        ; param 4+ = nophard: clear permarp and exit
+        lda     #0
+        sta     chn_permarp,x
+@effect0_done:
         jmp     do_slide_vib
+
+; Shared arp calculation - entry: A = arp value (hi nibble = val1, lo nibble = val2)
+; Used by both NOP-with-permarp and ARP effect
+do_arp_calc:
+        ldy     mod3counter
+        beq     @arp_val2
+        dey
+        bne     @arp_val0
+        ; mod3=1: high nibble + note
+        lsr     a
+        lsr     a
+        lsr     a
+        lsr     a
+        clc
+        adc     chn_note,x
+        bcc     @arp_done
+@arp_val0:
+        ; mod3=2: just note
+        lda     chn_note,x
+        clc
+        bcc     @arp_done
+@arp_val2:
+        ; mod3=0: low nibble + note
+        lda     chn_permarp,x
+        and     #$0f
+        clc
+        adc     chn_note,x
+@arp_done:
+        adc     chn_transpose,x
+        tay
+        lda     freqtable_lo,y
+        sta     chn_notefreqlo,x
+        sta     chn_freqlo,x
+        lda     freqtable_hi,y
+        sta     chn_notefreqhi,x
+        sta     chn_freqhi,x
+        jmp     do_slide_vib
+
 fx_haseffect:
+        ; Clear permarp unconditionally - arp will set it, others need it cleared
+        ; This saves 4 instructions vs conditional clear with PHA/PLA
+        tay                             ; save effect to Y
+        lda     #0
+        sta     chn_permarp,x
+        tya                             ; restore effect to A
         ; Binary search dispatch for effects 1-E (14 effects), all inlined
         cmp     #$80
         bcc     @fx_1_to_7
@@ -705,36 +759,10 @@ fx_haseffect:
         ; Effects 1-3 (most common: arp, porta, speed)
         cmp     #$20
         bcs     @fx_2_3
-        ; Effect 1 = arpeggio (inlined)
-        ldy     mod3counter
-        beq     @arp_val2
-        dey
-        bne     @arp_val0
+        ; Effect 1 = arpeggio - sets permarp and uses shared arp calc
         lda     chn_effectpar,x
-        lsr     a
-        lsr     a
-        lsr     a
-        lsr     a
-        clc
-        adc     chn_note,x
-        bcc     @arp_done
-@arp_val0:
-        lda     chn_note,x
-        bcc     @arp_done
-@arp_val2:
-        lda     chn_effectpar,x
-        and     #$0f
-        adc     chn_note,x
-@arp_done:
-        adc     chn_transpose,x
-        tay
-        lda     freqtable_lo,y
-        sta     chn_notefreqlo,x
-        sta     chn_freqlo,x
-        lda     freqtable_hi,y
-        sta     chn_notefreqhi,x
-        sta     chn_freqhi,x
-        jmp     do_slide_vib
+        sta     chn_permarp,x
+        jmp     do_arp_calc
 @fx_2_3:
         beq     @fx_2
         ; Effect 3 = speed (inlined)
@@ -804,15 +832,13 @@ fx_haseffect:
         cmp     #$90
         bcs     @fx_9
         ; Effect 8 = pulse width (inlined, hardcoded values)
+        ; param==0: A=0 from effectpar, param!=0: A=$08
         lda     chn_effectpar,x
-        beq     @pulse_zero
-        lda     #$08                ; param!=0: hi=$08, lo=$00
+        beq     @pulse_set
+        lda     #$08
+@pulse_set:
         sta     chn_plswidthhi,x
         lda     #$00
-        beq     @pulse_done
-@pulse_zero:
-        sta     chn_plswidthhi,x    ; param==0: hi=$00, lo=$00
-@pulse_done:
         sta     chn_plswidthlo,x
         jmp     do_slide_vib
 @fx_9:
@@ -833,23 +859,24 @@ fx_haseffect:
         sta     chn_slideenable,x
         ldy     chn_effectpar,x
         beq     @slide_up
+        ; slide down (param != 0)
         lda     chn_slidedelta_lo,x
         sec
         sbc     #$20
         sta     chn_slidedelta_lo,x
-        bcs     @slide_dn_done
+        bcs     @slide_exit
         dec     chn_slidedelta_hi,x
-@slide_dn_done:
+        ; fall through to @slide_exit
+@slide_exit:
         jmp     do_slide_vib
 @slide_up:
         lda     chn_slidedelta_lo,x
         clc
         adc     #$20
         sta     chn_slidedelta_lo,x
-        bcc     @slide_up_done
+        bcc     @slide_exit             ; branch backward if no overflow
         inc     chn_slidedelta_hi,x
-@slide_up_done:
-        jmp     do_slide_vib
+        bcs     @slide_exit             ; branch backward (always taken, C=1 from adc)
 @fx_c_to_e:
         cmp     #$e0
         bcs     do_slide_vib            ; Effect E removed (position jumps converted to breaks)
@@ -868,7 +895,7 @@ fx_haseffect:
         bne     @fx_exit3
         lda     chn_effectpar,x
         sta     filter_mode
-        jmp     do_slide_vib
+        ; fall through to do_slide_vib
 do_slide_vib:
         jsr     checkpoint
         lda     chn_slideenable,x
@@ -951,8 +978,7 @@ filtdone:
         bmi     @hr_newpat
         ldx     trackrow
         inx
-        txa
-        and     #$3f
+        cpx     #$40
         bne     @hr_setpos
 @hr_newpat:
         ldx     #0
@@ -960,8 +986,7 @@ filtdone:
 @hr_setpos:
         stx     hrtrackrow
         sty     hrordernumber
-        txa
-        sta     decode_row
+        stx     decode_row
         lda     speedcounter
         clc
         adc     chn_hardrestart+0
@@ -1073,13 +1098,12 @@ decode_order_bitstream:
         stx     dob_save_x+1        ; SMC: save X for later restore
         ; Calculate zp_ptr = bitstream_addr + order * 4
         txa
-        asl     a                   ; A = order * 2, carry into high byte
-        sta     zp_ptr              ; temp store low * 2
+        asl     a                   ; A = order * 2
+        asl     a                   ; A = (order * 4) & $FF, C = overflow bit
+        sta     zp_ptr
         lda     #0
-        rol     a                   ; A = high byte so far
+        rol     a                   ; A = 0 or 1 (high byte of order * 4)
         sta     zp_ptr+1
-        asl     zp_ptr              ; low * 4
-        rol     zp_ptr+1            ; high byte (0, 1, 2, or 3 depending on order)
         jsr     checkpoint
         lda     zp_ptr
         clc
@@ -1088,27 +1112,21 @@ decode_order_bitstream:
         lda     zp_ptr+1
         adc     bitstream_addr+1
         sta     zp_ptr+1
-        ; Read 4 bytes from bitstream
-        ldy     #0
+        ; Read 4 bytes from bitstream (loop, reverse order)
+        ldy     #3
+@bs_loop:
         lda     (zp_ptr),y
-        sta     bs_byte0
-        iny
-        lda     (zp_ptr),y
-        sta     bs_byte1
-        iny
-        lda     (zp_ptr),y
-        sta     bs_byte2
-        iny
-        lda     (zp_ptr),y
-        sta     bs_byte3
+        sta     bs_byte0,y
+        dey
+        bpl     @bs_loop
         jsr     checkpoint
         ; Extract transpose values (4 bits each)
-        ; ch0_tr = byte0 & $0F
+        ; ch0_tr = byte0 & $0F, ch1_tr = byte0 >> 4
         lda     bs_byte0
+        tay                         ; cache byte0 in Y
         and     #$0F
         sta     decoded_transpose+0
-        ; ch1_tr = byte0 >> 4
-        lda     bs_byte0
+        tya                         ; restore byte0
         lsr     a
         lsr     a
         lsr     a
@@ -1116,12 +1134,13 @@ decode_order_bitstream:
         sta     decoded_transpose+1
         ; ch2_tr = byte1 & $0F
         lda     bs_byte1
+        tay                         ; cache byte1 in Y (preserved across checkpoint)
         and     #$0F
         sta     decoded_transpose+2
         jsr     checkpoint
         ; Extract trackptr indices (5 bits each)
         ; ch0_tp = (byte1 >> 4) | ((byte2 & 1) << 4)
-        lda     bs_byte1
+        tya                         ; restore byte1
         lsr     a
         lsr     a
         lsr     a
@@ -1265,15 +1284,14 @@ gto_store_to_buffer:
         ; Check if this is a gap zero (zp_is_gap_zero set by decode_advance_row)
         lda     zp_is_gap_zero
         beq     @copy_prev_row
-        ; Gap zero: output zeros (unrolled for speed)
+        ; Gap zero: output zeros (loop, stores in reverse order)
         lda     #0
-        ldy     #0
+        ldy     #2
+@gap_loop:
         sta     (zp_temp1),y
-        iny
-        sta     (zp_temp1),y
-        iny
-        sta     (zp_temp1),y
-        bne     @store_done             ; always taken (Y=2)
+        dey
+        bpl     @gap_loop
+        bmi     @store_done             ; always taken (Y=$FF)
 @copy_prev_row:
         ; Normal row: copy prev_row to decode buffer
         ldy     #0
@@ -1317,11 +1335,7 @@ dar_not_gap:
         beq     dar_not_rle
         ; RLE: prev_row stays same, just decrement count and set gap
         dec     chn_rle_count,x
-        lda     chn_gap,x
-        beq     @rle_done
-        sta     chn_gap_remaining,x
-@rle_done:
-        rts
+        jmp     dar_set_gap
 dar_not_rle:
         ; Set up source pointer from pattern index
         ; Calculate source: song_base + packed_ptrs[pattern_idx]
@@ -1358,16 +1372,14 @@ dar_not_rle:
         bcc     dar_dict_zero_rle   ; $00-$0F: dict[0] with RLE 0-15
         cmp     #$EF
         bcs     dar_check_special   ; $EF-$FF: RLE, note-only, or extended
-        ; $10-$EE: dict[1-223] - subtract $0F to get actual index (fall through)
+        ; $10-$EE: dict[1-223] - subtract $10 to get direct offset (fall through)
         sec
-        sbc     #$0F                ; $10->1, $11->2, etc.
+        sbc     #$10                ; $10->0, $11->1, etc. (dict[1] at offset 0)
         ; Fall through to dar_copy_dict_entry
-; Copy dict entry A to prev_row (primary index 1-224)
+; Copy dict entry A to prev_row (A = offset into split dicts)
 ; Split dict format: 3 separate arrays indexed by Y
-; dict[0] is implicit (always 0), so dict[1] is at offset 0
 dar_copy_dict_entry:
         tay
-        dey                         ; Y = index - 1 (dict[1] at offset 0)
         lda     (zp_dict0),y
         sta     chn_prev_row_0,x
         lda     (zp_dict1),y
@@ -1452,10 +1464,11 @@ dar_ext_direct:
         ; Fall through to dar_set_gap
 dar_set_gap:
         ; Set up implicit zeros after this row (gap encoding)
+        ; Note: gap_remaining is already 0 when we reach here (checked at entry),
+        ; so storing 0 when gap=0 is harmless - skip the beq check
         lda     chn_gap,x
-        beq     @skip               ; gap=0: skip sta (gap_remaining already 0)
         sta     chn_gap_remaining,x
-@skip:  rts
+        rts
 
 ; ============================================================================
 ; Data Section (player variables initialized to zero serve as boundary marker)
@@ -1473,6 +1486,8 @@ chn_inst_ptr_lo:        .byte   0, 0, 0
 chn_inst_ptr_hi:        .byte   0, 0, 0
 chn_effect:             .byte   0, 0, 0
 chn_effectpar:          .byte   0, 0, 0
+chn_permarp:            .byte   0, 0, 0  ; Permanent arpeggio param (set by arp effect, used by NOP)
+permarp_pad:            .byte   0        ; Padding to keep PLAYERVARSSIZE even
 chn_waveform:           .byte   0, 0, 0
 chn_ad:                 .byte   0, 0, 0
 chn_sr:                 .byte   0, 0, 0

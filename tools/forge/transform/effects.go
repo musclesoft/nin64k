@@ -42,7 +42,6 @@ const (
 	PlayerEffectSlide    = 11 // Pitch slide (accumulates delta)
 	PlayerEffectGlobVol  = 12 // Global volume
 	PlayerEffectFiltMode = 13 // Filter mode
-	PlayerEffectPermArp  = 14 // Permanent arpeggio (reserved)
 )
 
 // Player effect 0 param values
@@ -95,8 +94,6 @@ func PlayerEffectName(eff byte) string {
 		return "globalvol"
 	case PlayerEffectFiltMode:
 		return "filtmode"
-	case PlayerEffectPermArp:
-		return "permarp"
 	default:
 		return "unknown"
 	}

@@ -10,7 +10,7 @@ func encodeB1(inst, effect byte) byte {
 	return (inst & 0x1F) | ((effect & 7) << 5)
 }
 
-func deepCopyPatterns(patterns []TransformedPattern) []TransformedPattern {
+func DeepCopyPatterns(patterns []TransformedPattern) []TransformedPattern {
 	result := make([]TransformedPattern, len(patterns))
 	for i, pat := range patterns {
 		result[i] = TransformedPattern{

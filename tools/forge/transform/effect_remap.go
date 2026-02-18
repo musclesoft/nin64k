@@ -16,10 +16,9 @@ package transform
 //	GT $1 (portaup):    96 -> 11
 //	F globalvol:        66 -> 12
 //	F filtmode:         40 -> 13
-//	perm arp:              -> 14
 //
-// Returns effectRemap, fSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect.
-func BuildGlobalEffectRemap() ([16]byte, map[int]byte, byte, byte, byte, byte) {
+// Returns effectRemap, fSubRemap, portaUpEffect, portaDownEffect, tonePortaEffect.
+func BuildGlobalEffectRemap() ([16]byte, map[int]byte, byte, byte, byte) {
 	effectRemap := [16]byte{}
 	fSubRemap := make(map[int]byte)
 
@@ -46,11 +45,9 @@ func BuildGlobalEffectRemap() ([16]byte, map[int]byte, byte, byte, byte, byte) {
 	fSubRemap[GTSubCodeGlobalVol] = 12 // 66
 	fSubRemap[GTSubCodeFiltMode] = 13  // 40
 
-	var permArpEffect byte = 14
-
 	portaUpEffect := effectRemap[GTEffectPortaUp]
 	portaDownEffect := effectRemap[GTEffectPortaDown]
 	tonePortaEffect := effectRemap[GTEffectTonePorta]
 
-	return effectRemap, fSubRemap, permArpEffect, portaUpEffect, portaDownEffect, tonePortaEffect
+	return effectRemap, fSubRemap, portaUpEffect, portaDownEffect, tonePortaEffect
 }

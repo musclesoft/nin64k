@@ -27,11 +27,10 @@ func BuildRemapAndTransform(
 	analyses [9]analysis.SongAnalysis,
 ) RemapResult {
 	fmt.Println("\n=== Build global effect remap ===")
-	globalEffectRemap, globalFSubRemap, permArpEffect, portaUpEffect, _, tonePortaEffect := transform.BuildGlobalEffectRemap()
+	globalEffectRemap, globalFSubRemap, portaUpEffect, _, tonePortaEffect := transform.BuildGlobalEffectRemap()
 	transformOpts := transform.TransformOptions{
-		PermanentArp:     false,
-		PermArpEffect:    permArpEffect,
-		MaxPermArpRows:   0,
+		PermanentArp:   true,
+		MaxPermArpRows: 0,
 		PersistPorta:     false,
 		PortaUpEffect:    portaUpEffect,
 		PortaDownEffect:  0,
@@ -113,6 +112,46 @@ func BuildRemapAndTransform(
 		}
 		if converted > 0 {
 			fmt.Printf("  %s: %d rows -> NOP\n", transform.PlayerEffectName(eff), converted)
+		}
+	}
+
+	// Permarp optimization runs AFTER persistent FX optimization to avoid
+	// creating NOPs that incorrectly inherit permarp
+	if transformOpts.PermanentArp {
+		fmt.Println("\n=== Permanent arpeggio optimization ===")
+		arpEffect := globalEffectRemap[0xA]
+		if arpEffect != 0 {
+			totalCross := 0
+			// Store original patterns for verification (before any permarp optimization)
+			origPatternsForVerify := make([][]transform.TransformedPattern, len(songNames))
+			for i := range songNames {
+				if rawData[i] == nil {
+					continue
+				}
+				origPatternsForVerify[i] = transform.DeepCopyPatterns(transformedSongs[i].Patterns)
+
+				// Within-pattern optimization
+				transformedSongs[i].Patterns = transform.OptimizeArpToPermanent(
+					transformedSongs[i].Patterns, arpEffect, nil)
+
+				// Cross-pattern optimization (includes boundary protection)
+				var crossConverted int
+				transformedSongs[i].Patterns, crossConverted = transform.OptimizeCrossPatternArp(
+					transformedSongs[i].Patterns, transformedSongs[i].Orders, arpEffect)
+				totalCross += crossConverted
+			}
+			fmt.Printf("  Cross-pattern: %d rows converted\n", totalCross)
+
+			// Verify after ALL permarp optimizations (including boundary protection)
+			for i, name := range songNames {
+				if rawData[i] == nil {
+					continue
+				}
+				if err := transform.VerifyFullSongPermarp(origPatternsForVerify[i], transformedSongs[i].Patterns, transformedSongs[i].Orders, arpEffect); err != nil {
+					fmt.Printf("FATAL: %s permarp verification failed:\n%v\n", name, err)
+					os.Exit(1)
+				}
+			}
 		}
 	}
 

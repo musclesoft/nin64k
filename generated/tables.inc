@@ -8,7 +8,7 @@ delta_table:
 	.byte	$03, $E8, $FE, $04, $05, $07, $13, $0C, $0D, $2C, $DA, $1D, $ED, $D2, $1B	; 48
 
 TRACKPTR_START = 46
-ROW_DICT_SIZE = 347
+ROW_DICT_SIZE = 349
 
 ; Transpose table: 45 bytes
 transpose_table:

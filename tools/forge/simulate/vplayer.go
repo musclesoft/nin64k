@@ -496,7 +496,7 @@ func (vp *VirtualPlayer) processRow() {
 			c.slideDeltaLo = 0
 			c.slideDeltaHi = 0
 			c.slideEnable = 0
-			c.permArp = 0 // Clear permanent arp on new note
+			// Note: permArp is NOT cleared on note - ASM player preserves permArp across notes
 		} else if note == 0x61 { // Key off ($61 = note off)
 			c.gateon = 0xFE
 			if vpDebug && ch == 2 && vp.currentFrame >= 360 && vp.currentFrame <= 420 {
@@ -1088,6 +1088,12 @@ func (vp *VirtualPlayer) processFilter() {
 func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 	c := &vp.chn[ch]
 
+	// Clear permArp for effects other than Special (0) and Arp (1)
+	// Special handles permArp clearing based on param; Arp sets permArp
+	if effect != PlayerEffectSpecial && effect != PlayerEffectArp {
+		c.permArp = 0
+	}
+
 	switch effect {
 	case PlayerEffectSpecial:
 		// No effect or special param
@@ -1095,6 +1101,9 @@ func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 			c.patArp = c.permArp // Apply permanent arp on NOP rows
 		} else {
 			c.patArp = 0 // Clear pattern arpeggio
+			if param != PlayerParam0Nop {
+				c.permArp = 0 // Non-NOP clears permarp (including NOP(HARD))
+			}
 		}
 		if param == PlayerParam0VibOff {
 			// GT vibrato - disable vibrato
@@ -1115,8 +1124,8 @@ func (vp *VirtualPlayer) processEffect(ch int, effect, param byte) {
 			}
 		}
 	case PlayerEffectArp:
-		// Pattern arpeggio - clears permanent arp
-		c.permArp = 0
+		// Pattern arpeggio - sets permanent arp for permarp optimization
+		c.permArp = param
 		c.patArp = param
 	case PlayerEffectPorta:
 		// Portamento - sliding handled in processInstrument

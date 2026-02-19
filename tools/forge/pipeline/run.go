@@ -75,23 +75,18 @@ func runVPValidation(
 			transposeBytes[j] = byte(v)
 		}
 
-		simulate.SetVPDebugSong("")
-		simulate.SetVPDebugFrame(0)
-
 		ok, writes, msg := simulate.CompareVirtual(
-			ps.Name,
 			origWrites,
 			outputs[i],
 			deltaBytes,
 			transposeBytes,
 			tables.GlobalWave.Data,
-			ps.Transformed,
-			ps.Encoded,
+			len(ps.Encoded.PatternOffsets),
 			testFrames,
 			tables.DeltaResult.StartConst,
 		)
 		if ok {
-			fmt.Printf("  %s: VPASS (%d writes)\n", ps.Name, writes)
+			fmt.Printf("  %s: PASS (%d writes)\n", ps.Name, writes)
 			vpPassed++
 		} else {
 			fmt.Printf("  %s: VFAIL - %s at write %d\n", ps.Name, msg, writes)

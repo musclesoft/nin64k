@@ -19,7 +19,8 @@ func Serialize(song transform.TransformedSong, encoded encode.EncodedSong) []byt
 	if numOrders > MaxOrders {
 		panic(fmt.Sprintf("too many orders: %d > %d", numOrders, MaxOrders))
 	}
-	bitstream := encode.PackOrderBitstream(numOrders, encoded.TempTranspose, encoded.TempTrackptr)
+	hrSkip := encode.ComputeHRSkipMask(song)
+	bitstream := encode.PackOrderBitstreamWithHR(numOrders, encoded.TempTranspose, encoded.TempTrackptr, hrSkip)
 	copy(output[BitstreamOffset:], bitstream)
 
 	filterSize := len(song.FilterTable)
@@ -683,7 +684,8 @@ func SerializeWithWaveRemap(
 		}
 	}
 
-	bitstream := encode.PackOrderBitstream(numOrders, relTranspose, relTrackptr)
+	hrSkip := encode.ComputeHRSkipMask(song)
+	bitstream := encode.PackOrderBitstreamWithHR(numOrders, relTranspose, relTrackptr, hrSkip)
 	copy(output[BitstreamOffset:], bitstream)
 
 	copy(output[FilterOffset:], song.FilterTable[:filterSize])

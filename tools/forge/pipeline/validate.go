@@ -391,14 +391,12 @@ func testEquivConfig(
 	)
 
 	ok, _, _ := simulate.CompareVirtual(
-		ps.Name,
 		origWrites,
 		output,
 		deltaBytes,
 		transposeBytes,
 		globalWaveData,
-		ps.Transformed,
-		encoded,
+		len(encoded.PatternOffsets),
 		testFrames,
 		startConst,
 	)

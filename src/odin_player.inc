@@ -987,12 +987,73 @@ filtdone:
         stx     hrtrackrow
         sty     hrordernumber
         stx     decode_row
+        ; Check if hrtrackrow == 0 (pattern boundary)
+        bne     @hr_within
+        jmp     @hr_boundary
+@hr_within:
+        ; Within pattern: check if prefetch is valid
+        lda     prefetch_done
+        bmi     @hr_prefetch_valid
+        jmp     @hr_no_prefetch
+@hr_prefetch_valid:
+        lda     prefetch_order
+        cmp     hrordernumber
+        beq     :+
+        jmp     @hr_no_prefetch
+:       lda     prefetch_row
+        cmp     hrtrackrow
+        beq     :+
+        jmp     @hr_no_prefetch
+:       ; Prefetch valid - use decode buffers directly
         lda     speedcounter
         clc
         adc     chn_hardrestart+0
         cmp     speed
-        bcc     @hr1
+        bcs     :+
+        jmp     @hr1_pf
+:       lda     decode_buffer_lo
+        sta     zp_trackptr
+        lda     decode_buffer_hi
+        sta     zp_trackptr+1
+        ldx     #0
+        jsr     check_hardrestart
+@hr1_pf:
         jsr     checkpoint
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+1
+        cmp     speed
+        bcs     :+
+        jmp     @hr2_pf
+:       lda     decode_buffer_lo+1
+        sta     zp_trackptr
+        lda     decode_buffer_hi+1
+        sta     zp_trackptr+1
+        ldx     #1
+        jsr     check_hardrestart
+@hr2_pf:
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+2
+        cmp     speed
+        bcs     :+
+        jmp     @dump
+:       lda     decode_buffer_lo+2
+        sta     zp_trackptr
+        lda     decode_buffer_hi+2
+        sta     zp_trackptr+1
+        ldx     #2
+        jsr     check_hardrestart
+        jmp     @dump
+@hr_no_prefetch:
+        ; No prefetch - decode on demand
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+0
+        cmp     speed
+        bcs     :+
+        jmp     @hr1
+:       jsr     checkpoint
         ldx     hrordernumber
         ldy     #0
         jsr     get_trackptr_order
@@ -1004,8 +1065,9 @@ filtdone:
         clc
         adc     chn_hardrestart+1
         cmp     speed
-        bcc     @hr2
-        ldx     hrordernumber
+        bcs     :+
+        jmp     @hr2
+:       ldx     hrordernumber
         ldy     #1
         jsr     get_trackptr_order
         jsr     checkpoint
@@ -1016,13 +1078,61 @@ filtdone:
         clc
         adc     chn_hardrestart+2
         cmp     speed
-        bcc     @dump
-        jsr     checkpoint
+        bcs     :+
+        jmp     @dump
+:       jsr     checkpoint
         ldx     hrordernumber
         ldy     #2
         jsr     get_trackptr_order
         ldx     #2
         jsr     check_hardrestart
+        jmp     @dump
+@hr_boundary:
+        ; Pattern boundary: read HR skip mask once
+        ldx     ordernumber
+        jsr     decode_order_bitstream
+        lda     bs_byte3
+        lsr     a
+        lsr     a
+        lsr     a                   ; HR skip mask now in bits 0-2
+        sta     hr_skip_mask
+        ; Check each channel with mask
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+0
+        cmp     speed
+        bcc     @hr_b1
+        lda     hr_skip_mask
+        lsr     a                   ; Shift bit 0 into carry
+        bcs     @hr_b1              ; Skip if bit was set
+        ldx     #0
+        jsr     do_hardrestart
+@hr_b1:
+        jsr     checkpoint
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+1
+        cmp     speed
+        bcc     @hr_b2
+        lda     hr_skip_mask
+        lsr     a
+        lsr     a                   ; Shift bit 1 into carry
+        bcs     @hr_b2
+        ldx     #1
+        jsr     do_hardrestart
+@hr_b2:
+        lda     speedcounter
+        clc
+        adc     chn_hardrestart+2
+        cmp     speed
+        bcc     @dump
+        lda     hr_skip_mask
+        lsr     a
+        lsr     a
+        lsr     a                   ; Shift bit 2 into carry
+        bcs     @dump
+        ldx     #2
+        jsr     do_hardrestart
 
 @dump:
         ldx     #$00
@@ -1057,7 +1167,18 @@ filtdone:
         jmp     checkpoint
 
 ; ============================================================================
+; do_hardrestart - Perform hard restart for channel X
+; ============================================================================
+do_hardrestart:
+        lda     #$00
+        sta     chn_waveform,x
+        sta     chn_ad,x
+        sta     chn_sr,x
+        rts
+
+; ============================================================================
 ; check_hardrestart - Check if hard restart needed for channel X
+; Used only for within-pattern HR checks (hrtrackrow != 0)
 ; ============================================================================
 check_hardrestart:
         ldy     #0
@@ -1074,11 +1195,7 @@ check_hardrestart:
         cmp     #$40              ; tone portamento (new effect 2 = bits 0-2 = 2 = 0x40 >> 5)
         beq     @done
 @do_hr:
-        ; Zero waveform, AD, SR for hard restart
-        lda     #$00
-        sta     chn_waveform,x
-        sta     chn_ad,x
-        sta     chn_sr,x
+        jmp     do_hardrestart
 @done:
         rts
 
@@ -1526,7 +1643,9 @@ decode_row:             .byte   0       ; current row for pattern decode
 ordernumber:            .byte   0
 nextordernumber:        .byte   0
 hrordernumber:          .byte   0
+hr_skip_mask:           .byte   0       ; HR skip mask from bitstream (bits 0-2 for ch 0-2)
 forcenewpattern:        .byte   0
+hr_pad:                 .byte   0       ; Padding to keep PLAYERVARSSIZE even
 prefetch_done:          .byte   0       ; $80 = prefetch valid
 prefetch_order:         .byte   0       ; order position used for prefetch
 prefetch_row:           .byte   0       ; row used for prefetch

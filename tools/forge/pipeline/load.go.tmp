@@ -85,79 +85,20 @@ func LoadAndAnalyze(cfg *Config, songNames []string) (
 			}
 		}
 
-		// Helper to check if row 0 of a pattern should skip HR
-		shouldSkipHR := func(patAddr uint16) bool {
-			pat, ok := song.Patterns[patAddr]
-			if !ok || len(pat.Rows) == 0 {
-				return true // Empty pattern - skip HR
-			}
-			row := pat.Rows[0]
-			note := row.Note & 0x7F
-			effect := row.Effect
-
-			if note == 0 || note == 0x61 {
-				return true // No note or key off
-			}
-			if effect&0x08 != 0 {
-				return false // Immediate HR
-			}
-			if effect == 2 {
-				return true // Portamento
-			}
-			return false // Normal note - do HR
-		}
-
 		// Build order list: if we need extra orders for prefetch but they introduce new patterns,
-		// find a played order with matching HR behavior and add it as a duplicate
+		// include the played orders, then add the next order (for prefetch to decode)
 		var limitedOrders []int
 		duplicateOrderForPrefetch := -1
-		duplicateOrderSource := -1
 		if needsExtra && ordersIntroduceNewPatterns {
-			// Get HR behavior for the next order (which we want to avoid including)
-			nextOrderIdx := highestPlayed + 1
-			nextOrderHRBehavior := [3]bool{}
-			if nextOrderIdx < song.NumOrders {
-				for ch := 0; ch < 3; ch++ {
-					if nextOrderIdx < len(song.Orders[ch]) {
-						patAddr := song.Orders[ch][nextOrderIdx].PatternAddr
-						nextOrderHRBehavior[ch] = shouldSkipHR(patAddr)
-					}
-				}
-			}
-
-			// Find a played order with matching HR behavior
-			bestSource := 0
-			bestMatchScore := -1
-			for _, srcOrd := range playedOrders {
-				if srcOrd >= song.NumOrders {
-					continue
-				}
-				matchScore := 0
-				for ch := 0; ch < 3; ch++ {
-					if srcOrd < len(song.Orders[ch]) {
-						patAddr := song.Orders[ch][srcOrd].PatternAddr
-						srcHRBehavior := shouldSkipHR(patAddr)
-						if srcHRBehavior == nextOrderHRBehavior[ch] {
-							matchScore++
-						}
-					}
-				}
-				if matchScore > bestMatchScore {
-					bestMatchScore = matchScore
-					bestSource = srcOrd
-				}
-			}
-
-			// Include played orders
+			// Include played orders, plus the next order
 			for _, ord := range fullAnal.ReachableOrders {
 				if ord <= highestPlayed {
 					limitedOrders = append(limitedOrders, ord)
 				}
 			}
-			// Add the matched source order as a duplicate
+			// Add the next order (its bitstream will be duplicated from a matching played order)
 			duplicateOrderForPrefetch = highestPlayed + 1
-			duplicateOrderSource = bestSource
-			limitedOrders = append(limitedOrders, bestSource)
+			limitedOrders = append(limitedOrders, duplicateOrderForPrefetch)
 			cutoff = duplicateOrderForPrefetch
 		} else {
 			// Normal case: include all orders up to cutoff
@@ -175,10 +116,80 @@ func LoadAndAnalyze(cfg *Config, songNames []string) (
 			os.Exit(1)
 		}
 
+		// Count extra patterns from orders beyond highestPlayed
+		extraPatterns := 0
+		for addr := range anal.PatternAddrs {
+			if !playedPatterns[addr] {
+				extraPatterns++
+			}
+		}
+
 		// Store duplicate order info for serialization
 		if duplicateOrderForPrefetch >= 0 {
+			// Helper to check if row 0 of a pattern should skip HR
+			shouldSkipHR := func(patAddr uint16) bool {
+				pat, ok := song.Patterns[patAddr]
+				if !ok || len(pat.Rows) == 0 {
+					return true // Empty pattern - skip HR
+				}
+				row := pat.Rows[0]
+				note := row.Note & 0x7F
+				effect := row.Effect
+
+				if note == 0 || note == 0x61 {
+					return true // No note or key off
+				}
+				if effect&0x08 != 0 {
+					return false // Immediate HR
+				}
+				if effect == 2 {
+					return true // Portamento
+				}
+				return false // Normal note - do HR
+			}
+
+			// Get HR behavior for duplicate order's patterns
+			dupHRBehavior := [3]bool{}
+			if duplicateOrderForPrefetch < song.NumOrders {
+				for ch := 0; ch < 3; ch++ {
+					if duplicateOrderForPrefetch < len(song.Orders[ch]) {
+						patAddr := song.Orders[ch][duplicateOrderForPrefetch].PatternAddr
+						dupHRBehavior[ch] = shouldSkipHR(patAddr)
+					}
+				}
+			}
+
+			// Find an order in playedOrders with matching HR behavior
+			bestSource := highestPlayed
+			bestMatchScore := -1
+			for _, srcOrd := range playedOrders {
+				if srcOrd >= song.NumOrders {
+					continue
+				}
+				matchScore := 0
+				for ch := 0; ch < 3; ch++ {
+					if srcOrd < len(song.Orders[ch]) {
+						patAddr := song.Orders[ch][srcOrd].PatternAddr
+						srcHRBehavior := shouldSkipHR(patAddr)
+						if srcHRBehavior == dupHRBehavior[ch] {
+							matchScore++
+						}
+					}
+				}
+				if matchScore > bestMatchScore {
+					bestMatchScore = matchScore
+					bestSource = srcOrd
+				}
+			}
+
 			anal.DuplicateOrder = duplicateOrderForPrefetch
-			anal.DuplicateSource = duplicateOrderSource
+			anal.DuplicateSource = bestSource
+
+			if name == "d2p" || bestMatchScore < 3 {
+				fmt.Printf("  %s: dup=%d from %d (HR match=%d/3), dup HR=[%v,%v,%v]\n",
+					name, duplicateOrderForPrefetch, bestSource, bestMatchScore,
+					dupHRBehavior[0], dupHRBehavior[1], dupHRBehavior[2])
+			}
 		}
 
 		fmt.Printf("  %s: %d bytes, %d frames -> %d orders, %d patterns\n",

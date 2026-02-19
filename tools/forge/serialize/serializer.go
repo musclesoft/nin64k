@@ -20,7 +20,7 @@ func Serialize(song transform.TransformedSong, encoded encode.EncodedSong) []byt
 		panic(fmt.Sprintf("too many orders: %d > %d", numOrders, MaxOrders))
 	}
 	hrSkip := encode.ComputeHRSkipMask(song)
-	bitstream := encode.PackOrderBitstreamWithHR(numOrders, encoded.TempTranspose, encoded.TempTrackptr, hrSkip)
+	bitstream := encode.PackOrderBitstreamWithHR(numOrders, encoded.TempTranspose, encoded.TempTrackptr, hrSkip, -1, -1)
 	copy(output[BitstreamOffset:], bitstream)
 
 	filterSize := len(song.FilterTable)
@@ -554,7 +554,7 @@ func SerializeWithTables(
 	deltaBase int,
 	transposeBase int,
 ) []byte {
-	return SerializeWithWaveRemap(song, encoded, deltaToIdx, transposeToIdx, deltaBase, transposeBase, nil, 0)
+	return SerializeWithWaveRemap(song, encoded, deltaToIdx, transposeToIdx, deltaBase, transposeBase, nil, 0, -1, -1)
 }
 
 func SerializeWithWaveRemap(
@@ -566,6 +566,8 @@ func SerializeWithWaveRemap(
 	transposeBase int,
 	waveRemap map[int][3]int,
 	startConst int,
+	duplicateOrder int,
+	duplicateSource int,
 ) []byte {
 	numPatterns := len(encoded.PatternData)
 	numOrders := len(song.Orders[0])
@@ -672,6 +674,8 @@ func SerializeWithWaveRemap(
 
 			relTranspose[ch][i] = transposeToIdx[absTranspose]
 
+			// For duplicate orders, compute delta relative to actual previous order
+			// (not relative to the source's previous order)
 			delta := absTrackptr - prevTrackptr
 			if delta > 127 {
 				delta -= 256
@@ -684,8 +688,8 @@ func SerializeWithWaveRemap(
 		}
 	}
 
-	hrSkip := encode.ComputeHRSkipMask(song)
-	bitstream := encode.PackOrderBitstreamWithHR(numOrders, relTranspose, relTrackptr, hrSkip)
+	hrSkip := encode.ComputeHRSkipMaskWithDuplicate(song, duplicateOrder, duplicateSource)
+	bitstream := encode.PackOrderBitstreamWithHR(numOrders, relTranspose, relTrackptr, hrSkip, duplicateOrder, duplicateSource)
 	copy(output[BitstreamOffset:], bitstream)
 
 	copy(output[FilterOffset:], song.FilterTable[:filterSize])

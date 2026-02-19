@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"fmt"
 	"forge/parse"
 )
 
@@ -15,11 +16,20 @@ const gtEffectPosJump = 0xB
 
 // CountMaxOrderGT computes the highest order accessed during playback
 // using GT effect numbers (before remapping).
-// Returns maxOrder and the list of visited orders in playback sequence.
+// Returns maxOrder and the list of orders that were actually played (had frames executed).
 func CountMaxOrderGT(song parse.ParsedSong, frames int) (int, []int) {
+	maxOrder, playedOrders, _ := countMaxOrderGTWithDetails(song, frames, false)
+	return maxOrder, playedOrders
+}
+
+func CountMaxOrderGTWithStats(song parse.ParsedSong, frames int, verbose bool) (int, []int, bool) {
+	return countMaxOrderGTWithDetails(song, frames, verbose)
+}
+
+func countMaxOrderGTWithDetails(song parse.ParsedSong, frames int, verbose bool) (int, []int, bool) {
 	numOrders := song.NumOrders
 	if numOrders == 0 {
-		return 0, nil
+		return 0, nil, false
 	}
 
 	// Build pattern info: for each pattern, find speed changes, break row, and jump target
@@ -116,6 +126,13 @@ func CountMaxOrderGT(song parse.ParsedSong, frames int) (int, []int) {
 	visited[order] = true
 	visitedOrders = append(visitedOrders, order)
 
+	type orderPlayInfo struct {
+		order        int
+		jumpTarget   int
+		framesPlayed int
+	}
+	lastOrderInfo := make(map[int]orderPlayInfo)
+
 	for frameCount < frames {
 		frameCount++
 		speedCounter++
@@ -136,6 +153,14 @@ func CountMaxOrderGT(song parse.ParsedSong, frames int) (int, []int) {
 
 			if newSpeed, ok := info.speedChanges[row]; ok {
 				speed = newSpeed
+			}
+
+			// Track frame count for each order
+			if st, ok := lastOrderInfo[order]; ok {
+				st.framesPlayed++
+				lastOrderInfo[order] = st
+			} else {
+				lastOrderInfo[order] = orderPlayInfo{order: order, jumpTarget: info.jumpTarget, framesPlayed: 1}
 			}
 
 			row++
@@ -174,5 +199,51 @@ func CountMaxOrderGT(song parse.ParsedSong, frames int) (int, []int) {
 		}
 	}
 
-	return maxOrder, visitedOrders
+	// Build list of orders that were actually played (framesPlayed > 0)
+	playedOrders := make([]int, 0, len(lastOrderInfo))
+	for ord, info := range lastOrderInfo {
+		if info.framesPlayed > 0 {
+			playedOrders = append(playedOrders, ord)
+		}
+	}
+
+	// Sort played orders
+	for i := 0; i < len(playedOrders)-1; i++ {
+		for j := i + 1; j < len(playedOrders); j++ {
+			if playedOrders[i] > playedOrders[j] {
+				playedOrders[i], playedOrders[j] = playedOrders[j], playedOrders[i]
+			}
+		}
+	}
+
+	// Check if prefetch would try to decode beyond highestPlayed
+	// Prefetch happens at speedcounter == speed-1 before a pattern boundary
+	// So we need to check: did the song end with speedcounter >= speed-1 in the last pattern?
+	needsExtraOrder := (speedCounter >= speed-1) && (row >= orderInfos[order].breakRow || order != song.StartOrder)
+
+	if verbose {
+		if maxOrder < numOrders {
+			info := orderInfos[maxOrder]
+			if st, ok := lastOrderInfo[maxOrder]; ok {
+				if st.framesPlayed > 0 {
+					if info.jumpTarget >= 0 {
+						fmt.Printf("    [order %d: played %d frames, jumps to %d]\n", maxOrder, st.framesPlayed, info.jumpTarget)
+					} else {
+						fmt.Printf("    [order %d: played %d frames, continues to %d]\n", maxOrder, st.framesPlayed, maxOrder+1)
+					}
+				} else {
+					fmt.Printf("    [order %d: visited but not played (nextordernumber incremented, then jumped back)]\n", maxOrder)
+				}
+			}
+		}
+		fmt.Printf("    [actually played: %d orders]\n", len(playedOrders))
+		fmt.Printf("    [final state: order=%d row=%d speedcounter=%d/%d]\n", order, row, speedCounter, speed)
+		if needsExtraOrder {
+			fmt.Printf("    [prefetch needs next order - ended at/near pattern boundary]\n")
+		} else {
+			fmt.Printf("    [prefetch NOT needed - ended mid-pattern]\n")
+		}
+	}
+
+	return maxOrder, playedOrders, needsExtraOrder
 }

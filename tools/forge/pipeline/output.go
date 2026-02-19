@@ -43,6 +43,8 @@ func SerializeAndWrite(cfg *Config, songs [9]*ProcessedSong, tables TablesResult
 			tables.TransposeResult.Bases[i],
 			tables.GlobalWave.Remap[i],
 			tables.DeltaResult.StartConst,
+			ps.Anal.DuplicateOrder,
+			ps.Anal.DuplicateSource,
 		)
 
 		if err := verify.SerializeWithWaveRemap(ps.Transformed, ps.Encoded, output, tables.GlobalWave.Remap[i]); err != nil {

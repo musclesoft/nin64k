@@ -71,6 +71,8 @@ func checkExcludedEntries(
 				transposeResult.Bases[i],
 				globalWave.Remap[i],
 				deltaResult.StartConst,
+				-1,
+				-1,
 			)
 			encode.UseOverrideExcluded = false
 
@@ -410,6 +412,8 @@ func testEquivConfig(
 		transposeBase,
 		waveRemap,
 		startConst,
+		-1,
+		-1,
 	)
 
 	ok, _, _ := simulate.CompareVirtualWithDebug(
@@ -421,7 +425,7 @@ func testEquivConfig(
 		len(encoded.PatternOffsets),
 		testFrames,
 		startConst,
-		songNum == 1, // Enable debug for song 1
+		false,
 	)
 	return ok
 }

@@ -13,6 +13,10 @@ import "forge/transform"
 //
 // The mask is encoded as: bit 0 = ch0, bit 1 = ch1, bit 2 = ch2
 func ComputeHRSkipMask(song transform.TransformedSong) []byte {
+	return ComputeHRSkipMaskWithDuplicate(song, -1, -1)
+}
+
+func ComputeHRSkipMaskWithDuplicate(song transform.TransformedSong, duplicateOrder int, duplicateSource int) []byte {
 	numOrders := len(song.Orders[0])
 	if numOrders == 0 {
 		return nil
@@ -89,20 +93,35 @@ func ComputeHRSkipMask(song transform.TransformedSong) []byte {
 
 // PackOrderBitstreamWithHR packs the order bitstream with HR skip masks.
 // Byte 3 format: bits 0-2 = trackptr bits 2-4, bits 3-5 = HR skip mask
-func PackOrderBitstreamWithHR(numOrders int, transpose [3][]byte, trackptr [3][]byte, hrSkip []byte) []byte {
+// If duplicateOrder >= 0, order duplicateOrder will use data from duplicateSource
+func PackOrderBitstreamWithHR(numOrders int, transpose [3][]byte, trackptr [3][]byte, hrSkip []byte, duplicateOrder int, duplicateSource int) []byte {
 	out := make([]byte, numOrders*4)
 	for i := 0; i < numOrders; i++ {
-		ch0Tr := transpose[0][i] & 0x0F
-		ch1Tr := transpose[1][i] & 0x0F
-		ch2Tr := transpose[2][i] & 0x0F
+		// Use duplicate source if this is the duplicate order
+		// Note: trackptr deltas are already computed correctly in the arrays,
+		// so we always use index i for those
+		transposeIdx := i
+		if duplicateOrder >= 0 && i == duplicateOrder {
+			transposeIdx = duplicateSource
+		}
+
+		ch0Tr := transpose[0][transposeIdx] & 0x0F
+		ch1Tr := transpose[1][transposeIdx] & 0x0F
+		ch2Tr := transpose[2][transposeIdx] & 0x0F
 		ch0Tp := trackptr[0][i] & 0x1F
 		ch1Tp := trackptr[1][i] & 0x1F
 		ch2Tp := trackptr[2][i] & 0x1F
 
+		// For HR skip, use the source's value since it's based on patterns
+		hrIdx := i
+		if duplicateOrder >= 0 && i == duplicateOrder {
+			hrIdx = duplicateSource
+		}
+
 		out[i*4+0] = ch0Tr | (ch1Tr << 4)
 		out[i*4+1] = ch2Tr | ((ch0Tp & 0x0F) << 4)
 		out[i*4+2] = (ch0Tp >> 4) | (ch1Tp << 1) | ((ch2Tp & 0x03) << 6)
-		out[i*4+3] = (ch2Tp >> 2) | ((hrSkip[i] & 0x07) << 3)
+		out[i*4+3] = (ch2Tp >> 2) | ((hrSkip[hrIdx] & 0x07) << 3)
 	}
 	return out
 }

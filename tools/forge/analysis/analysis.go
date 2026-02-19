@@ -17,6 +17,8 @@ type SongAnalysis struct {
 	InstrumentFreq    map[int]int
 	FilterTriggerInst map[int]bool
 	TruncateLimits    map[uint16]int
+	DuplicateOrder    int // Order number that should duplicate DuplicateSource (-1 if none)
+	DuplicateSource   int // Source order to duplicate
 }
 
 func Analyze(song parse.ParsedSong, raw []byte) SongAnalysis {
@@ -30,6 +32,8 @@ func Analyze(song parse.ParsedSong, raw []byte) SongAnalysis {
 		InstrumentFreq:    make(map[int]int),
 		FilterTriggerInst: make(map[int]bool),
 		TruncateLimits:    make(map[uint16]int),
+		DuplicateOrder:    -1,
+		DuplicateSource:   -1,
 	}
 
 	analysis.ReachableOrders, analysis.OrderMap = findReachableOrders(song, raw)
@@ -128,6 +132,8 @@ func AnalyzeWithOrders(song parse.ParsedSong, raw []byte, reachableOrders []int)
 		InstrumentFreq:    make(map[int]int),
 		FilterTriggerInst: make(map[int]bool),
 		TruncateLimits:    make(map[uint16]int),
+		DuplicateOrder:    -1,
+		DuplicateSource:   -1,
 	}
 
 	// Build order map (old index -> new index)

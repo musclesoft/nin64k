@@ -933,9 +933,16 @@ do_slide_vib:
         adc     chn_slidedelta_hi,x
         sta     chn_freqhi,x
 @noslide:
-        jsr     checkpoint
         lda     chn_vibdepth,x
-        beq     @novib
+        bne     @vib_calc
+        ; Fast path: no vibrato, just copy freq to finfreq
+        lda     chn_freqlo,x
+        sta     chn_finfreqlo,x
+        lda     chn_freqhi,x
+        sta     chn_finfreqhi,x
+        jmp     pp_nextchn
+@vib_calc:
+        jsr     checkpoint
         lda     chn_vibpos,x
         and     #$1f
         cmp     #$10
@@ -974,12 +981,6 @@ do_slide_vib:
         clc
         adc     chn_vibspeed,x
         sta     chn_vibpos,x
-        jmp     pp_nextchn
-@novib:
-        lda     chn_freqlo,x
-        sta     chn_finfreqlo,x
-        lda     chn_freqhi,x
-        sta     chn_finfreqhi,x
 pp_nextchn:
         inx
         cpx     #$03

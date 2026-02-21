@@ -112,11 +112,11 @@ player_init:
         adc     #3                      ; A = base + 3
         sta     filter_load+2           ; $3CC high byte
         adc     #1                      ; A = base + 4 (C still clear)
-        sta     arp_load_addr+1         ; $4AF high byte
+        sta     smc_arp_load_addr+1         ; $4AF high byte
         lda     #$CC
         sta     filter_load+1           ; $3CC low byte
         lda     #$AF
-        sta     arp_load_addr           ; $4AF low byte
+        sta     smc_arp_load_addr           ; $4AF low byte
         lda     #$00
         sta     zp_song_base
         ; Clear player variables
@@ -537,7 +537,7 @@ pi_waveset:
         cmp     #$20
         beq     pi_skiparp
         ldy     chn_arpidx,x
-arp_load_addr = *+1
+smc_arp_load_addr = *+1
         lda     $FFFF,y
         bmi     pi_arpabs
         clc
@@ -1187,7 +1187,7 @@ decode_order_bitstream:
         rts
 @need_decode:
         stx     decoded_order
-        stx     dob_save_x+1        ; SMC: save X for later restore
+        stx     smc_dob_save_x+1        ; SMC: save X for later restore
         ; Calculate zp_ptr = bitstream_addr + order * 4
         txa
         asl     a                   ; A = order * 2
@@ -1266,7 +1266,7 @@ decode_order_bitstream:
         asl     a
         ora     decoded_trackptr_idx+2
         sta     decoded_trackptr_idx+2
-dob_save_x:
+smc_dob_save_x:
         ldx     #0                  ; SMC: restore original X
         rts
 
@@ -1274,9 +1274,9 @@ dob_save_x:
 ; Returns: A = transpose value (from transpose_table lookup)
 ; Bitstream stores relative indices (0-15), add base to get absolute
 get_transpose_order:
-        sty     gto_save_y+1        ; SMC: save channel
+        sty     smc_gto_save_y+1        ; SMC: save channel
         jsr     decode_order_bitstream  ; ensure order X is decoded
-gto_save_y:
+smc_gto_save_y:
         ldy     #0                  ; SMC: restored channel
         lda     decoded_transpose,y ; load relative index (0-15)
         clc
@@ -1288,12 +1288,12 @@ gto_save_y:
 ; get_trackptr_order - Get pattern index for channel Y at order X
 ; cur holds trackptr for ordernumber; next is computed as cur + delta_table[index]
 get_trackptr_order:
-        sty     gto_channel+1       ; SMC: save channel
+        sty     smc_gto_channel+1       ; SMC: save channel
         cpx     ordernumber
         beq     @use_cur
         ; X = nextordernumber: decode bitstream and compute cur + delta_table[index]
         jsr     decode_order_bitstream
-        ldy     gto_channel+1       ; restore Y = channel
+        ldy     smc_gto_channel+1       ; restore Y = channel
         lda     decoded_trackptr_idx,y
         clc
         adc     delta_base          ; convert relative to absolute index
@@ -1307,7 +1307,7 @@ get_trackptr_order:
         lda     chn_trackptr_cur,y
 gto_have_pattern:
         sta     smc_chn_trackptr+1    ; save pattern index for gto_need_decode
-gto_channel:
+smc_gto_channel:
         ldx     #0                  ; SMC: channel
         ; Check if this exact row is already decoded
         cmp     chn_decoded_pat,x
@@ -1607,7 +1607,7 @@ dar_set_gap:
 ; ============================================================================
 ; Data Section (player variables initialized to zero serve as boundary marker)
 ; ============================================================================
-
+player_variables:
 ; Player Variables (zero-initialized - forms natural code/data boundary)
 chn_hardrestart:        .byte   0, 0, 0
 chn_gateon:             .byte   0, 0, 0
@@ -1621,7 +1621,6 @@ chn_inst_ptr_hi:        .byte   0, 0, 0
 chn_effect:             .byte   0, 0, 0
 chn_effectpar:          .byte   0, 0, 0
 chn_permarp:            .byte   0, 0, 0  ; Permanent arpeggio param (set by arp effect, used by NOP)
-permarp_pad:            .byte   0        ; Padding to keep PLAYERVARSSIZE even
 chn_waveform:           .byte   0, 0, 0
 chn_ad:                 .byte   0, 0, 0
 chn_sr:                 .byte   0, 0, 0
@@ -1666,7 +1665,11 @@ prefetch_order:         .byte   0       ; order position used for prefetch
 prefetch_row:           .byte   0       ; row used for prefetch
 prefetch_transpose:     .byte   0, 0, 0 ; cached transpose values
 
-PLAYERVARSSIZE = * - chn_hardrestart
+.if ((* - player_variables) & 1) <> 0
+                        .byte 0
+.endif
+
+PLAYERVARSSIZE = * - player_variables
 
 ; Trackptr delta decoding state
 chn_trackptr_cur:       .byte   0, 0, 0        ; Pattern index for current ordernumber
